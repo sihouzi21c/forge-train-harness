@@ -659,7 +659,9 @@ def _static_backward(
         _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.pre_mlp_norm_weight, dw_mtp_mlp_norm)
 
         # Add MLP and attention gradient at hidden
-        d_mtp_eagle_h = d_mtp_hidden_mlp
+        # The gradient of the loss w.r.t. hidden_after_attn is:
+        #   d_mtp_eagle_h (from the MLP residual connection) + d_mtp_hidden_mlp (from MLP compute)
+        d_mtp_eagle_h = d_mtp_eagle_h + d_mtp_hidden_mlp
 
         # Attention branch residual from hidden_before_attn
         # wo backward: attn_out = attn_flat @ wo.T
@@ -796,8 +798,11 @@ def _static_backward(
         )
         _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.pre_mlp_norm_weight, dw_mlp_norm)
 
-        # Attention branch residual
-        d_hidden = d_hidden_mlp
+        # Add MLP residual: hidden = hidden_before_attn + attn_out * depth_scale
+        # then hidden = hidden + mlp_out * depth_scale.
+        # The gradient of the loss w.r.t. hidden_before_attn is:
+        #   d_hidden (from the MLP residual connection) + d_hidden_mlp (from MLP compute)
+        d_hidden = d_hidden + d_hidden_mlp
 
         # ── Attention backward ─────────────────────────────────────────
         # wo backward: attn_out = attn_flat @ wo.T
@@ -831,9 +836,9 @@ def _static_backward(
         _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.input_norm_weight, dw_attn_norm)
 
         # Add residual from attention branch: hidden = hidden_before_attn + attn_out * depth_scale
-        # So d_hidden_before_attn includes d_hidden from attn_out * depth_scale
-        # and from the MLP residual (which we already added)
-        d_hidden = d_hidden_before_attn
+        # The gradient of the loss w.r.t. hidden_before_attn is:
+        #   d_hidden (from the attention residual connection) + d_hidden_before_attn (from attention compute)
+        d_hidden = d_hidden + d_hidden_before_attn
 
     # ── Embedding backward ─────────────────────────────────────────────
     dw_emb = embedding_backward(
