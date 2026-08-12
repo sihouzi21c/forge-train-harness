@@ -55,15 +55,19 @@ def linear_backward(
             f"weight out_dim {weight.shape[0]}"
         )
 
+    # Ensure weight is in the same dtype as grad_out for the matmul
+    dtype = grad_out.dtype
+    w = weight.to(dtype=dtype) if weight.dtype != dtype else weight
+
     # dX = grad_out @ weight
-    grad_in = torch.matmul(grad_out, weight)
+    grad_in = torch.matmul(grad_out, w)
 
     # dW = grad_out.T @ x (reshaped to 2D)
     n = weight.shape[0]
     k = weight.shape[1]
     g2 = grad_out.reshape(-1, n)
     x2 = x.reshape(-1, k)
-    grad_weight = torch.matmul(g2.transpose(0, 1), x2)
+    grad_weight = torch.matmul(g2.transpose(0, 1), x2.to(dtype=dtype))
 
     return grad_in, grad_weight
 
@@ -261,12 +265,12 @@ def project_qkv_backward(
     grad_projected = grad_grouped.reshape(*leading, qkv_out_dim)
 
     # d hidden = grad_projected @ weight
-    grad_hidden = torch.matmul(grad_projected, weight)
+    grad_hidden = torch.matmul(grad_projected, weight.to(dtype=grad_projected.dtype))
 
     # d weight = grad_projected.T @ hidden
     g2 = grad_projected.reshape(-1, grad_projected.shape[-1])
     h2 = hidden.reshape(-1, H)
-    grad_weight = torch.matmul(g2.transpose(0, 1), h2)
+    grad_weight = torch.matmul(g2.transpose(0, 1), h2.to(dtype=grad_projected.dtype))
 
     return grad_hidden, grad_weight
 

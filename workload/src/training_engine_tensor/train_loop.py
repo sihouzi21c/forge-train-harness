@@ -595,10 +595,11 @@ def _static_backward(
         # ── MTP LM head backward: logits = mtp_pre_head @ output_weight.T
         # d(mtp_pre_head) = grad_mtp_logits @ output_weight
         # d(output_weight) += grad_mtp_logits.T @ mtp_pre_head
+        # grad_mtp_logits is fp32 (from FP32 CE), output_weight is bf16
+        d_mtp_pre_head = torch.matmul(grad_mtp_logits, model.output_weight.to(dtype=grad_mtp_logits.dtype))
         g2_mtp = grad_mtp_logits.reshape(-1, V)
         mtp_pre = cache.mtp_pre_head.reshape(-1, H)
-        d_mtp_pre_head = torch.matmul(grad_mtp_logits, model.output_weight)
-        dw_output_mtp = torch.matmul(g2_mtp.transpose(0, 1), mtp_pre).float()
+        dw_output_mtp = torch.matmul(g2_mtp.transpose(0, 1), mtp_pre.to(dtype=grad_mtp_logits.dtype)).float()
         _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.output_weight, dw_output_mtp)
 
         # ── width_mult backward: d(hidden) = d(mtp_pre_head) / width_mult
@@ -717,10 +718,11 @@ def _static_backward(
     grad_logits = cross_entropy_backward(cache.main_logits, cache.labels, cache.loss_mask)
 
     # ── Main LM head backward: logits = main_pre_head @ output_weight.T
+    # grad_logits is fp32 (from FP32 CE), output_weight is bf16
+    d_main_pre_head = torch.matmul(grad_logits, model.output_weight.to(dtype=grad_logits.dtype))
     g2_main = grad_logits.reshape(-1, V)
     main_pre = cache.main_pre_head.reshape(-1, H)
-    d_main_pre_head = torch.matmul(grad_logits, model.output_weight)
-    dw_output_main = torch.matmul(g2_main.transpose(0, 1), main_pre).float()
+    dw_output_main = torch.matmul(g2_main.transpose(0, 1), main_pre.to(dtype=grad_logits.dtype)).float()
     _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.output_weight, dw_output_main)
 
     # ── width_mult backward: d(hidden) = d(main_pre_head) / width_mult
