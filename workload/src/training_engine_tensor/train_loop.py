@@ -1098,7 +1098,7 @@ def _init_process_group() -> int:
     """
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", device_id=local_rank)
+    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     rank = dist.get_rank()
     return rank
 
