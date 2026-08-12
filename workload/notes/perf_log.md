@@ -100,3 +100,29 @@ The step 1 loss diff remaining at 3.05e-06 (unchanged across all fixes) suggests
 - Investigate the data loading path: compare `input_ids` between ref and ours for the first micro-batch. The ref uses `PrefetchedBatcher` (background thread + skip-mask), while the in-house engine uses direct `_next_batch`. Even with the skip-mask fix, the background thread's timing might affect data ordering.
 - Check if the canonical checkpoint's `tok_embeddings.weight` matches the ref's `init_weights` output for the same seed.
 - If data is the issue, verify the `HFStreamDataloader` produces identical batches for both ref and ours.
+- review R4 PASS: docs-only commit, engine code unchanged from R3 — no proxy, no forgery
+
+## Round 5 — bitwise-singlecard milestone: F.silu SwiGLU fix, muP LR groups, kr/kv contiguous, hash prefix
+
+### Changes
+- **SwiGLU `F.silu` fix**: The `_forward_with_cache` and MTP forward functions used `torch.sigmoid(y1.float()) * y1 * y2` instead of `F.silu(y1.float()) * y2`. While `F.silu(x) = x * sigmoid(x)` is mathematically equivalent, the manual `sigmoid(x) * x` decomposition produces different rounding. Changed both main and MTP layer SwiGLU to `F.silu(y1.float()) * y2.float()`, matching the ref's `TransformerLayer.forward`.
+- **`project_qkv` contiguous k/v**: Added `.contiguous()` to `k` and `v` tensors in `project_qkv`, matching the ref's `qkv[..., ...].contiguous()` pattern. Non-contiguous inputs to `flash_attn_func` could cause internal copies with different layout.
+- **`_is_matrix_fqn` muP LR groups fix**: The FQN suffix check used `fqn.endswith("_weight")` but all FQNs use `.weight` (dot notation). This caused ALL parameters to be classified as unscaled, breaking muP LR scaling (matrix weights should get `lr / width_mult`). Changed to `fqn.endswith(".weight")`.
+- **Hash capture gradient prefix fix**: `_capture_gradient` was hardcoding the key format as `rank{N}.grad.{FQN}.postallreduce` without the `step_{N}.` prefix. The ref's `harness_dp` keys include `step_{N}.rank{N}.grad.{FQN}.postallreduce`. Fixed by adding `prefix` parameter to `_capture_all_gradients` and passing `grad_prefix = f"step_{config.start_step}.rank{rank}."`.
+- **Eliminated redundant QKV matmul**: Moved the capture-only `qkv_proj` computation inside the capture block to avoid an extra `torch.matmul` per layer when capture is disabled.
+
+### Results
+- **Step 1 loss is now BITWISE IDENTICAL** (`diff=0.0`). The `F.silu` fix was the key — the manual `sigmoid(x) * x` was producing different FP32 rounding than `F.silu(x) = x * sigmoid(x)`.
+- Step 2-8 loss: still diverging (step 2 diff=5.88e-05, step 8 diff=7.20e-04), driven by the optimizer divergence from the gradient difference.
+- Step 1 grad_norm: diff=0.0011 (0.54% relative) — unchanged, the gradient computation still differs from the ref's autograd.
+- Hash: 0/155 equal — the hash prefix fix should help but was not yet tested in this round.
+
+### Remaining issues
+- The backward pass (static backward vs autograd) produces slightly different gradients (~0.5% relative), causing optimizer divergence.
+- The muP LR groups fix should help with step 2-8 divergence but is a first-time run.
+- The hash capture keys now match the ref's format but need verification.
+
+### Next step
+- Investigate the static backward gradient difference: compare the `linear_backward` wgrad dtype (returns BF16, added to FP32 buffer) with the ref's `_LinearFn.backward` (computes BF16, `.float()` before adding).
+- The `cross_entropy_backward` function creates a separate autograd graph — verify it matches the ref's `obj.backward()` chain exactly.
+- Re-run the gate after the hash prefix fix to verify hash comparison.

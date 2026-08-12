@@ -78,8 +78,8 @@ def project_qkv(hidden: torch.Tensor, weight: torch.Tensor
     group_width = (nq_per_kv + 2) * d
     grouped = projected.view(*leading, nkv, group_width)
     q = grouped[..., : nq_per_kv * d].reshape(*leading, NUM_HEADS, d)
-    k = grouped[..., nq_per_kv * d: nq_per_kv * d + d]
-    v = grouped[..., nq_per_kv * d + d:]
+    k = grouped[..., nq_per_kv * d: nq_per_kv * d + d].contiguous()
+    v = grouped[..., nq_per_kv * d + d:].contiguous()
     return q, k, v
 
 

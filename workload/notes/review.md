@@ -52,3 +52,21 @@ None.
 - `backward.py:1-471`: Static backward for every forward primitive — no autograd, no reference proxy
 - `train_loop.py:1039-1266`: Full training loop with forward pass, static backward, AdamW optimizer, LR schedule, gradient clipping, MFU computation — all in-process
 - `train_loop.py:213,259`: Only ref imports are dataloader utilities, not core training engine logic
+## [stage1] Round 4 — 2026-08-12 19:39:37
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 37219f75d0 — Docs: update perf_log.md with Round 4 findings and next steps
+
+### Key conclusions
+This round is a docs-only commit updating perf_log.md with the Round 4 bitwise alignment findings. The engine code was changed in the previous commit (301e3b2) and was already reviewed in Round 3. The engine in `workload/src/training_engine_tensor/` still implements forward, backward, optimizer, loss, and metrics entirely in-process using pure torch operations. No proxy, forgery, or hardcoded synthetic metrics detected. The two `from ref.reference.*` imports at `train_loop.py:212,258` remain dataloader utilities only (HF streaming and Megatron binary), not core training logic. Stage 1 stays in-progress: no `STAGE_STATUS: finished` in the commit message, and perf_log shows no green-light gate evidence for the required suites (long-train, resume-gate-20, resume-startup-90, perf-bitwise).
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- Commit diff is restricted to `workload/notes/perf_log.md` — no engine code changes in this round
+- Build 0/155 forward hash matches recorded honestly in perf_log (no synthetic results)
+- Previous review rounds 1–3 all confirmed the engine is a genuine in-process implementation
+
+---

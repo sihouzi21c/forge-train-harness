@@ -88,7 +88,7 @@ def _capture_forward(records: dict, prefix: str, fqn: str, call_idx: int,
 def _capture_gradient(records: dict, prefix: str, fqn: str,
                       tensor: torch.Tensor) -> None:
     """Record a parameter gradient hash."""
-    key = f"rank{os.environ.get('RANK', '0')}.grad.{fqn}.postallreduce"
+    key = f"{prefix}rank{os.environ.get('RANK', '0')}.grad.{fqn}.postallreduce"
     records[key] = _hash_tensor(tensor)
 
 
@@ -391,17 +391,17 @@ def _forward_with_cache(
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.attention_norm", 0, normed)
 
-        qkv_proj = torch.matmul(normed, layer.qkv_weight.t())
         q, k, v = project_qkv(normed, layer.qkv_weight)
         if capture_records is not None:
+            qkv_proj = torch.matmul(normed, layer.qkv_weight.t())
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.wqkv", 0, qkv_proj)
 
         q_rot = apply_rope(q, rope_freqs)
         k_rot = apply_rope(k, rope_freqs)
-        # Use math attention fallback to match ref's deterministic stack.
-        # The ref disables flash SDP and mem-efficient SDP, falling back to
-        # the math backend (torch.baddbmm).  Using the flash attention kernel
-        # directly would produce different numerical results.
+        # Use flash_attn_func to match the ref's attention implementation
+        # exactly.  The ref's TransformerLayer.forward calls:
+        #   from flash_attn import flash_attn_func
+        #   attn = flash_attn_func(q, k, v, causal=True, deterministic=True)
         attn, softmax_lse = _gqa_attention(q_rot, k_rot, v, allow_math_fallback=True)
         attn_flat = attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         attn_out = torch.matmul(attn_flat, layer.attention_proj_weight.t())
@@ -420,7 +420,7 @@ def _forward_with_cache(
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.wfc1", 0, gate_up)
 
         y1, y2 = gate_up.chunk(2, dim=-1)
-        intermediate = (torch.sigmoid(y1.float()) * y1 * y2.float()).to(y1.dtype)
+        intermediate = (torch.nn.functional.silu(y1.float()) * y2.float()).to(y1.dtype)
         mlp_out = torch.matmul(intermediate, layer.mlp_fc2_weight.t())
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.w2", 0, mlp_out)
@@ -492,7 +492,7 @@ def _forward_with_cache(
         mtp_normed2 = rms_norm(eagle_h, model.mtp.layer.pre_mlp_norm_weight)
         mtp_gate_up = torch.matmul(mtp_normed2, model.mtp.layer.mlp_fc1_weight.t())
         mtp_y1, mtp_y2 = mtp_gate_up.chunk(2, dim=-1)
-        mtp_intermediate = (torch.sigmoid(mtp_y1.float()) * mtp_y1 * mtp_y2.float()).to(mtp_y1.dtype)
+        mtp_intermediate = (torch.nn.functional.silu(mtp_y1.float()) * mtp_y2.float()).to(mtp_y1.dtype)
         mtp_mlp_out = torch.matmul(mtp_intermediate, model.mtp.layer.mlp_fc2_weight.t())
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, "mtp.layer.w2", 0, mtp_mlp_out)
@@ -913,7 +913,7 @@ def _build_optimizer_groups(
     # AND not output.weight).
     def _is_matrix_fqn(fqn: str) -> bool:
         return (
-            fqn.endswith("_weight")
+            fqn.endswith(".weight")
             and "norm" not in fqn
             and "tok_embeddings" not in fqn
             and "output" not in fqn
@@ -1138,10 +1138,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # ── Capture setup ──────────────────────────────────────────────────
     capture_records: dict | None = None
     capture_prefix = ""
+    grad_prefix = ""
     if config.hash_capture_level > 0:
         capture_records = {}
         # The ref's harness_dp adds a step_{step}. prefix before the rank prefix.
         capture_prefix = f"step_{config.start_step}.rank{rank}.mb0."
+        grad_prefix = f"step_{config.start_step}.rank{rank}."
 
     # ── MFU prep ───────────────────────────────────────────────────────
     tokens_per_step = config.global_batch_size * C.MAX_SEQ_LEN
@@ -1229,7 +1231,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
         # ── Capture mode: dump and exit (non-persistent) ────────────────
         if config.hash_capture_level > 0 and not config.persistent:
-            _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model)
+            _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
             _write_capture_output(config, capture_records, rank)
             _ordered_teardown()
             return  # Not reached (SystemExit raised in _ordered_teardown)
@@ -1279,7 +1281,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
     # ── Persistent capture: write hash dump before teardown ──────────
     if config.hash_capture_level > 0 and config.persistent and capture_records is not None:
-        _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model)
+        _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
         _write_capture_output(config, capture_records, rank)
 
     # ── Ordered teardown ──────────────────────────────────────────────
@@ -1289,13 +1291,14 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 # ── Gradient capture helpers ────────────────────────────────────────────────
 
 
-def _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model):
+def _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model,
+                           prefix: str = ""):
     """Capture all parameter gradients as hash records."""
     fqn_map = _build_fqn_map(model)
     for buf, p in zip(fp32_grad_bufs, bf16_params):
         fqn = fqn_map.get(p.data_ptr(), None)
         if fqn is not None:
-            _capture_gradient(capture_records, "", fqn, buf)
+            _capture_gradient(capture_records, prefix, fqn, buf)
 
 
 def _build_fqn_map(model: ModelParameters) -> dict:
