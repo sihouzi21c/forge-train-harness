@@ -1104,32 +1104,31 @@ def _init_process_group() -> int:
 
 
 def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, empty cache, then return.
+    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then return.
 
-    Returns normally so the interpreter can clean up.  The NCCL PG is
-    NOT destroyed here — it is left for the OS to clean up on process
-    exit, avoiding the "terminate called without an active exception"
-    SIGABRT that occurs when the NCCL finalizer races Python's
-    Py_Finalize.
+    Returns normally so the interpreter can clean up.  The barrier uses
+    device_ids to avoid the "devices unknown" warning.
     """
     import gc
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    # 1. Drain in-flight GPU work.
     try:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     except Exception:
         pass
-    # 2. Collect all Python garbage to release GPU tensor references.
     for _ in range(3):
         gc.collect()
-    # 3. Free the CUDA allocator cache.
+    try:
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier(device_ids=[local_rank])
+            dist.destroy_process_group()
+    except Exception:
+        pass
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
-    # 4. Final GC pass.
     gc.collect()
     if os.environ.get("RANK", "0") == "0":
         print("ALL DONE", flush=True)
