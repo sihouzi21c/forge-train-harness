@@ -146,7 +146,7 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     ``k``, ``v`` shape ``[B, S, NUM_KV_HEADS, HEAD_DIM]``.
     """
     out = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, is_causal=True, attn_mask=None, dropout_p=0.0, scale=None
+        q, k, v, is_causal=True
     )
     return out, None
 
