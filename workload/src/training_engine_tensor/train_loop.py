@@ -1143,7 +1143,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         capture_records = {}
         # The ref's harness_dp adds a step_{step}. prefix before the rank prefix.
         capture_prefix = f"step_{config.start_step}.rank{rank}.mb0."
-        grad_prefix = f"step_{config.start_step}.rank{rank}."
+        grad_prefix = f"step_{config.start_step}."
 
     # ── MFU prep ───────────────────────────────────────────────────────
     tokens_per_step = config.global_batch_size * C.MAX_SEQ_LEN

@@ -122,6 +122,20 @@ The step 1 loss diff remaining at 3.05e-06 (unchanged across all fixes) suggests
 - The muP LR groups fix should help with step 2-8 divergence but is a first-time run.
 - The hash capture keys now match the ref's format but need verification.
 
+### Updated results (2026-08-12, Round 5b)
+- **Step 1 loss: BITWISE PASS** (`diff=0.0`). Forward pass is now fully aligned.
+- **Step 1 grad_norm: diff=0.0011 (0.54% relative)**. The gradient computation still differs from the ref's autograd.
+- **Hash checks increased from 155 to 312** after fixing the `grad_prefix` double `rank0.` bug. The forward + gradient key format now matches the ref's `step_{N}.rank{R}.{grad|fwd}.{FQN}` format.
+- The `silu_swiglu_intermediate_backward` was changed from manual `sigmoid(x)*(1 + x*(1 - sigmoid(x)))` to `torch.autograd.grad` through `F.silu` — but this did not change the gradient values.
+- The `linear_backward` wgrad was changed to return FP32 (`.float()`) matching the ref's `wg.float()` pattern — no numerical change.
+
+### Remaining gradient diff hypothesis
+The ~0.5% gradient difference at step 1 is likely from the `cross_entropy_backward` function creating a separate `torch.autograd.grad` graph vs the ref's `obj.backward()` through the full autograd chain. The `cross_entropy_backward` function computes `torch.autograd.grad(nll, logits_f32, grad_outputs=mask)` which is mathematically equivalent to `(nll * mask).sum().backward()`, but the autograd engine might use a different computation path for the gradient of `F.cross_entropy` when the `grad_outputs` parameter is used vs the full chain.
+
+### Next step
+- Investigate the `cross_entropy_backward` function: try replacing `torch.autograd.grad` with the full `(nll * mask).sum().backward()` chain to match the ref's path exactly.
+- If the gradient diff persists, bisect the backward pass by comparing per-parameter gradient norms between ref and ours.
+
 ### Next step
 - Investigate the static backward gradient difference: compare the `linear_backward` wgrad dtype (returns BF16, added to FP32 buffer) with the ref's `_LinearFn.backward` (computes BF16, `.float()` before adding).
 - The `cross_entropy_backward` function creates a separate autograd graph — verify it matches the ref's `obj.backward()` chain exactly.

@@ -63,13 +63,14 @@ def linear_backward(
     # match the ref's _LinearFn.backward (which uses ctx.weight as-is).
     grad_in = torch.matmul(grad_out, weight)
 
-    # dW = grad_out.T @ x (reshaped to 2D) — use weight's dtype for the
-    # computation, matching the ref's pattern.
+    # dW = grad_out.T @ x (reshaped to 2D) — compute in weight's dtype
+    # then convert to fp32 (matching the ref's _LinearFn.backward which does
+    # wg = torch.matmul(g2.T, x2); _ensure_main_grad(weight).add_(wg.float())).
     n = weight.shape[0]
     k = weight.shape[1]
     g2 = grad_out.reshape(-1, n)
     x2 = x.reshape(-1, k)
-    grad_weight = torch.matmul(g2.transpose(0, 1), x2)
+    grad_weight = torch.matmul(g2.transpose(0, 1), x2).float()
 
     return grad_in, grad_weight
 
@@ -119,24 +120,18 @@ def silu_swiglu_intermediate_backward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward of ``silu(gate) * up``.
 
-    ``silu(x) = sigmoid(x) * x``.
-    ``d(silu(x))/dx = sigmoid(x) * (1 + x * (1 - sigmoid(x)))``.
-
-    Uses the input dtype for the activation gradient computation.
+    Replays ``F.silu(gate) * up`` through ``torch.autograd.grad`` to match the
+    ref's autograd backward for ``F.silu`` exactly.  The manual closed-form
+    ``sigmoid(x) * (1 + x * (1 - sigmoid(x)))`` can differ from the fused
+    autograd kernel's computation.
     """
-    dtype = grad_out.dtype
-    gate_f = gate.to(dtype=dtype)
-    up_f = up.to(dtype=dtype)
-    grad_out_f = grad_out.to(dtype=dtype)
-
-    sig = torch.sigmoid(gate_f)
-    silu = sig * gate_f
-    d_silu = sig * (1.0 + gate_f * (1.0 - sig))
-
-    grad_gate = grad_out_f * d_silu * up_f
-    grad_up = grad_out_f * silu
-
-    return grad_gate.to(gate.dtype), grad_up.to(up.dtype)
+    import torch.nn.functional as _F
+    with torch.enable_grad():
+        gate_f = gate.detach().float().requires_grad_(True)
+        up_f = up.detach().float().requires_grad_(True)
+        out = _F.silu(gate_f) * up_f
+        grad_gate_f, grad_up_f = torch.autograd.grad(out, (gate_f, up_f), grad_out.float())
+    return grad_gate_f.to(gate.dtype), grad_up_f.to(up.dtype)
 
 
 # ── Embedding backward ──────────────────────────────────────────────────────
