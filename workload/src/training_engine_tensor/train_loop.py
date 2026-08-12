@@ -1101,7 +1101,13 @@ def _init_process_group() -> int:
 
 
 def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, exit 0."""
+    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then return.
+
+    Returns normally (no ``os._exit``, no ``SystemExit``) so the interpreter
+    can clean up without crashing the NCCL communicator during its destructor
+    pass.  The gate wrapper checks exit code 0 + valid artifact, so a clean
+    return is required.
+    """
     import gc
     try:
         if torch.cuda.is_available():
@@ -1127,4 +1133,6 @@ def _ordered_teardown() -> None:
         print("ALL DONE", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
-    raise SystemExit(0)
+    # Return normally — do NOT raise SystemExit or os._exit.  The gate wrapper
+    # checks exit code 0; a SIGABRT from the NCCL destructor racing against
+    # Py_Finalize is a FAIL even when the artifact is valid.
