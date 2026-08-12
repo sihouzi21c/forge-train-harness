@@ -66,3 +66,37 @@
 ### Next step
 - Remote sync and run `bin/harness run multistep-1gpu` to verify the fix.
 - review R3 PASS: engine implements forward/backward/loss/optimizer in-process; no proxy detected
+
+## Round 4 — bitwise-singlecard milestone: comprehensive alignment fixes
+
+### Changes
+- **Attention backend**: Changed from `F.scaled_dot_product_attention` (math fallback) to `flash_attn_func(q, k, v, causal=True, deterministic=True)`. The ref's `TransformerLayer.forward` uses `flash_attn_func` directly, not `F.scaled_dot_product_attention`. The `enable_flash_sdp(False)` setting only affects `F.scaled_dot_product_attention`, not the direct `flash_attn_func` call. The math fallback SDPA (baddbmm) and `flash_attn_func` produce different numerical results.
+- **SwiGLU**: Changed to use `F.silu(y_1.float()) * y_2.float()` instead of manual `sigmoid(x) * x` decomposition.
+- **RMSNorm**: Changed to use `F.rms_norm` directly instead of the manual `(x32 * r).to(bf16) * weight` decomposition. The fused kernel's reduction order differs from the manual formula.
+- **Cross-entropy**: Changed to use `F.cross_entropy(reduction="none")` matching the ref's `masked_ce`.
+- **Cross-entropy backward**: Changed to return bf16 gradients (matching ref's `.float()` backward which converts fp32 → bf16 through the autograd chain).
+- **Linear backward dtype**: Changed to keep weight in its original bf16 dtype, matching the ref's `_LinearFn.backward` which uses `ctx.weight` as-is without explicit dtype casting.
+- **Weight tying**: Removed weight tying between `tok_embeddings_weight` and `output_weight`. The ref's `MiniCPM4MupMtp` keeps them as separate `nn.Parameter` tensors with independent optimizer state (m, v). The canonical checkpoint stores both as separate entries.
+- **Hash key naming**: Added `step_{n}.` prefix to match the ref's `harness_dp` format.
+- **Data alignment**: Added zero-loss-mask skip logic to `_next_batch` (matching ref's `next_batch` and `PrefetchedBatcher`).
+- **Embedding**: Changed to use `F.embedding` matching the ref's `_EmbeddingFn.forward`.
+
+### Current status
+- The engine runs without crashing (fixes the `torch.matmul(fp32, bf16)` dtype mismatch).
+- The step 1 loss diff is 3.05e-06 (identical to before the changes).
+- The step 1 grad_norm diff is 0.0011 (identical to before).
+- The forward pass hash shows 0/155 matching keys — ALL forward activations differ from the ref, even the first embedding lookup (`tok_embeddings#0`).
+- Canonical checkpoint is correctly loaded (157 keys, debug verified).
+- Tok embeddings and output weights are separate tensors (different data_ptr, debug verified).
+
+### Root cause hypothesis
+The forward pass hash mismatch persists even after aligning all the computation primitives. The first activation (`tok_embeddings#0`) differs, which is the embedding lookup output. This suggests either:
+1. The `input_ids` from the dataloader differ between ref and ours (data loading/data path issue)
+2. The `tok_embeddings_weight` tensor values differ despite the canonical checkpoint being loaded
+
+The step 1 loss diff remaining at 3.05e-06 (unchanged across all fixes) suggests the forward pass diff is upstream of all the backward/optimizer changes — likely a data loading or initialization difference.
+
+### Next step
+- Investigate the data loading path: compare `input_ids` between ref and ours for the first micro-batch. The ref uses `PrefetchedBatcher` (background thread + skip-mask), while the in-house engine uses direct `_next_batch`. Even with the skip-mask fix, the background thread's timing might affect data ordering.
+- Check if the canonical checkpoint's `tok_embeddings.weight` matches the ref's `init_weights` output for the same seed.
+- If data is the issue, verify the `HFStreamDataloader` produces identical batches for both ref and ours.
