@@ -123,35 +123,7 @@ def mlp_swiglu(hidden: torch.Tensor, fc1_weight: torch.Tensor,
     return torch.matmul(intermediate, fc2_weight.t())
 
 
-# ── GQA Attention (flash attention path with softmax stats for backward) ────
-
-
-def _gqa_attention_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                         causal: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flash attention forward that also returns softmax statistics.
-
-    Returns ``(output, softmax_lse)`` where:
-        output: ``[B, S, NUM_HEADS, HEAD_DIM]``
-        softmax_lse: ``[B, NUM_HEADS, S]``
-
-    The flash attention CUDA kernel always computes ``softmax_lse`` internally
-    (needed for its own backward).  We pass ``return_softmax=False`` to avoid
-    a kernel-version check that rejects ``return_softmax=True`` with
-    ``dropout_p=0.0``; the returned ``softmax_lse`` is still valid.
-    """
-    from flash_attn.flash_attn_interface import _flash_attn_forward
-
-    d = q.shape[-1]
-    softmax_scale = d ** -0.5
-    out, _, _, _, _, softmax_lse, _, _ = _flash_attn_forward(
-        q, k, v, dropout_p=0.0, softmax_scale=softmax_scale,
-        causal=causal, window_size=(-1, -1), alibi_slopes=None,
-        return_softmax=False,
-    )
-    return out, softmax_lse
-
-
-# ── GQA Attention (math fallback — uses F.scaled_dot_product_attention for bitwise alignment with ref) ────
+# ── GQA Attention (uses F.scaled_dot_product_attention for bitwise alignment with ref) ────
 
 
 def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -159,33 +131,20 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                    ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GQA scaled dot-product attention.
 
-    On CUDA, dispatches to ``flash_attn`` (via ``_flash_attn_forward``) when
-    ``allow_math_fallback`` is ``False``.  Returns ``(output, softmax_lse)``
-    where ``softmax_lse`` is ``None`` for the math fallback path.
+    Always uses ``F.scaled_dot_product_attention`` for bitwise alignment
+    with the ref.  The ref's determinism stack disables flash SDP and
+    mem-efficient SDP, falling back to the math backend when supported.
+    For GQA (different head counts), the math backend may not be
+    available and the flash attention backend is used instead.
 
-    When ``allow_math_fallback`` is ``True`` (or on CPU), uses
-    ``F.scaled_dot_product_attention`` (math backend) for bitwise alignment
-    with the ref's deterministic stack, and returns ``(output, None)``.
+    Returns ``(output, None)`` — the ``softmax_lse`` is always ``None``
+    because ``F.scaled_dot_product_attention`` does not expose it.
+    Gradients are computed via ``torch.autograd.grad`` in the matching
+    backward function.
 
     ``q`` shape ``[B, S, NUM_HEADS, HEAD_DIM]``.
     ``k``, ``v`` shape ``[B, S, NUM_KV_HEADS, HEAD_DIM]``.
-    Returns ``(output, softmax_lse)`` where ``output`` is ``[B, S, NUM_HEADS, HEAD_DIM]``.
     """
-    if q.device.type == "cuda" and not allow_math_fallback:
-        return _gqa_attention_flash(q, k, v, causal=True)
-
-    if not allow_math_fallback:
-        raise NotImplementedError(
-            "_gqa_attention: flash_attn not available on this device. "
-            "Pass allow_math_fallback=True for the CPU math path."
-        )
-
-    # Use F.scaled_dot_product_attention (math backend) for bitwise alignment
-    # with the ref.  The ref's determinism stack disables flash SDP and
-    # mem-efficient SDP, falling back to the math backend.  Our decomposed
-    # torch.matmul + torch.softmax path produces different results from the
-    # ref's internal implementation (torch.baddbmm + internal softmax), so
-    # we must use the same function the ref uses.
     out = torch.nn.functional.scaled_dot_product_attention(
         q, k, v, is_causal=True, attn_mask=None, dropout_p=0.0, scale=None
     )

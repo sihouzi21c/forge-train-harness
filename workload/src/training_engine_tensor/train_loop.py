@@ -35,7 +35,6 @@ from training_engine_tensor.backward import (
     cross_entropy_backward,
     embedding_backward,
     gqa_attention_backward,
-    gqa_attention_backward_flash,
     linear_backward,
     project_qkv_backward,
     rms_norm_backward,
@@ -671,18 +670,14 @@ def _static_backward(
         )
         _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.attention_proj_weight, dw_mtp_wo)
 
-        # Attention backward (GQA)
+        # Attention backward (GQA) — always uses math fallback path
+        # since _gqa_attention always returns None for softmax_lse
+        # (F.scaled_dot_product_attention does not expose it).
         d_mtp_attn = d_mtp_attn_flat.reshape(B, S, C.NUM_HEADS, C.HEAD_DIM)
-        if mtp_lc.softmax_lse is not None:
-            d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward_flash(
-                d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
-                mtp_lc.attn_out_raw, mtp_lc.softmax_lse,
-            )
-        else:
-            d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward(
-                d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
-                allow_math_fallback=True,
-            )
+        d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward(
+            d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
+            allow_math_fallback=True,
+        )
 
         # RoPE backward
         d_mtp_q = apply_rope_backward(d_mtp_q_rot, rope_freqs)
@@ -811,18 +806,13 @@ def _static_backward(
         )
         _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.attention_proj_weight, dw_wo)
 
-        # Attention backward (GQA)
+        # Attention backward (GQA) — always uses math fallback path
+        # since _gqa_attention always returns None for softmax_lse.
         d_attn = d_attn_flat.reshape(B, S, C.NUM_HEADS, C.HEAD_DIM)
-        if lc.softmax_lse is not None:
-            d_q_rot, d_k_rot, d_v = gqa_attention_backward_flash(
-                d_attn, lc.q_rot, lc.k_rot, lc.v,
-                lc.attn_out_raw, lc.softmax_lse,
-            )
-        else:
-            d_q_rot, d_k_rot, d_v = gqa_attention_backward(
-                d_attn, lc.q_rot, lc.k_rot, lc.v,
-                allow_math_fallback=True,
-            )
+        d_q_rot, d_k_rot, d_v = gqa_attention_backward(
+            d_attn, lc.q_rot, lc.k_rot, lc.v,
+            allow_math_fallback=True,
+        )
 
         # RoPE backward
         d_q = apply_rope_backward(d_q_rot, rope_freqs)
