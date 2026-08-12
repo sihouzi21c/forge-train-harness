@@ -579,7 +579,7 @@ def _static_backward(
     B, S = cache.input_ids.shape
     H = C.HIDDEN_SIZE
     V = C.VOCAB_SIZE
-    allow_math = not torch.cuda.is_available()
+    allow_math = True  # always use math fallback for backward (flash_attn backward not accessible as standalone)
 
     # ====================================================================
     # MTP BRANCH BACKWARD (if enabled)
