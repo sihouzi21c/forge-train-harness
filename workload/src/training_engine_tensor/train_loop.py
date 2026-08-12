@@ -334,7 +334,7 @@ class ForwardCache:
     mtp_emb: torch.Tensor | None = None
     mtp_a: torch.Tensor | None = None       # after emb_input_layernorm
     mtp_b: torch.Tensor | None = None       # after hidden_input_layernorm
-    mtp_eagle_h: torch.Tensor | None = None  # after eagle_fc
+    mtp_eagle_h: torch.Tensor | None = None  # input to final_layernorm (after transformer layer)
     mtp_layer_cache: LayerCache | None = None
     mtp_final: torch.Tensor | None = None    # after final_layernorm
     mtp_pre_head: torch.Tensor | None = None
@@ -505,7 +505,7 @@ def _forward_with_cache(
         cache.mtp_emb = mtp_emb
         cache.mtp_a = a
         cache.mtp_b = b
-        cache.mtp_eagle_h = mtp_eagle_h  # before eagle_fc
+        cache.mtp_eagle_h = eagle_h  # input to final_layernorm (after transformer layer)
         cache.mtp_layer_cache = mtp_mtp_layer_cache
         cache.mtp_final = mtp_final
         cache.mtp_pre_head = mtp_pre_head
