@@ -108,6 +108,41 @@ def _find_in_flat(flat_params: list[torch.Tensor], names: list[str],
     return None
 
 
+def _ref_fqn_to_internal(ref_fqn: str) -> str:
+    """Translate the ref's FQN to the internal parameter name.
+
+    The canonical checkpoint uses the ref's ``named_parameters()`` keys
+    (e.g. ``tok_embeddings.weight``, ``layers.0.attention_norm.weight``).
+    The internal engine uses flat names with underscores.
+    """
+    mapping = {
+        "tok_embeddings.weight": "tok_embeddings_weight",
+        "norm.weight": "final_norm_weight",
+        "output.weight": "output_weight",
+        "mtp.emb_input_layernorm.weight": "mtp.emb_input_norm_weight",
+        "mtp.hidden_input_layernorm.weight": "mtp.hidden_input_norm_weight",
+        "mtp.eagle_fc.weight": "mtp.eagle_fc_weight",
+        "mtp.final_layernorm.weight": "mtp.final_norm_weight",
+    }
+    if ref_fqn in mapping:
+        return mapping[ref_fqn]
+    # Layer weights: layers.{i}.XXX.weight → layers.{i}.YYY_weight
+    layer_map = {
+        "attention_norm": "input_norm",
+        "wqkv": "qkv",
+        "wo": "attention_proj",
+        "ffn_norm": "pre_mlp_norm",
+        "wfc1": "mlp_fc1",
+        "w2": "mlp_fc2",
+    }
+    parts = ref_fqn.rsplit(".", 2)
+    if len(parts) == 3:
+        prefix, module, _ = parts
+        if module in layer_map:
+            return f"{prefix}.{layer_map[module]}_weight"
+    return ref_fqn  # fallback
+
+
 def load_weights_from_checkpoint(
     checkpoint_root: str,
     device: torch.device,
@@ -140,16 +175,16 @@ def load_weights_from_checkpoint(
 
     ckpt_path = Path(checkpoint_root) / "canonical_state_fp32.pt"
     if ckpt_path.is_file():
-        # Load and convert to bf16
+        # Load and convert to bf16.  The canonical checkpoint uses the
+        # ref's ``named_parameters()`` FQN keys; translate them to our
+        # internal flat names.
         state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        if isinstance(state, dict):
-            flat_params = [state[k].to(device=device, dtype=torch.bfloat16)
-                           for k in sorted(state.keys())]
-            flat_names = sorted(state.keys())
-        else:
-            flat_params = [t.to(device=device, dtype=torch.bfloat16)
-                           for t in state]
-            flat_names = [f"param_{i}" for i in range(len(flat_params))]
+        flat_params = []
+        flat_names = []
+        for k in sorted(state.keys()):
+            internal_name = _ref_fqn_to_internal(k)
+            flat_params.append(state[k].to(device=device, dtype=torch.bfloat16))
+            flat_names.append(internal_name)
     else:
         # Initialise weights using muP scheme (same as ref)
         # ref: matrix weights (qkv, fc1, eagle_fc) → N(0, init_std/sqrt(width_mult))
