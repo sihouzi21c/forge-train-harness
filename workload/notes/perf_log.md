@@ -33,6 +33,25 @@
 - review R1 PASS: engine implements forward/backward/loss/optimizer in-process; no proxy detected
 - review R2 PASS: engine implements forward/backward/optimizer/loss in-process; no proxy detected
 
+## Round 2 — bitwise-singlecard alignment: gradient scaling, weight tying, attention alignment, residual gradient fixes
+
+### Changes
+- **Fixed critical gradient scaling bug**: ref's `reduce_grads` scales accumulated gradients by `1/g_lm_n` (per-step LM token count). Without this, gradients are `lm_n` (~8192) times larger.
+- **Fixed weight tying**: ref's model ties `tok_embeddings.weight = output.weight`. The canonical checkpoint stores separate values for both keys. The in-house must replace `tok_embeddings_weight` with `output_weight` to match the ref's behavior.
+- **Fixed attention backend**: `F.scaled_dot_product_attention` (math/flash backend) produces different results from decomposed `torch.matmul + softmax + matmul`. The in-house must use `F.scaled_dot_product_attention` for bitwise alignment.
+- **Fixed GQA backward head repeat**: the backward was repeating KV heads before computing attention gradients, but the forward passes GQA-native shapes. This caused incorrect gradients.
+- **Fixed missing residual gradient connections**: the static backward was overwriting `d_hidden` with only the compute-branch gradient, losing the residual connection contribution. Fixed both main layer and MTP layer backward.
+
+### Remaining issues
+- Step 1 loss diff: 0.00036343 (forward pass not yet bitwise identical)
+- Step 1 grad norm: 0.251 vs ref's 0.205 (1.22x, improved from 0.537x)
+- The forward pass difference is very small (0.0024% relative) but prevents bitwise match
+- The gradient difference is now closer to the ref's after the residual connection fix
+
+### Next step
+- Investigate the remaining forward pass difference (0.00036343 in loss)
+- The gradient norm is now 1.22x of the ref's — still needs investigation
+
 ## Round 2 — bitwise-singlecard milestone: gradient scaling bug fix + optimizer hyperparameter plumbing
 
 ### Changes
