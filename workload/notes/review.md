@@ -71,3 +71,24 @@ None.
 - Previous review rounds 1–3 all confirmed the engine is a genuine in-process implementation
 
 ---
+
+## [stage1] Round 6 — 2026-08-12 21:10:03
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 82faa7e — Fix: hash capture per-step prefix, wgrad FP32 alignment, norm computation
+
+### Key conclusions
+The dev agent fixed per-step hash capture prefix, wgrad FP32 alignment in rms_norm_backward, project_qkv_backward, and embedding_backward, and switched _compute_grad_norm from float64 to float32 to match the ref's clip_grad_norm_ path. The engine remains a genuine in-process implementation — no subprocess calls to ref/ scripts, no hardcoded synthetic metrics, no renamed proxy variants. The two `from ref.reference.*` imports at `train_loop.py:212,258` are data-loader utilities only (HF streaming and Megatron binary), not core training logic. The gradient diff (0.54% at step 1) persists despite all backward-aligning fixes, suggesting a deeper systematic issue the dev agent has identified. Stage 1 stays in-progress: no `STAGE_STATUS: finished` in the commit message, profile snapshot missing for this perf-touching round (backward.py, train_loop.py modified).
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `backward.py:103-110`: rms_norm_backward wgrad now uses `.float()` — aligns with ref's `_RMSNormFn.backward` WGRAD_ACCUM_FP32 path
+- `backward.py:161-168`: embedding_backward uses fp32 accumulation buffer — matches ref's `_EmbeddingFn.backward`
+- `backward.py:419-435`: cross_entropy_backward switched from `torch.autograd.grad` to `(nll * mask).sum().backward()` — matches ref's exact autograd chain
+- `train_loop.py:863-881`: _compute_grad_norm uses torch.norm with float32 reduction — matches ref's `clip_grad_norm_` path
+- `train_loop.py:1160-1170`: per-step capture prefix fix — hash comparison improved from 0/312 to 154/2496 matching keys
+
+---

@@ -175,3 +175,47 @@ The 0.54% diff is suspiciously consistent (same value across multiple runs) and 
 ### Next step
 - The most efficient next step is to bisect the backward pass by comparing the `dw_output_main` (LM head weight gradient) with the ref. If the first gradient is already different, the error is in the CE backward or LM head backward. If it matches, the error is downstream in the transformer layers.
 - review R6: in progress
+- review R6 PASS: bitwise alignment fixes genuine, no proxy; 0.54% gradient diff persists, stage 1 in-progress
+
+## Round 7 — bitwise-singlecard milestone: gradient bisect, CE backward verification
+
+### Changes
+- No code changes (debug-only investigation, reverted).
+
+### Investigation: gradient root cause
+
+The 0.54% gradient norm difference at step 1 (loss is bitwise identical) was investigated via systematic bisect:
+
+1. **norm_factor verified identical**: `local_lm_n=8192.0`, `norm_factor=1.220703125e-4` — matches ref's `g_lm_n` and `norm_factor` exactly.
+
+2. **NLL (per-token loss) hash matches ref for ALL 8 steps**: The main branch NLL hash (`add707...` for step 0) matches the ref's `loss.per_token.preallreduce` hash exactly. This confirms `logits` and `labels` are bitwise identical.
+
+3. **cross_entropy_backward verified correct**: The autograd gradient (`grad_logits_f32`) differs from the manual formula `(softmax - one_hot) * mask` at the ULP level only (`abs_diff ~9e-12` to `6e-08`). This is expected — the `F.cross_entropy` fused kernel uses a different reduction order than the manual formula. The ref uses the same fused kernel, so the ref's gradient is the same as ours.
+
+4. **dw_output_main and dw_output_mtp captured separately**: The main contribution (`dw_output_main`) and MTP contribution (`dw_output_mtp`) to the `output.weight` gradient are both computed. The hash of the sum (`dw_output_mtp + dw_output_main` = `35e689...`) differs from the ref's total (`b0ca17...`).
+
+5. **loss_mask hash verified**: The main and MTP loss_mask hashes are consistent across all 8 steps, confirming data loading is deterministic.
+
+### Gradient comparison (step 1)
+
+| Metric | Ref | Ours | Diff | Rel |
+|--------|-----|------|------|-----|
+| Loss | 1.532468452e+01 | 1.532468452e+01 | 0.0 | 0% |
+| Grad norm | 0.2048209161 | 0.2037235200 | 0.001097 | 0.54% |
+
+### Root cause hypothesis
+The gradient difference persists despite:
+- Forward pass being bitwise identical (step 1 loss diff=0)
+- NLL matching ref for all 8 steps
+- `cross_entropy_backward` producing the correct autograd gradient
+- `norm_factor` matching ref exactly
+
+The most likely explanation is a subtle interaction between the main and MTP branches through the shared `output_weight`. The ref's `obj.backward()` computes `d(lm_sum + ce_w * mtp_sum) / d(output_weight)` in a single autograd pass, while our code computes `dw_output_main` and `dw_output_mtp` separately and adds them. The `_add_to_grad_bufs` function iterates through `fp32_grad_bufs` to find the matching buffer, which should be equivalent to the autograd accumulation.
+
+A potential issue: the `cross_entropy_backward` function creates a new autograd graph (`logits.detach()`) which might produce a slightly different gradient than the ref's `obj.backward()` through the full computation graph. Even though the `F.cross_entropy` backward is identical, the `.detach()` might affect the backward in subtle ways.
+
+### Next step
+- Investigate whether `cross_entropy_backward`'s `logits.detach()` affects the gradient. Try removing the `.detach()` and using the full autograd chain.
+- If the issue persists, bisect the backward pass by comparing the `dw_output_main` (main-only output weight gradient) with the ref's main contribution (ref's total minus MTP contribution).
+- Consider running a no-MTP variant to isolate the main branch gradient.
+- review R7: in progress
