@@ -109,6 +109,13 @@ def main() -> None:
         hash_capture_level=hash_args.hash_capture_level,
         hash_output=hash_args.hash_output or None,
         persistent=hash_args.persistent,
+        # Optimizer hyperparameters from the rendered product (config/optim.toml
+        # + gate_config overrides, projected into the product's [cli] section).
+        lr=float(_require("LR")),
+        min_lr=float(_require("MIN_LR")),
+        lr_warmup_iters=int(_require("LR_WARMUP_ITERS")),
+        lr_decay_iters=int(_require("LR_DECAY_ITERS")),
+        lr_wsd_decay_iters=int(_require("LR_WSD_DECAY_ITERS")),
     )
     run_training_loop(config, loss_tag="LOSS")
 

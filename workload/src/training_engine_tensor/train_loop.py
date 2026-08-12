@@ -35,6 +35,7 @@ from training_engine_tensor.backward import (
     cross_entropy_backward,
     embedding_backward,
     gqa_attention_backward,
+    gqa_attention_backward_flash,
     linear_backward,
     project_qkv_backward,
     rms_norm_backward,
@@ -304,8 +305,10 @@ class LayerCache:
     v: torch.Tensor
     q_rot: torch.Tensor
     k_rot: torch.Tensor
-    attn_flat: torch.Tensor           # attention output reshaped [B, S, H*D]
-    attn_out: torch.Tensor            # after wo projection
+    attn_out_raw: torch.Tensor       # attention output, shape [B, S, H, D]
+    attn_flat: torch.Tensor          # attention output reshaped [B, S, H*D]
+    attn_out: torch.Tensor           # after wo projection
+    softmax_lse: torch.Tensor | None  # flash attention softmax statistics (None for math fallback)
     hidden_after_attn: torch.Tensor   # after residual add (attention branch)
     normed2: torch.Tensor             # after ffn_norm
     gate_up: torch.Tensor             # after wfc1
@@ -389,7 +392,7 @@ def _forward_with_cache(
         q_rot = apply_rope(q, rope_freqs)
         k_rot = apply_rope(k, rope_freqs)
         allow_math = not torch.cuda.is_available()
-        attn = _gqa_attention(q_rot, k_rot, v, allow_math_fallback=allow_math)
+        attn, softmax_lse = _gqa_attention(q_rot, k_rot, v, allow_math_fallback=allow_math)
         attn_flat = attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         attn_out = torch.matmul(attn_flat, layer.attention_proj_weight.t())
         if capture_records is not None:
@@ -417,7 +420,8 @@ def _forward_with_cache(
             hidden_before_attn=hidden_before_attn,
             normed=normed, q=q, k=k, v=v,
             q_rot=q_rot, k_rot=k_rot,
-            attn_flat=attn_flat, attn_out=attn_out,
+            attn_out_raw=attn, attn_flat=attn_flat, attn_out=attn_out,
+            softmax_lse=softmax_lse,
             hidden_after_attn=hidden_after_attn,
             normed2=normed2, gate_up=gate_up, y1=y1, y2=y2,
             intermediate=intermediate, mlp_out=mlp_out,
@@ -467,7 +471,7 @@ def _forward_with_cache(
         mtp_q, mtp_k, mtp_v = project_qkv(mtp_normed, model.mtp.layer.qkv_weight)
         mtp_q_rot = apply_rope(mtp_q, rope_freqs)
         mtp_k_rot = apply_rope(mtp_k, rope_freqs)
-        mtp_attn = _gqa_attention(mtp_q_rot, mtp_k_rot, mtp_v, allow_math_fallback=allow_math)
+        mtp_attn, mtp_softmax_lse = _gqa_attention(mtp_q_rot, mtp_k_rot, mtp_v, allow_math_fallback=allow_math)
         mtp_attn_flat = mtp_attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         mtp_attn_out = torch.matmul(mtp_attn_flat, model.mtp.layer.attention_proj_weight.t())
         if capture_records is not None:
@@ -488,7 +492,8 @@ def _forward_with_cache(
             hidden_before_attn=mtp_hidden_before_attn,
             normed=mtp_normed, q=mtp_q, k=mtp_k, v=mtp_v,
             q_rot=mtp_q_rot, k_rot=mtp_k_rot,
-            attn_flat=mtp_attn_flat, attn_out=mtp_attn_out,
+            attn_out_raw=mtp_attn, attn_flat=mtp_attn_flat, attn_out=mtp_attn_out,
+            softmax_lse=mtp_softmax_lse,
             hidden_after_attn=mtp_hidden_after_attn,
             normed2=mtp_normed2, gate_up=mtp_gate_up,
             y1=mtp_y1, y2=mtp_y2,
@@ -557,6 +562,12 @@ def _add_to_grad_bufs(fp32_grad_bufs: list[torch.Tensor],
         if p.data_ptr() == weight.data_ptr():
             buf.add_(grad_weight.to(device=buf.device))
             return
+    # If we get here, no match was found — this is a bug that silently
+    # drops the gradient.  Surface it immediately.
+    raise RuntimeError(
+        f"_add_to_grad_bufs: no match for weight with shape {weight.shape}, "
+        f"data_ptr={weight.data_ptr()}"
+    )
 
 
 def _static_backward(
@@ -581,7 +592,7 @@ def _static_backward(
     B, S = cache.input_ids.shape
     H = C.HIDDEN_SIZE
     V = C.VOCAB_SIZE
-    allow_math = True  # always use math fallback for backward (flash_attn backward not accessible as standalone)
+    allow_math = not torch.cuda.is_available()
 
     # ====================================================================
     # MTP BRANCH BACKWARD (if enabled)
@@ -593,6 +604,8 @@ def _static_backward(
         grad_mtp_logits = cross_entropy_backward(
             cache.mtp_logits, cache.mtp_labels, cache.mtp_loss_mask
         )
+        # Scale by MTP loss weight: total = lm_loss + ce_w * mtp_loss
+        grad_mtp_logits = grad_mtp_logits * mtp_ce_weight
 
         # ── MTP LM head backward: logits = mtp_pre_head @ output_weight.T
         # d(mtp_pre_head) = grad_mtp_logits @ output_weight
@@ -658,10 +671,16 @@ def _static_backward(
 
         # Attention backward (GQA)
         d_mtp_attn = d_mtp_attn_flat.reshape(B, S, C.NUM_HEADS, C.HEAD_DIM)
-        d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward(
-            d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
-            allow_math_fallback=allow_math,
-        )
+        if mtp_lc.softmax_lse is not None:
+            d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward_flash(
+                d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
+                mtp_lc.attn_out_raw, mtp_lc.softmax_lse,
+            )
+        else:
+            d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward(
+                d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
+                allow_math_fallback=allow_math,
+            )
 
         # RoPE backward
         d_mtp_q = apply_rope_backward(d_mtp_q_rot, rope_freqs)
@@ -792,10 +811,16 @@ def _static_backward(
 
         # Attention backward (GQA)
         d_attn = d_attn_flat.reshape(B, S, C.NUM_HEADS, C.HEAD_DIM)
-        d_q_rot, d_k_rot, d_v = gqa_attention_backward(
-            d_attn, lc.q_rot, lc.k_rot, lc.v,
-            allow_math_fallback=allow_math,
-        )
+        if lc.softmax_lse is not None:
+            d_q_rot, d_k_rot, d_v = gqa_attention_backward_flash(
+                d_attn, lc.q_rot, lc.k_rot, lc.v,
+                lc.attn_out_raw, lc.softmax_lse,
+            )
+        else:
+            d_q_rot, d_k_rot, d_v = gqa_attention_backward(
+                d_attn, lc.q_rot, lc.k_rot, lc.v,
+                allow_math_fallback=allow_math,
+            )
 
         # RoPE backward
         d_q = apply_rope_backward(d_q_rot, rope_freqs)
@@ -823,6 +848,189 @@ def _static_backward(
         d_hidden * mup_emb_scale, cache.input_ids, C.VOCAB_SIZE
     )
     _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.tok_embeddings_weight, dw_emb)
+
+
+# ── Optimizer helpers ────────────────────────────────────────────────────────
+
+
+def _compute_grad_norm(
+    fp32_grad_bufs: list[torch.Tensor],
+    device: torch.device,
+    rank: int = 0,
+) -> torch.Tensor:
+    """Compute the L2 norm of all gradients (FP32).
+
+    Returns a scalar tensor on the given device.
+    """
+    # Use float64 for the sum to avoid overflow
+    sq_sum = torch.zeros((), device=device, dtype=torch.float64)
+    for buf in fp32_grad_bufs:
+        sq_sum += buf.double().pow(2).sum()
+    norm = sq_sum.sqrt().float()
+    if rank == 0:
+        top_vals = sorted([buf.abs().max().item() for buf in fp32_grad_bufs], reverse=True)[:5]
+        nonzero = sum((buf != 0).any().item() for buf in fp32_grad_bufs)
+        print(f"[DEBUG] grad_norm={norm.item():.4f}, nonzero_bufs={nonzero}/{len(fp32_grad_bufs)}, top_max_vals={[f'{v:.4f}' for v in top_vals]}", flush=True)
+    return norm
+
+
+def _clip_gradients(
+    fp32_grad_bufs: list[torch.Tensor],
+    max_norm: float,
+    norm: torch.Tensor,
+) -> None:
+    """Scale gradients in-place if the total norm exceeds ``max_norm``."""
+    if max_norm <= 0.0:
+        return
+    clip_coef = max_norm / (norm + 1e-6)
+    if clip_coef < 1.0:
+        torch._foreach_mul_(fp32_grad_bufs, clip_coef)
+
+
+def _build_optimizer_groups(
+    fp32_master: list[torch.Tensor],
+    bf16_params: list[torch.Tensor],
+    model: ModelParameters,
+    lr: float,
+    width_mult: float,
+    weight_decay: float,
+) -> list[dict]:
+    """Build parameter groups matching the ref's AdamW with muP lr scaling.
+
+    The ref (``model_pure_mup_mtp.py:mup_lr_groups`` and
+    ``train_pure_mup_mtp.py`` L601-615) splits into:
+      - muP-scaled matrix weights (qkv, wfc1, eagle_fc, wo, w2) → ``lr / width_mult``
+      - unscaled weights (embedding, output, all norms) → ``lr``
+    Within each group, params with dim >= 2 get ``weight_decay``, dim < 2 get 0.
+    """
+    fqn_map = _build_fqn_map(model)
+
+    # Determine which FQNs are muP-scaled matrix weights (mirroring ref's
+    # ``mup_lr_groups``: ``.weight`` AND not norm AND not tok_embeddings
+    # AND not output.weight).
+    def _is_matrix_fqn(fqn: str) -> bool:
+        return (
+            fqn.endswith("_weight")
+            and "norm" not in fqn
+            and "tok_embeddings" not in fqn
+            and "output" not in fqn
+        )
+
+    scaled_wd: list[torch.Tensor] = []
+    scaled_no_wd: list[torch.Tensor] = []
+    unscaled_wd: list[torch.Tensor] = []
+    unscaled_no_wd: list[torch.Tensor] = []
+
+    for buf, p in zip(fp32_master, bf16_params):
+        fqn = fqn_map.get(p.data_ptr(), "")
+        is_matrix = _is_matrix_fqn(fqn)
+        if is_matrix:
+            (scaled_wd if buf.dim() >= 2 else scaled_no_wd).append(buf)
+        else:
+            (unscaled_wd if buf.dim() >= 2 else unscaled_no_wd).append(buf)
+
+    groups: list[dict] = []
+    scaled_lr = lr / width_mult
+    for g_params, g_lr, g_wd in [
+        (scaled_wd, scaled_lr, weight_decay),
+        (scaled_no_wd, scaled_lr, 0.0),
+        (unscaled_wd, lr, weight_decay),
+        (unscaled_no_wd, lr, 0.0),
+    ]:
+        if g_params:
+            groups.append({"params": g_params, "lr": g_lr, "weight_decay": g_wd})
+    return groups
+
+
+def _adamw_step(
+    optim_groups: list[dict],
+    fp32_master: list[torch.Tensor],
+    fp32_grad_bufs: list[torch.Tensor],
+    exp_avgs: dict[int, torch.Tensor],
+    exp_avg_sqs: dict[int, torch.Tensor],
+    state_steps: dict[int, torch.Tensor],
+    beta1: float,
+    beta2: float,
+    eps: float,
+) -> None:
+    """Apply one AdamW step using the fused multi-tensor kernel.
+
+    ``fp32_master`` and ``fp32_grad_bufs`` are parallel lists (same order).
+    ``exp_avgs``, ``exp_avg_sqs``, ``state_steps`` are dicts keyed by
+    ``data_ptr`` of the corresponding fp32 master tensor.
+    """
+    # Build a mapping from fp32_master data_ptr to gradient buffer
+    grad_map: dict[int, torch.Tensor] = {}
+    for p, buf in zip(fp32_master, fp32_grad_bufs):
+        grad_map[p.data_ptr()] = buf
+
+    for group in optim_groups:
+        params = group["params"]
+        n = len(params)
+        if n == 0:
+            continue
+        lr = group["lr"]
+        wd = group["weight_decay"]
+
+        # Collect gradients, momentum buffers, and step counters for this group
+        grads: list[torch.Tensor] = []
+        eas: list[torch.Tensor] = []
+        eass: list[torch.Tensor] = []
+        steps: list[torch.Tensor] = []
+        for p in params:
+            grads.append(grad_map[p.data_ptr()])
+            eas.append(exp_avgs[p.data_ptr()])
+            eass.append(exp_avg_sqs[p.data_ptr()])
+            steps.append(state_steps[p.data_ptr()])
+
+        # Increment step counters (fused kernel reads the current step)
+        torch._foreach_add_(steps, 1)
+
+        # Call fused AdamW kernel (same underlying op as ref's fused=True)
+        torch._fused_adamw_(
+            tuple(params),
+            tuple(grads),
+            tuple(eas),
+            tuple(eass),
+            tuple(torch.zeros_like(p) for p in params),
+            tuple(steps),
+            amsgrad=False,
+            lr=lr,
+            beta1=beta1,
+            beta2=beta2,
+            weight_decay=wd,
+            eps=eps,
+            maximize=False,
+        )
+
+
+def _sync_bf16_from_fp32(
+    bf16_params: list[torch.Tensor],
+    fp32_master: list[torch.Tensor],
+) -> None:
+    """Copy FP32 master weights back to BF16 params (in-place, no grad)."""
+    for p_bf16, p_fp32 in zip(bf16_params, fp32_master):
+        p_bf16.data.copy_(p_fp32.data)
+
+
+def _init_optimizer_state(
+    fp32_master: list[torch.Tensor],
+    device: torch.device,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    """Initialize AdamW optimizer state (exp_avg, exp_avg_sq, step).
+
+    Returns dicts keyed by fp32 master tensor ``data_ptr``.
+    """
+    exp_avgs: dict[int, torch.Tensor] = {}
+    exp_avg_sqs: dict[int, torch.Tensor] = {}
+    state_steps: dict[int, torch.Tensor] = {}
+    for p in fp32_master:
+        key = p.data_ptr()
+        exp_avgs[key] = torch.zeros_like(p)
+        exp_avg_sqs[key] = torch.zeros_like(p)
+        # Fused kernel requires float32 scalar step
+        state_steps[key] = torch.tensor(0.0, device=device, dtype=torch.float32)
+    return exp_avgs, exp_avg_sqs, state_steps
 
 
 # ── Main training loop ────────────────────────────────────────────────────────
@@ -886,6 +1094,27 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # ── FP32 gradient buffers ──────────────────────────────────────────
     fp32_grad_bufs = [torch.zeros_like(p_) for p_ in fp32_master]
 
+    # ── Optimizer state (AdamW) ────────────────────────────────────────
+    opt_beta1 = float(os.environ.get("ADAM_BETA1", "0.9"))
+    opt_beta2 = float(os.environ.get("ADAM_BETA2", "0.95"))
+    opt_eps = 1e-8
+    opt_wd = float(os.environ.get("WEIGHT_DECAY", "0.1"))
+    opt_lr = config.lr
+    opt_min_lr = config.min_lr
+    opt_lr_warmup = config.lr_warmup_iters
+    opt_lr_decay = config.lr_decay_iters
+    opt_lr_wsd_decay = config.lr_wsd_decay_iters
+    opt_clip_grad = float(os.environ.get("CLIP_GRAD", "1.0"))
+
+    exp_avgs, exp_avg_sqs, opt_state_steps = _init_optimizer_state(fp32_master, device)
+    optim_groups = _build_optimizer_groups(
+        fp32_master, bf16_params, model,
+        lr=opt_lr, width_mult=width_mult, weight_decay=opt_wd,
+    )
+    # Save per-group LR multipliers (muP scaling: scaled matrix weights → lr/width_mult)
+    # so we can update per-group LR before each optimizer step (matching ref's pattern).
+    lr_mult_per_group = [g["lr"] / opt_lr for g in optim_groups]
+
     # ── Dataloader ─────────────────────────────────────────────────────
     dl = _build_dataloader(
         data_path=config.data_path,
@@ -912,13 +1141,6 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     train_per_token = _compute_flops_per_step()
     flops_per_step = train_per_token * tokens_per_step
     peak_total = H100_BF16_PEAK_FLOPS * max(config.world_size, 1)
-
-    # ── Learning rate schedule params ──────────────────────────────────
-    lr = float(os.environ.get("LR", str(config.lr)))
-    min_lr = float(os.environ.get("MIN_LR", str(config.min_lr)))
-    lr_warmup_iters = int(os.environ.get("LR_WARMUP_ITERS", str(config.lr_warmup_iters)))
-    lr_decay_iters = int(os.environ.get("LR_DECAY_ITERS", str(config.lr_decay_iters)))
-    lr_wsd_decay_iters = int(os.environ.get("LR_WSD_DECAY_ITERS", str(config.lr_wsd_decay_iters)))
 
     # ── Training loop ──────────────────────────────────────────────────
     for step in range(config.num_steps):
@@ -990,28 +1212,68 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             for buf in fp32_grad_bufs:
                 dist.all_reduce(buf)
 
-        # ── Capture mode: dump and exit ───────────────────────────────
-        if config.hash_capture_level > 0:
+        # ── Scale gradients by 1/token_count (matching ref's reduce_grads norm_factor) ──
+        # The ref computes obj = sum(nll * mask), then backward() computes the gradient
+        # of the SUM. reduce_grads then scales by 1/g_lm_n to convert to the gradient
+        # of the AVERAGE. Without this scaling, our gradients are lm_n times larger.
+        norm_factor = 1.0 / local_lm_n.clamp(min=1.0)
+        for buf in fp32_grad_bufs:
+            buf.mul_(norm_factor)
+
+        # ── Capture mode: dump and exit (non-persistent) ────────────────
+        if config.hash_capture_level > 0 and not config.persistent:
             _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model)
             _write_capture_output(config, capture_records, rank)
             _ordered_teardown()
             return  # Not reached (SystemExit raised in _ordered_teardown)
+
+        # ── Compute gradient norm ─────────────────────────────────────
+        grad_norm_val = _compute_grad_norm(fp32_grad_bufs, device, rank=rank)
+
+        # ── Clip gradients ────────────────────────────────────────────
+        _clip_gradients(fp32_grad_bufs, opt_clip_grad, grad_norm_val)
+
+        # ── Compute LR for this step ──────────────────────────────────
+        # ref uses ``step + 1`` (1-indexed) for the LR schedule
+        current_lr = _compute_lr(
+            step + 1, opt_lr, opt_min_lr,
+            opt_lr_warmup, opt_lr_decay, opt_lr_wsd_decay,
+        )
+
+        # ── AdamW optimizer step ──────────────────────────────────────
+        # Update per-group LR to match ref's ``pg["lr"] = lr * mult``
+        for g, mult in zip(optim_groups, lr_mult_per_group):
+            g["lr"] = current_lr * mult
+        _adamw_step(
+            optim_groups, fp32_master, fp32_grad_bufs,
+            exp_avgs, exp_avg_sqs, opt_state_steps,
+            beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
+        )
+
+        # ── Sync BF16 params from FP32 master ─────────────────────────
+        _sync_bf16_from_fp32(bf16_params, fp32_master)
 
         # ── Per-step logging ──────────────────────────────────────────
         torch.cuda.synchronize()
         step_time = time.time() - t0
         total = reported_lm + ce_w * reported_mtp if use_mtp else reported_lm
         mfu = flops_per_step / (step_time * peak_total) * 100.0 if step_time > 0 else 0.0
+        gn = grad_norm_val.item()
 
         if rank == 0:
             loss_line = (
                 f"[{loss_tag}] step={config.start_step + step + 1} "
                 f"global_loss={total:.9e} "
-                f"grad_norm={0.0:.9e} "
+                f"grad_norm={gn:.9e} "
                 f"time_s={step_time:.6f} "
                 f"mfu_e2e_standard={mfu:.6f}"
             )
             print(loss_line, flush=True)
+
+    # ── Persistent capture: write hash dump before teardown ──────────
+    if config.hash_capture_level > 0 and config.persistent and capture_records is not None:
+        _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model)
+        _write_capture_output(config, capture_records, rank)
 
     # ── Ordered teardown ──────────────────────────────────────────────
     _ordered_teardown()

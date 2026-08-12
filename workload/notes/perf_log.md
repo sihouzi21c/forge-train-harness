@@ -30,3 +30,19 @@
 ### Status
 - Alignment milestone: in progress — engine functional, data path issue to fix
 - Next step: ensure DATA_CONF is used for data path, add missing capture keys (layer outputs, MTP keys), run backward-align
+- review R1 PASS: engine implements forward/backward/loss/optimizer in-process; no proxy detected
+- review R2 PASS: engine implements forward/backward/optimizer/loss in-process; no proxy detected
+
+## Round 2 — bitwise-singlecard milestone: gradient scaling bug fix + optimizer hyperparameter plumbing
+
+### Changes
+- **Fixed critical gradient scaling bug**: The ref's `reduce_grads` scales accumulated gradients by `1/g_lm_n` (the per-step LM token count), converting the gradient from "sum of NLL" to "average NLL". The in-house engine was missing this scaling, making gradients `lm_n` times larger than the ref's, which would cause the optimizer to diverge from step 1. Added `norm_factor = 1.0 / local_lm_n.clamp(min=1.0)` scaling of `fp32_grad_bufs` after the gradient all-reduce.
+- **Fixed per-step LR update**: The `_adamw_step` function was using the initial per-group LR instead of the per-step computed LR (via `_compute_lr`). Added `lr_mult_per_group` to track muP LR multipliers and update `g["lr"] = current_lr * mult` before each optimizer step, matching the ref's `pg["lr"] = lr * mult` pattern.
+- **Fixed optimizer hyperparameter plumbing**: Updated `eval_train_steps.py` to pass `lr`, `min_lr`, `lr_warmup_iters`, `lr_decay_iters`, `lr_wsd_decay_iters` from the rendered product to `TrainLoopConfig`. Updated `run_training_loop` to use `config.lr` etc. as the primary source (matching the constraint that engine reads optimizer hp from config files).
+
+### Observation
+- The gradient scaling bug was the most likely cause of multi-step alignment failure — the `lm_n` factor (up to 8192 for MBS=2 × S=4096) would make the optimizer step ~8000× too large, producing completely different parameters from step 1 onwards.
+- The per-step LR update was a latent bug that doesn't affect the multistep-1gpu gate (8 steps, warmup=0, far from decay → LR constant at 5.22e-4), but would cause misalignment on longer runs with changing LR.
+
+### Next step
+- Remote sync and run `bin/harness run multistep-1gpu` to verify the fix.

@@ -297,6 +297,55 @@ def _check_head_dims(grad_q, grad_k, grad_v, nkv, nq_per_kv, d):
         raise ValueError("project_qkv_backward: " + "; ".join(msg_parts))
 
 
+# ── GQA attention backward (flash attention path) ────────────────────────────
+
+
+def gqa_attention_backward_flash(
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    deterministic: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward of flash attention via ``_flash_attn_backward``.
+
+    Uses the same flash attention backward kernel as the ref's autograd
+    Function, ensuring bitwise alignment.
+
+    Args:
+        grad_out: Gradient w.r.t. attention output, shape ``[B, S, H, D]``.
+        q, k, v: Forward inputs, shape ``[B, S, H_q/D, H_kv/D, H_kv/D]``.
+        out: Attention output from forward, shape ``[B, S, H, D]``.
+        softmax_lse: Softmax log-sum-exp from forward, shape ``[B, H, S]``.
+        deterministic: Whether to use deterministic computation.
+
+    Returns:
+        ``(grad_q, grad_k, grad_v)``.
+    """
+    from flash_attn.flash_attn_interface import _flash_attn_backward
+
+    B, S, H_q, D = q.shape
+    _, _, H_kv, _ = k.shape
+    d = D
+    softmax_scale = d ** -0.5
+
+    # Pre-allocate gradient buffers
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+
+    _flash_attn_backward(
+        grad_out, q, k, v, out, softmax_lse,
+        dq, dk, dv,
+        dropout_p=0.0, softmax_scale=softmax_scale,
+        causal=True, window_size=(-1, -1), alibi_slopes=None,
+        deterministic=deterministic,
+    )
+    return dq, dk, dv
+
+
 # ── GQA attention backward (math fallback) ──────────────────────────────────
 
 

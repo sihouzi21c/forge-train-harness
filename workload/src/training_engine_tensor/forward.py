@@ -123,28 +123,55 @@ def mlp_swiglu(hidden: torch.Tensor, fc1_weight: torch.Tensor,
     return torch.matmul(intermediate, fc2_weight.t())
 
 
+# ── GQA Attention (flash attention path with softmax stats for backward) ────
+
+
+def _gqa_attention_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         causal: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flash attention forward that also returns softmax statistics.
+
+    Returns ``(output, softmax_lse)`` where:
+        output: ``[B, S, NUM_HEADS, HEAD_DIM]``
+        softmax_lse: ``[B, NUM_HEADS, S]``
+
+    The flash attention CUDA kernel always computes ``softmax_lse`` internally
+    (needed for its own backward).  We pass ``return_softmax=False`` to avoid
+    a kernel-version check that rejects ``return_softmax=True`` with
+    ``dropout_p=0.0``; the returned ``softmax_lse`` is still valid.
+    """
+    from flash_attn.flash_attn_interface import _flash_attn_forward
+
+    d = q.shape[-1]
+    softmax_scale = d ** -0.5
+    out, _, _, _, _, softmax_lse, _, _ = _flash_attn_forward(
+        q, k, v, dropout_p=0.0, softmax_scale=softmax_scale,
+        causal=causal, window_size=(-1, -1), alibi_slopes=None,
+        return_softmax=False,
+    )
+    return out, softmax_lse
+
+
 # ── GQA Attention (math fallback for CPU / non-flash paths) ────────────────
 
 
 def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                   allow_math_fallback: bool = False) -> torch.Tensor:
+                   allow_math_fallback: bool = False,
+                   ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GQA scaled dot-product attention.
 
-    On CUDA, dispatches to ``flash_attn_func`` when ``allow_math_fallback``
-    is ``False``.  When ``allow_math_fallback`` is ``True`` (or on CPU),
-    uses the explicit math backend (softmax + matmul) so the backward
-    can be computed via the manual backward primitives.
+    On CUDA, dispatches to ``flash_attn`` (via ``_flash_attn_forward``) when
+    ``allow_math_fallback`` is ``False``.  Returns ``(output, softmax_lse)``
+    where ``softmax_lse`` is ``None`` for the math fallback path.
+
+    When ``allow_math_fallback`` is ``True`` (or on CPU), uses the explicit
+    math backend (softmax + matmul) and returns ``(output, None)``.
 
     ``q`` shape ``[B, S, NUM_HEADS, HEAD_DIM]``.
     ``k``, ``v`` shape ``[B, S, NUM_KV_HEADS, HEAD_DIM]``.
-    Returns ``[B, S, NUM_HEADS, HEAD_DIM]``.
+    Returns ``(output, softmax_lse)`` where ``output`` is ``[B, S, NUM_HEADS, HEAD_DIM]``.
     """
     if q.device.type == "cuda" and not allow_math_fallback:
-        try:
-            from flash_attn import flash_attn_func  # type: ignore[import-untyped]
-            return flash_attn_func(q, k, v, causal=True, deterministic=True)
-        except ImportError:
-            pass
+        return _gqa_attention_flash(q, k, v, causal=True)
 
     if not allow_math_fallback:
         raise NotImplementedError(
@@ -152,7 +179,7 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             "Pass allow_math_fallback=True for the CPU math path."
         )
 
-    # Math fallback: causal softmax attention
+    # Math fallback: causal softmax attention (returns None for softmax_lse)
     # flash_attn uses [B, S, H, D] layout; for math fallback we permute to [B, H, S, D]
     B, S, H_q, D = q.shape
     _, _, H_kv, _ = k.shape
@@ -177,7 +204,7 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
     attn_weights = torch.softmax(scores, dim=-1)  # [B, H_q, S, S]
     out = torch.matmul(attn_weights.to(v_attn.dtype), v_attn)  # [B, H_q, S, D]
-    return out.permute(0, 2, 1, 3)  # [B, S, H_q, D]
+    return out.permute(0, 2, 1, 3), None  # [B, S, H_q, D]
 
 
 # ── Decoder layer forward ──────────────────────────────────────────────────
@@ -206,7 +233,7 @@ def decoder_layer_forward(
     q, k, v = project_qkv(normed, layer.qkv_weight)
     q = apply_rope(q, rope_freqs)
     k = apply_rope(k, rope_freqs)
-    attn = _gqa_attention(q, k, v, allow_math_fallback=allow_math_fallback)
+    attn, _ = _gqa_attention(q, k, v, allow_math_fallback=allow_math_fallback)
     attn_flat = attn.reshape(B, S, NUM_HEADS * HEAD_DIM)
     hidden = hidden + torch.matmul(attn_flat, layer.attention_proj_weight.t()) * depth_scale
 
