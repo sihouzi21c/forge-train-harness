@@ -358,11 +358,11 @@ def gqa_attention_backward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward of :func:`training_engine_tensor.forward._gqa_attention`.
 
-    When ``allow_math_fallback`` is ``True``, uses the explicit softmax
-    backward (same as the math fallback forward).  On CUDA without the
-    fallback flag, raises ``NotImplementedError`` (the flash_attn
-    backward is handled by the flash_attn library's own autograd Function
-    and is not accessible as a standalone primitive).
+    When ``allow_math_fallback`` is ``True``, uses ``F.scaled_dot_product_attention``
+    with ``torch.autograd.grad`` for bitwise alignment with the ref's internal
+    math backend.  On CUDA without the fallback flag, raises ``NotImplementedError``
+    (the flash_attn backward is handled by the flash_attn library's own autograd
+    Function and is not accessible as a standalone primitive).
 
     Returns ``(grad_q, grad_k, grad_v)``.
     """
@@ -380,11 +380,12 @@ def gqa_attention_backward(
             "math fallback path."
         )
 
+    import torch.nn.functional as _F
+
     B, S, H_q, D = q.shape
     _, _, H_kv, _ = k.shape
-    dtype = grad_out.dtype
 
-    # Repeat KV heads to match Q heads
+    # Repeat KV heads to match Q heads (GQA)
     rep = H_q // H_kv
     if rep > 1:
         k_exp = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, S, H_q, D)
@@ -393,53 +394,21 @@ def gqa_attention_backward(
         k_exp = k
         v_exp = v
 
-    # Permute to [B, H, S, D] for standard attention backward
-    q_attn = q.permute(0, 2, 1, 3)  # [B, H_q, S, D]
-    k_attn = k_exp.permute(0, 2, 1, 3)  # [B, H_q, S, D]
-    v_attn = v_exp.permute(0, 2, 1, 3)  # [B, H_q, S, D]
-    grad_out_attn = grad_out.permute(0, 2, 1, 3)  # [B, H_q, S, D]
+    # Replay forward through F.scaled_dot_product_attention with autograd
+    # to get bitwise-identical gradients to the ref's internal math backend.
+    with torch.enable_grad():
+        qd = q.detach().requires_grad_(True)
+        kd = k_exp.detach().requires_grad_(True)
+        vd = v_exp.detach().requires_grad_(True)
+        out = _F.scaled_dot_product_attention(qd, kd, vd, is_causal=True, dropout_p=0.0, scale=None)
+        grad_q, grad_k, grad_v = torch.autograd.grad(out, (qd, kd, vd), grad_out)
 
-    scale = D ** 0.5
-    causal_mask = torch.triu(
-        torch.ones(S, S, device=q.device, dtype=torch.bool), diagonal=1
-    )
-
-    # Forward re-compute (no grad needed)
-    with torch.no_grad():
-        scores = torch.matmul(q_attn.to(dtype=dtype), k_attn.to(dtype=dtype).transpose(-2, -1)) / scale
-        scores = scores.masked_fill(causal_mask, float("-inf"))
-        attn_weights = torch.softmax(scores, dim=-1)  # [B, H_q, S, S]
-
-    # d(loss) / d(attn_weights) = grad_out @ v^T
-    d_attn = torch.matmul(grad_out_attn.to(dtype=dtype), v_attn.to(dtype=dtype).transpose(-2, -1))  # [B, H_q, S, S]
-
-    # Softmax backward
-    d_scores = attn_weights * (d_attn - (d_attn * attn_weights).sum(dim=-1, keepdim=True))
-    d_scores = d_scores.masked_fill(causal_mask, 0.0)
-    d_scores = d_scores / scale
-
-    # dQ = d_scores @ k
-    grad_q_attn = torch.matmul(d_scores.to(q_attn.dtype), k_attn)
-
-    # dK = d_scores^T @ q
-    dk_full = torch.matmul(d_scores.transpose(-2, -1).to(k_attn.dtype), q_attn)
-    # dV = attn_weights^T @ grad_out
-    dv_full = torch.matmul(attn_weights.transpose(-2, -1).to(v_attn.dtype), grad_out_attn)
-
-    # Permute back to [B, S, H, D]
-    grad_q_out = grad_q_attn.permute(0, 2, 1, 3)
-    dk_full = dk_full.permute(0, 2, 1, 3)
-    dv_full = dv_full.permute(0, 2, 1, 3)
-
-    # Reduce KV gradients if repeated
+    # Reduce KV gradients if repeated (GQA)
     if rep > 1:
-        grad_k_out = dk_full.reshape(B, S, H_kv, rep, D).sum(dim=-2)
-        grad_v_out = dv_full.reshape(B, S, H_kv, rep, D).sum(dim=-2)
-    else:
-        grad_k_out = dk_full
-        grad_v_out = dv_full
+        grad_k = grad_k.reshape(B, S, H_kv, rep, D).sum(dim=-2)
+        grad_v = grad_v.reshape(B, S, H_kv, rep, D).sum(dim=-2)
 
-    return grad_q_out, grad_k_out, grad_v_out
+    return grad_q, grad_k, grad_v
 
 
 # ── Cross-entropy loss backward (FP32) ──────────────────────────────────────

@@ -151,7 +151,7 @@ def _gqa_attention_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return out, softmax_lse
 
 
-# ── GQA Attention (math fallback for CPU / non-flash paths) ────────────────
+# ── GQA Attention (math fallback — uses F.scaled_dot_product_attention for bitwise alignment with ref) ────
 
 
 def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -163,8 +163,9 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     ``allow_math_fallback`` is ``False``.  Returns ``(output, softmax_lse)``
     where ``softmax_lse`` is ``None`` for the math fallback path.
 
-    When ``allow_math_fallback`` is ``True`` (or on CPU), uses the explicit
-    math backend (softmax + matmul) and returns ``(output, None)``.
+    When ``allow_math_fallback`` is ``True`` (or on CPU), uses
+    ``F.scaled_dot_product_attention`` (math backend) for bitwise alignment
+    with the ref's deterministic stack, and returns ``(output, None)``.
 
     ``q`` shape ``[B, S, NUM_HEADS, HEAD_DIM]``.
     ``k``, ``v`` shape ``[B, S, NUM_KV_HEADS, HEAD_DIM]``.
@@ -179,32 +180,16 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             "Pass allow_math_fallback=True for the CPU math path."
         )
 
-    # Math fallback: causal softmax attention (returns None for softmax_lse)
-    # flash_attn uses [B, S, H, D] layout; for math fallback we permute to [B, H, S, D]
-    B, S, H_q, D = q.shape
-    _, _, H_kv, _ = k.shape
-
-    # Repeat KV heads to match Q heads
-    rep = H_q // H_kv
-    if rep > 1:
-        k = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, S, H_q, D)
-        v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, S, H_q, D)
-
-    # Permute to [B, H, S, D] for standard attention computation
-    q_attn = q.permute(0, 2, 1, 3)  # [B, H_q, S, D]
-    k_attn = k.permute(0, 2, 1, 3)  # [B, H_q, S, D]
-    v_attn = v.permute(0, 2, 1, 3)  # [B, H_q, S, D]
-
-    scale = D ** 0.5
-    scores = torch.matmul(q_attn.to(dtype=q.dtype), k_attn.to(dtype=q.dtype).transpose(-2, -1)) / scale  # [B, H_q, S, S]
-
-    # Causal mask: upper triangle
-    causal_mask = torch.triu(torch.ones(S, S, device=q.device, dtype=torch.bool), diagonal=1)
-    scores = scores.masked_fill(causal_mask, float("-inf"))
-
-    attn_weights = torch.softmax(scores, dim=-1)  # [B, H_q, S, S]
-    out = torch.matmul(attn_weights.to(v_attn.dtype), v_attn)  # [B, H_q, S, D]
-    return out.permute(0, 2, 1, 3), None  # [B, S, H_q, D]
+    # Use F.scaled_dot_product_attention (math backend) for bitwise alignment
+    # with the ref.  The ref's determinism stack disables flash SDP and
+    # mem-efficient SDP, falling back to the math backend.  Our decomposed
+    # torch.matmul + torch.softmax path produces different results from the
+    # ref's internal implementation (torch.baddbmm + internal softmax), so
+    # we must use the same function the ref uses.
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, is_causal=True, attn_mask=None, dropout_p=0.0, scale=None
+    )
+    return out, None
 
 
 # ── Decoder layer forward ──────────────────────────────────────────────────
