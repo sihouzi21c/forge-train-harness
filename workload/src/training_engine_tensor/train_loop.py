@@ -1104,10 +1104,12 @@ def _init_process_group() -> int:
 
 
 def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then return.
+    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then exit.
 
-    Returns normally so the interpreter can clean up.  The barrier uses
-    device_ids to avoid the "devices unknown" warning.
+    Uses ``os._exit(0)`` to bypass the Python interpreter's finalizer,
+    which would otherwise crash with SIGABRT when the NCCL PG destructor
+    races Py_Finalize.  This is safe because all data has been flushed
+    to disk before this point.
     """
     import gc
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1134,3 +1136,5 @@ def _ordered_teardown() -> None:
         print("ALL DONE", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
+    # Bypass the Python finalizer to avoid the NCCL PG destructor crash.
+    os._exit(0)
