@@ -837,8 +837,20 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = f"cuda:{local_rank}"
 
-    # ── Seed ───────────────────────────────────────────────────────────
+    # ── Determinism (must match the ref's enable_determinism) ──────────
+    # The ref enables the full bit-wise determinism stack; the in-house
+    # engine must do the same for bitwise alignment (alignment milestone).
+    import random
+    import numpy as np
+    random.seed(config.seed)
+    np.random.seed(config.seed)
     torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
 
     # ── Model parameters ───────────────────────────────────────────────
     init_ones = int(os.environ.get("FORGE_INIT_ONES", "0"))
