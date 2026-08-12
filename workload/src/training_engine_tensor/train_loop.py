@@ -381,9 +381,10 @@ def _forward_with_cache(
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.attention_norm", 0, normed)
 
+        qkv_proj = torch.matmul(normed, layer.qkv_weight.t())
         q, k, v = project_qkv(normed, layer.qkv_weight)
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wqkv", 0, q)
+            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wqkv", 0, qkv_proj)
 
         q_rot = apply_rope(q, rope_freqs)
         k_rot = apply_rope(k, rope_freqs)
@@ -462,6 +463,7 @@ def _forward_with_cache(
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, "mtp.layer.attention_norm", 0, mtp_normed)
 
+        mtp_qkv_proj = torch.matmul(mtp_normed, model.mtp.layer.qkv_weight.t())
         mtp_q, mtp_k, mtp_v = project_qkv(mtp_normed, model.mtp.layer.qkv_weight)
         mtp_q_rot = apply_rope(mtp_q, rope_freqs)
         mtp_k_rot = apply_rope(mtp_k, rope_freqs)
