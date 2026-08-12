@@ -1296,7 +1296,13 @@ def _build_fqn_map(model: ModelParameters) -> dict:
     fqn_map = {}
     fqn_map[model.tok_embeddings_weight.data_ptr()] = "tok_embeddings.weight"
     fqn_map[model.final_norm_weight.data_ptr()] = "norm.weight"
-    fqn_map[model.output_weight.data_ptr()] = "output.weight"
+    if model.output_weight is not model.tok_embeddings_weight:
+        fqn_map[model.output_weight.data_ptr()] = "output.weight"
+    else:
+        # Tied weight: also register output.weight under the same data_ptr
+        # (the ref's named_parameters returns both names; use output.weight
+        # as the canonical name for the hash capture key).
+        fqn_map[model.output_weight.data_ptr()] = "output.weight"
     for layer in model.layers:
         idx = layer.index
         fqn_map[layer.input_norm_weight.data_ptr()] = f"layers.{idx}.attention_norm.weight"
@@ -1320,7 +1326,14 @@ def _build_fqn_map(model: ModelParameters) -> dict:
 
 
 def _collect_bf16_params(model: ModelParameters) -> list[torch.Tensor]:
-    """Collect all bf16 weight tensors from the model."""
+    """Collect all bf16 weight tensors from the model.
+
+    The model ties ``output_weight`` to ``tok_embeddings_weight`` (same tensor,
+    matching the ref's weight tying).  Skip the duplicate to avoid parallel
+    ``fp32_master`` / ``fp32_grad_bufs`` entries that would cause the
+    ``_adamw_step`` ``grad_map`` to map the tied ``data_ptr`` to the wrong
+    (zero) gradient buffer.
+    """
     params = [model.tok_embeddings_weight]
     for layer in model.layers:
         params.extend([
@@ -1332,7 +1345,8 @@ def _collect_bf16_params(model: ModelParameters) -> list[torch.Tensor]:
             layer.mlp_fc2_weight,
         ])
     params.append(model.final_norm_weight)
-    params.append(model.output_weight)
+    if model.output_weight is not model.tok_embeddings_weight:
+        params.append(model.output_weight)
     if model.mtp is not None:
         params.extend([
             model.mtp.emb_input_norm_weight,

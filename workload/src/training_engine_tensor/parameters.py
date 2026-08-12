@@ -286,6 +286,14 @@ def load_weights_from_checkpoint(
         flat_params = all_params
         flat_names = all_names
 
+    # Tie tok_embeddings_weight and output_weight (matching ref's weight tying).
+    # The ref's model sets self.tok_embeddings.weight = self.output.weight.
+    # This ensures the backward accumulates the combined gradient (embedding +
+    # output head) into a single buffer, and the optimizer updates a single weight.
+    tok_idx = flat_names.index("tok_embeddings_weight")
+    out_idx = flat_names.index("output_weight")
+    flat_params[out_idx] = flat_params[tok_idx]
+
     # Build ModelParameters from the flat list
     layers = []
     li = 0
