@@ -1103,37 +1103,33 @@ def _init_process_group() -> int:
 
 
 def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, empty cache, barrier, destroy PG, then return.
+    """Ordered teardown: drain GPU, empty cache, then release the PG.
 
-    Returns normally (no ``os._exit``, no ``SystemExit``) so the interpreter
-    can clean up without crashing the NCCL communicator during its destructor
-    pass.  The gate wrapper checks exit code 0 + valid artifact, so a clean
-    return is required.
+    Returns normally so the interpreter can clean up without crashing
+    the NCCL communicator during its destructor pass.
     """
     import gc
     try:
-        # 1. Drain in-flight GPU work so no kernel is still executing.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     except Exception:
         pass
     try:
-        # 2. Free the CUDA allocator cache BEFORE destroying the PG so
-        #    no outstanding CUDA allocation holds a reference to the
-        #    NCCL communicator.
+        gc.collect()
+    except Exception:
+        pass
+    try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
     try:
-        # 3. Coordinate teardown across ranks, then release the PG.
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
     except Exception:
         pass
     try:
-        # 4. Final GC pass to collect any NCCL-related wrappers.
         gc.collect()
     except Exception:
         pass
@@ -1141,4 +1137,3 @@ def _ordered_teardown() -> None:
         print("ALL DONE", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
-    # Return normally — do NOT raise SystemExit or os._exit.
