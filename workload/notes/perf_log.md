@@ -65,3 +65,4 @@
 
 ### Next step
 - Remote sync and run `bin/harness run multistep-1gpu` to verify the fix.
+- review R3 PASS: engine implements forward/backward/loss/optimizer in-process; no proxy detected

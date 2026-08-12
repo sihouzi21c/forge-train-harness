@@ -16,6 +16,23 @@ None.
 - `train_loop.py:828-1017`: Full training loop with forward pass, static backward, loss computation, LR schedule, all in-process
 - `train_loop.py:212,258`: Only ref imports are dataloader utilities (`hf_stream_dataloader`, `MegatronBinaryDataloader`) — not core training logic
 
+## [stage1] Round 3 — 2026-08-12 18:44:13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: db3b7e9 — Feat: critical backward fixes — residual gradients, gradient scaling, weight tying, attention alignment
+
+### Key conclusions
+The dev agent fixed critical backward bugs (residual gradient connections, gradient scaling, weight tying, attention alignment, GQA backward shapes, per-step LR update) in the training engine. The engine in `workload/src/training_engine_tensor/` implements forward, backward, optimizer, loss, and metrics entirely in-process using pure torch operations. The two `from ref.reference.*` imports at `train_loop.py:212,258` are dataloader utilities only (HF streaming and Megatron binary), not core training logic. No hardcoded synthetic metrics, no shell-outs to reference scripts, no renamed proxy variants. The commit diff only touches `workload/notes/perf_log.md` (perf_log entry) — the actual code changes were in prior commits. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message, and the perf_log shows no green-light gate evidence for the required suites.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `forward.py:129-151`: GQA attention uses `F.scaled_dot_product_attention` for bitwise alignment with ref — no proxy
+- `backward.py:352-404`: GQA attention backward uses `torch.autograd.grad` through `F.scaled_dot_product_attention` — no proxy
+- `train_loop.py:212,258`: Only ref imports are dataloader utilities (`hf_stream_dataloader`, `MegatronBinaryDataloader`) — not core training logic
+
 ---
 
 ## [stage1] Round 2 — 2026-08-12 16:16:53

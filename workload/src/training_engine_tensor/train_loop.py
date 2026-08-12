@@ -269,8 +269,16 @@ def _pairwise(items):
 
 
 def _next_batch(dl, device):
-    """Get the next batch from the dataloader."""
+    """Get the next batch from the dataloader, skipping zero-loss-mask micro-batches.
+
+    Mirrors the ref's ``next_batch`` function which skips micro-batches where
+    all loss mask values are zero.  The ref's ``PrefetchedBatcher`` and inline
+    ``next_batch`` both do this; without it the in-house engine would consume
+    a batch that the ref skipped, causing data misalignment.
+    """
     data = next(dl)
+    while (data["loss_mask"] == 0).all().item():
+        data = next(dl)
     return (
         data["tokens"].to(device),
         data["labels"].to(device),
@@ -611,11 +619,12 @@ def _static_backward(
         # ── MTP LM head backward: logits = mtp_pre_head @ output_weight.T
         # d(mtp_pre_head) = grad_mtp_logits @ output_weight
         # d(output_weight) += grad_mtp_logits.T @ mtp_pre_head
-        # grad_mtp_logits is fp32 (from FP32 CE), output_weight is bf16
-        d_mtp_pre_head = torch.matmul(grad_mtp_logits, model.output_weight.to(dtype=grad_mtp_logits.dtype))
+        # grad_mtp_logits is fp32 (from FP32 CE), output_weight is bf16.
+        # Match the ref's _LinearFn.backward: keep weight in bf16 for the matmul.
+        d_mtp_pre_head = torch.matmul(grad_mtp_logits, model.output_weight)
         g2_mtp = grad_mtp_logits.reshape(-1, V)
         mtp_pre = cache.mtp_pre_head.reshape(-1, H)
-        dw_output_mtp = torch.matmul(g2_mtp.transpose(0, 1), mtp_pre.to(dtype=grad_mtp_logits.dtype)).float()
+        dw_output_mtp = torch.matmul(g2_mtp.transpose(0, 1), mtp_pre).float()
         _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.output_weight, dw_output_mtp)
 
         # ── width_mult backward: d(hidden) = d(mtp_pre_head) / width_mult
@@ -738,11 +747,12 @@ def _static_backward(
     grad_logits = cross_entropy_backward(cache.main_logits, cache.labels, cache.loss_mask)
 
     # ── Main LM head backward: logits = main_pre_head @ output_weight.T
-    # grad_logits is fp32 (from FP32 CE), output_weight is bf16
-    d_main_pre_head = torch.matmul(grad_logits, model.output_weight.to(dtype=grad_logits.dtype))
+    # grad_logits is fp32 (from FP32 CE), output_weight is bf16.
+    # Match the ref's _LinearFn.backward: keep weight in bf16 for the matmul.
+    d_main_pre_head = torch.matmul(grad_logits, model.output_weight)
     g2_main = grad_logits.reshape(-1, V)
     main_pre = cache.main_pre_head.reshape(-1, H)
-    dw_output_main = torch.matmul(g2_main.transpose(0, 1), main_pre.to(dtype=grad_logits.dtype)).float()
+    dw_output_main = torch.matmul(g2_main.transpose(0, 1), main_pre).float()
     _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.output_weight, dw_output_main)
 
     # ── width_mult backward: d(hidden) = d(main_pre_head) / width_mult
@@ -1068,6 +1078,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         mup_emb_scale=float(os.environ.get("MUP_EMB_SCALE", "12.0")),
         mup_depth_scale=float(os.environ.get("MUP_DEPTH_SCALE", "1.4")),
     )
+    if rank == 0:
+        import sys
+        print(f"[debug] model.tok_embeddings_weight.data_ptr={model.tok_embeddings_weight.data_ptr()}, model.output_weight.data_ptr={model.output_weight.data_ptr()}, same={model.tok_embeddings_weight.data_ptr() == model.output_weight.data_ptr()}", file=sys.stderr, flush=True)
 
     # muP constants
     mup_base_hidden_size = float(os.environ.get("MUP_BASE_HIDDEN_SIZE", "256"))
@@ -1127,7 +1140,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     capture_prefix = ""
     if config.hash_capture_level > 0:
         capture_records = {}
-        capture_prefix = f"rank{rank}.mb0."
+        # The ref's harness_dp adds a step_{step}. prefix before the rank prefix.
+        capture_prefix = f"step_{config.start_step}.rank{rank}.mb0."
 
     # ── MFU prep ───────────────────────────────────────────────────────
     tokens_per_step = config.global_batch_size * C.MAX_SEQ_LEN
@@ -1289,13 +1303,9 @@ def _build_fqn_map(model: ModelParameters) -> dict:
     fqn_map = {}
     fqn_map[model.tok_embeddings_weight.data_ptr()] = "tok_embeddings.weight"
     fqn_map[model.final_norm_weight.data_ptr()] = "norm.weight"
-    if model.output_weight is not model.tok_embeddings_weight:
-        fqn_map[model.output_weight.data_ptr()] = "output.weight"
-    else:
-        # Tied weight: also register output.weight under the same data_ptr
-        # (the ref's named_parameters returns both names; use output.weight
-        # as the canonical name for the hash capture key).
-        fqn_map[model.output_weight.data_ptr()] = "output.weight"
+    # The ref keeps tok_embeddings.weight and output.weight as SEPARATE tensors.
+    # Register both under their own data_ptr.
+    fqn_map[model.output_weight.data_ptr()] = "output.weight"
     for layer in model.layers:
         idx = layer.index
         fqn_map[layer.input_norm_weight.data_ptr()] = f"layers.{idx}.attention_norm.weight"
@@ -1321,13 +1331,11 @@ def _build_fqn_map(model: ModelParameters) -> dict:
 def _collect_bf16_params(model: ModelParameters) -> list[torch.Tensor]:
     """Collect all bf16 weight tensors from the model.
 
-    The model ties ``output_weight`` to ``tok_embeddings_weight`` (same tensor,
-    matching the ref's weight tying).  Skip the duplicate to avoid parallel
-    ``fp32_master`` / ``fp32_grad_bufs`` entries that would cause the
-    ``_adamw_step`` ``grad_map`` to map the tied ``data_ptr`` to the wrong
-    (zero) gradient buffer.
+    The ref's model keeps ``tok_embeddings.weight`` and ``output.weight`` as
+    SEPARATE tensors with independent optimizer state (m, v).  Both are
+    included in the parameter list.
     """
-    params = [model.tok_embeddings_weight]
+    params = [model.tok_embeddings_weight, model.output_weight]
     for layer in model.layers:
         params.extend([
             layer.input_norm_weight,
@@ -1338,8 +1346,6 @@ def _collect_bf16_params(model: ModelParameters) -> list[torch.Tensor]:
             layer.mlp_fc2_weight,
         ])
     params.append(model.final_norm_weight)
-    if model.output_weight is not model.tok_embeddings_weight:
-        params.append(model.output_weight)
     if model.mtp is not None:
         params.extend([
             model.mtp.emb_input_norm_weight,

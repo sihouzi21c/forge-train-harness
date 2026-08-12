@@ -185,6 +185,9 @@ def load_weights_from_checkpoint(
             internal_name = _ref_fqn_to_internal(k)
             flat_params.append(state[k].to(device=device, dtype=torch.bfloat16))
             flat_names.append(internal_name)
+        if rank == 0:
+            import sys
+            print(f"[debug] loaded canonical checkpoint from {ckpt_path} ({len(state)} keys)", file=sys.stderr, flush=True)
     else:
         # Initialise weights using muP scheme (same as ref)
         # ref: matrix weights (qkv, fc1, eagle_fc) → N(0, init_std/sqrt(width_mult))
@@ -286,15 +289,14 @@ def load_weights_from_checkpoint(
         flat_params = all_params
         flat_names = all_names
 
-    # Tie tok_embeddings_weight and output_weight (matching ref's weight tying).
-    # The ref's model sets self.tok_embeddings.weight = self.output.weight, so
-    # the embedding lookup uses the output weight tensor.  The canonical
-    # checkpoint stores BOTH keys with SEPARATE values (the harness hook does
-    # not preserve the tied-tensor identity), so we must REPLACE the
-    # tok_embeddings tensor with the output tensor to match the ref's behavior.
-    tok_idx = flat_names.index("tok_embeddings_weight")
-    out_idx = flat_names.index("output_weight")
-    flat_params[tok_idx] = flat_params[out_idx]  # tok_embeddings = output.weight
+    # The ref's model (model_pure_mup_mtp.py: MiniCPM4MupMtp) keeps
+    # tok_embeddings.weight and output.weight as SEPARATE tensors with
+    # independent optimizer state (m, v).  The canonical checkpoint stores
+    # both keys with separate values.  Do NOT tie them — the ref treats
+    # them as independent parameters.
+    # tok_idx = flat_names.index("tok_embeddings_weight")
+    # out_idx = flat_names.index("output_weight")
+    # flat_params[tok_idx] = flat_params[out_idx]  # tok_embeddings = output.weight
 
     # Build ModelParameters from the flat list
     layers = []

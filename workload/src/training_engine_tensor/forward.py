@@ -88,23 +88,17 @@ def project_qkv(hidden: torch.Tensor, weight: torch.Tensor
 
 def rms_norm(hidden: torch.Tensor, weight: torch.Tensor,
              eps: float | None = None) -> torch.Tensor:
-    """RMSNorm.  Follows the ``(x32 * r).to(bf16) * weight`` chain.
+    """RMSNorm.  Uses ``torch.nn.functional.rms_norm`` directly, matching the
+    ref's ``_RMSNormFn.forward`` (which calls ``F.rms_norm(x, shape, weight, eps)``).
 
-    This is the primitive decomposition that ``nn.RMSNorm`` uses on CUDA
-    and is the ONLY chain that is bitwise-identical to the ref's RMSNorm
-    at bf16.  See ``test_training_engine_forward.py::TestRmsNormAndSwiglu``.
-
-    For bf16 inputs, computation is in fp32. For fp32/fp64 inputs, the
-    computation stays in the input dtype.
+    This is the ONLY chain that is bitwise-identical to the ref's RMSNorm
+    at bf16.  The manual ``(x32 * r).to(bf16) * weight`` decomposition can
+    differ in floating-point rounding due to the fused kernel's reduction
+    order.
     """
+    import torch.nn.functional as _F
     eps_val = eps if eps is not None else NORM_EPS
-    if hidden.dtype == torch.bfloat16:
-        x32 = hidden.float()
-        r = torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps_val)
-        return (x32 * r).to(hidden.dtype) * weight
-    # For higher precision types, stay in the input dtype
-    r = torch.rsqrt(hidden.pow(2).mean(dim=-1, keepdim=True) + eps_val)
-    return (hidden * r) * weight
+    return _F.rms_norm(hidden, (weight.shape[0],), weight, eps_val)
 
 
 # ── SwiGLU MLP ─────────────────────────────────────────────────────────────
@@ -116,38 +110,42 @@ def mlp_swiglu(hidden: torch.Tensor, fc1_weight: torch.Tensor,
 
     SwiGLU uses fp32 for the SiLU activation multiplication (``silu(y1.float()) * y2.float()``),
     then casts back to the input dtype before the fc2 projection.
+    Uses ``torch.nn.functional.silu`` to match the ref's implementation exactly.
     """
+    import torch.nn.functional as _F
     gate_up = torch.matmul(hidden, fc1_weight.t())  # [B, S, 2*ffn]
     y_1, y_2 = gate_up.chunk(2, dim=-1)
-    intermediate = (torch.sigmoid(y_1.float()) * y_1.float() * y_2.float()).to(y_1.dtype)
+    intermediate = (_F.silu(y_1.float()) * y_2.float()).to(y_1.dtype)
     return torch.matmul(intermediate, fc2_weight.t())
 
 
-# ── GQA Attention (uses F.scaled_dot_product_attention for bitwise alignment with ref) ────
+# ── GQA Attention (uses flash_attn_func for bitwise alignment with ref) ────
 
 
 def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                    allow_math_fallback: bool = False,
                    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """GQA scaled dot-product attention.
+    """GQA scaled dot-product attention via flash_attn_func.
 
-    Always uses ``F.scaled_dot_product_attention`` for bitwise alignment
-    with the ref.  The ref's determinism stack disables flash SDP and
-    mem-efficient SDP, falling back to the math backend when supported.
-    For GQA (different head counts), the math backend may not be
-    available and the flash attention backend is used instead.
+    Uses ``flash_attn_func`` directly, matching the ref's attention implementation
+    exactly.  The ref's ``TransformerLayer.forward`` calls::
+
+        from flash_attn import flash_attn_func
+        attn = flash_attn_func(q, k, v, causal=True, deterministic=True)
+
+    ``allow_math_fallback`` is ignored — the flash_attn kernel is the
+    authoritative path for bitwise alignment.
 
     Returns ``(output, None)`` — the ``softmax_lse`` is always ``None``
-    because ``F.scaled_dot_product_attention`` does not expose it.
+    because ``flash_attn_func`` does not expose it through this wrapper.
     Gradients are computed via ``torch.autograd.grad`` in the matching
     backward function.
 
     ``q`` shape ``[B, S, NUM_HEADS, HEAD_DIM]``.
     ``k``, ``v`` shape ``[B, S, NUM_KV_HEADS, HEAD_DIM]``.
     """
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, is_causal=True
-    )
+    from flash_attn import flash_attn_func
+    out = flash_attn_func(q, k, v, causal=True, deterministic=True)
     return out, None
 
 
@@ -193,11 +191,14 @@ def decoder_layer_forward(
 
 
 def embedding_forward(idx: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Embedding lookup: ``weight[idx] * 1.0`` (no scale applied here).
+    """Embedding lookup: ``F.embedding(idx, weight)``, matching the ref's ``_EmbeddingFn``.
 
-    The caller (train_loop) multiplies by ``mup_emb_scale`` after lookup.
+    Uses ``torch.nn.functional.embedding`` which is the same op the ref's
+    ``_EmbeddingFn.forward`` calls (``F.embedding(idx, weight)``).  The
+    caller (train_loop) multiplies by ``mup_emb_scale`` after lookup.
     """
-    return weight[idx.long()]
+    import torch.nn.functional as _F
+    return _F.embedding(idx, weight)
 
 
 # ── LM head ─────────────────────────────────────────────────────────────────
@@ -218,23 +219,25 @@ def lm_head_forward(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 def masked_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
                          loss_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """FP32 cross-entropy with loss masking.
+    """FP32 cross-entropy with loss masking, matching the ref's ``masked_ce``.
+
+    Uses ``torch.nn.functional.cross_entropy`` with ``reduction="none"``,
+    identical to the ref's implementation::
+
+        nll = F.cross_entropy(logits.reshape(-1, V).float(),
+                              labels.reshape(-1), reduction="none")
 
     ``logits`` shape ``[B, S, V]``, ``labels`` shape ``[B, S]``,
     ``loss_mask`` shape ``[B, S]``.
 
     Returns ``(sum_loss [fp32 scalar], num_tokens [fp32 scalar])``.
-    Mirrors the ref's ``masked_ce``.
     """
+    import torch.nn.functional as _F
     B, S, V = logits.shape
-    logits_f32 = logits.float().reshape(-1, V)
-    labels_flat = labels.reshape(-1)
-
-    # Log-sum-exp trick for numerical stability
-    logits_max = logits_f32.max(dim=-1, keepdim=True).values
-    logits_stable = logits_f32 - logits_max
-    log_softmax = logits_stable - logits_stable.exp().sum(dim=-1, keepdim=True).log()
-    nll = -log_softmax[torch.arange(logits_stable.shape[0], device=logits.device), labels_flat]
-
+    nll = _F.cross_entropy(
+        logits.reshape(-1, V).float(),
+        labels.reshape(-1),
+        reduction="none",
+    )
     mask = loss_mask.reshape(-1).float()
     return (nll * mask).sum(), mask.sum()
