@@ -20,11 +20,11 @@ import torch
 from training_engine_tensor.config import (
     FFN_HIDDEN_SIZE,
     HIDDEN_SIZE,
+    NUM_LAYERS,
     NUM_HEADS,
     NUM_KV_HEADS,
     HEAD_DIM,
     VOCAB_SIZE,
-    NORM_EPS,
 )
 
 
