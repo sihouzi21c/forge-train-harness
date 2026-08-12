@@ -1077,11 +1077,19 @@ def _collect_bf16_params(model: ModelParameters) -> list[torch.Tensor]:
 
 
 def _write_capture_output(config: TrainLoopConfig, records: dict | None, rank: int) -> None:
-    """Write the capture hash records to the output file."""
+    """Write the capture hash records to the output file.
+
+    For single-rank runs (world_size=1), writes directly to ``hash_output``.
+    For multi-rank, writes to ``hash_output.rank<r>`` shards that the
+    dispatcher's ``load_merged_capture`` merges.
+    """
     if config.hash_output and records is not None:
         p = Path(config.hash_output)
         p.parent.mkdir(parents=True, exist_ok=True)
-        rank_path = p.with_name(p.name + f".rank{rank}")
+        if config.world_size > 1:
+            rank_path = p.with_name(p.name + f".rank{rank}")
+        else:
+            rank_path = p
         with open(rank_path, "w") as f:
             json.dump(records, f, indent=2)
 
