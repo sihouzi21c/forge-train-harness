@@ -1216,6 +1216,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # The ref computes obj = sum(nll * mask), then backward() computes the gradient
         # of the SUM. reduce_grads then scales by 1/g_lm_n to convert to the gradient
         # of the AVERAGE. Without this scaling, our gradients are lm_n times larger.
+        if rank == 0:
+            print(f"[DEBUG] local_lm_n={local_lm_n.item():.1f}, lm_sum={local_lm_sum.item():.4f}", flush=True)
         norm_factor = 1.0 / local_lm_n.clamp(min=1.0)
         for buf in fp32_grad_bufs:
             buf.mul_(norm_factor)
