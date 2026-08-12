@@ -385,28 +385,21 @@ def gqa_attention_backward(
     B, S, H_q, D = q.shape
     _, _, H_kv, _ = k.shape
 
-    # Repeat KV heads to match Q heads (GQA)
-    rep = H_q // H_kv
-    if rep > 1:
-        k_exp = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, S, H_q, D)
-        v_exp = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, S, H_q, D)
-    else:
-        k_exp = k
-        v_exp = v
-
     # Replay forward through F.scaled_dot_product_attention with autograd
     # to get bitwise-identical gradients to the ref's internal math backend.
+    # Use the SAME q, k, v shapes as the forward (GQA: different head counts).
+    # The ref's autograd backward uses the saved q, k, v from the forward pass
+    # which have NUM_HEADS / NUM_KV_HEADS heads respectively.
     with torch.enable_grad():
         qd = q.detach().requires_grad_(True)
-        kd = k_exp.detach().requires_grad_(True)
-        vd = v_exp.detach().requires_grad_(True)
+        kd = k.detach().requires_grad_(True)
+        vd = v.detach().requires_grad_(True)
         out = _F.scaled_dot_product_attention(qd, kd, vd, is_causal=True, dropout_p=0.0, scale=None)
-        grad_q, grad_k, grad_v = torch.autograd.grad(out, (qd, kd, vd), grad_out)
 
-    # Reduce KV gradients if repeated (GQA)
-    if rep > 1:
-        grad_k = grad_k.reshape(B, S, H_kv, rep, D).sum(dim=-2)
-        grad_v = grad_v.reshape(B, S, H_kv, rep, D).sum(dim=-2)
+        # Compute gradients through the full attention (including GQA handling)
+        # The ref's autograd backward handles GQA internally, so the gradients
+        # for k and v have NUM_KV_HEADS heads (not NUM_HEADS).
+        grad_q, grad_k, grad_v = torch.autograd.grad(out, (qd, kd, vd), grad_out)
 
     return grad_q, grad_k, grad_v
 
