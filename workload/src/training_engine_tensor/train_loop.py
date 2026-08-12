@@ -1103,10 +1103,14 @@ def _init_process_group() -> int:
 
 
 def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, empty cache, then release the PG.
+    """Ordered teardown: drain GPU, empty cache, then return.
 
-    Returns normally so the interpreter can clean up without crashing
-    the NCCL communicator during its destructor pass.
+    Does NOT call ``dist.destroy_process_group()`` — the NCCL PG is
+    left to the OS to clean up on process exit, avoiding the
+    "terminate called without an active exception" SIGABRT that occurs
+    when the NCCL finalizer races the Python interpreter's destructor
+    pass.  This is safe because the process is about to exit anyway,
+    and the OS will close the socket / IPC handles.
     """
     import gc
     try:
@@ -1121,12 +1125,6 @@ def _ordered_teardown() -> None:
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception:
-        pass
-    try:
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-            dist.destroy_process_group()
     except Exception:
         pass
     try:
