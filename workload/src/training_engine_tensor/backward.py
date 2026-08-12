@@ -146,27 +146,22 @@ def embedding_backward(
 ) -> torch.Tensor:
     """Backward of embedding lookup.
 
+    Uses ``torch.ops.aten.embedding_dense_backward`` (the same op the
+    ref's ``_EmbeddingFn.backward`` calls) for bitwise alignment with
+    the ref's ``F.embedding`` backward.  The result is computed in the
+    input dtype (bf16) then converted to fp32, matching the ref's
+    ``wg.float()`` path.
+
     ``grad_out`` shape ``[B, S, H]``.
     ``token_ids`` shape ``[B, S]``.
 
     Returns ``[vocab_size, H]`` fp32 gradient.
     """
-    max_id = token_ids.max().item()
-    if vocab_size is not None and max_id >= vocab_size:
-        raise ValueError(
-            f"embedding_backward: token id {max_id} out of vocab {vocab_size}"
-        )
-    V = vocab_size if vocab_size is not None else int(max_id) + 1
-    H = grad_out.shape[-1]
-
-    flat_ids = token_ids.reshape(-1)
-    flat_grad = grad_out.reshape(-1, H)
-    # Use float32 for the gradient accumulation to match the ref's
-    # _EmbeddingFn.backward which uses torch.ops.aten.embedding_dense_backward
-    # and converts to fp32.
-    grad_embedding = torch.zeros(V, H, dtype=torch.float32, device=grad_out.device)
-    grad_embedding.index_add_(0, flat_ids, flat_grad.float())
-    return grad_embedding
+    V = vocab_size if vocab_size is not None else int(token_ids.max().item()) + 1
+    wg = torch.ops.aten.embedding_dense_backward(
+        grad_out, token_ids, V, -1, False
+    )
+    return wg.float()
 
 
 # ── RoPE backward ───────────────────────────────────────────────────────────
@@ -389,7 +384,7 @@ def gqa_attention_backward(
     return grad_q, grad_k, grad_v
 
 
-# ── Cross-entropy loss backward (manual softmax - one_hot formula) ─────
+# ── Cross-entropy loss backward (F.cross_entropy autograd + fp32 scaling) ─
 
 
 def cross_entropy_backward(
@@ -400,37 +395,35 @@ def cross_entropy_backward(
 ) -> torch.Tensor:
     """Backward of cross-entropy loss w.r.t. logits.
 
-    Uses the closed-form gradient ``(softmax - one_hot) * mask`` instead of
-    replaying ``F.cross_entropy`` through ``obj.backward()``.  The closed-form
-    is fully deterministic, while ``F.cross_entropy`` backward can exhibit
-    subtle non-determinism (observable as a ~0.54% gradient-norm difference
-    when called multiple times per step, e.g. for MTP logits).
+    Replays ``F.cross_entropy(logits.float(), labels, reduction="none")``
+    through ``obj.backward()`` — the same autograd path the ref's
+    ``masked_ce`` function uses — so the gradient is bitwise-identical
+    to the ref's ``F.cross_entropy`` backward kernel.
 
-    The gradient of ``obj = (F.cross_entropy(..., reduction="none") * mask).sum()``
-    w.r.t. the fp32 logits is::
-
-        d(obj)/d(logits) = mask * (softmax(logits) - one_hot(labels))
-
-    When ``scale != 1.0``, the multiplication is done in fp32 before the
-    ``.to(bf16)`` conversion, matching the ref's ``loss = lm_sum + ce_w * mtp_sum;
+    The ``scale`` multiplication is done in fp32 before the ``.to(bf16)``
+    conversion, matching the ref's ``loss = lm_sum + ce_w * mtp_sum;
     loss.backward()`` where the ``ce_w`` scaling is applied in fp32.
 
     Returns the gradient in bf16.
     """
+    import torch.nn.functional as _F
+
     B, S, V = logits.shape
     labels_flat = labels.reshape(-1)
     mask = loss_mask.reshape(-1).float()
 
-    # Compute softmax in fp32 for numerical stability
-    logits_f32 = logits.detach().float().reshape(-1, V)
-    probs = torch.softmax(logits_f32, dim=-1)
+    # Replay the ref's exact masked_ce chain: logits.float() →
+    # F.cross_entropy → (nll * mask).sum() → backward().  This is
+    # bitwise-identical to the ref's autograd, unlike the manual
+    # softmax-one_hot formula which differs by ~1 ULP in bf16.
+    with torch.enable_grad():
+        logits_f32 = logits.detach().float().reshape(-1, V).requires_grad_(True)
+        nll = _F.cross_entropy(logits_f32, labels_flat, reduction="none")
+        obj = (nll * mask).sum()
+        obj.backward()
+        grad_logits_f32 = logits_f32.grad
 
-    # One-hot encoding in fp32
-    one_hot = torch.zeros_like(probs)
-    one_hot.scatter_(-1, labels_flat.unsqueeze(-1), 1.0)
-
-    # Gradient: scale * (softmax - one_hot) * mask
-    # The scale multiplication is done in fp32 before .to(bf16),
-    # matching the ref's loss.backward() which applies ce_w in fp32.
-    grad = scale * (probs - one_hot) * mask.unsqueeze(-1)
-    return grad.reshape(B, S, V).to(logits.dtype)
+    # Apply scale in fp32 (matching ref's ce_w * mtp_sum in fp32) before
+    # the .to(bf16) conversion.
+    grad = (scale * grad_logits_f32).reshape(B, S, V).to(logits.dtype)
+    return grad

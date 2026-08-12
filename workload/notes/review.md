@@ -187,3 +187,41 @@ None.
 - `train_loop.py:1306-1309`: `global_loss` and `mfu_e2e_standard` are computed values from actual computation, not hardcoded
 
 ---
+
+## [stage1] Round 11 — 2026-08-13 04:34:50
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 4bf7528 — Fix: cross_entropy_backward manual softmax-one_hot + ce_w fp32 scaling
+
+### Key conclusions
+The dev agent replaced the `F.cross_entropy` backward call (via `obj.backward()`) with a manual `softmax - one_hot` closed-form formula in `cross_entropy_backward` (`backward.py:392-430`), and added a `scale` parameter for fp32 `ce_w` scaling before `.to(bf16)` conversion. The change is a genuine in-process implementation — no proxy, no shell-outs, no ref imports, no hardcoded metrics. The `scale` factor is a legitimate computation parameter used in `train_loop.py:623-625` for the MTP loss weight. The 0.54% gradient norm difference persists with the MTP branch gradient as the identified root cause. Stage 1 finish conditions are not satisfied: no `STAGE_STATUS: finished` in commit message, no gate evidence in perf_log, and profile snapshot missing for this perf-touching round.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `backward.py:392-430`: Manual `softmax - one_hot` closed-form CE backward — no proxy, no `F.cross_entropy` backward kernel
+- `train_loop.py:623-625`: `scale=mtp_ce_weight` passed to `cross_entropy_backward` — legitimate fp32 scaling before bf16 conversion
+- anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)
+
+---
+
+## [stage1] Round 12 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+The dev agent resolved the systematic 0.54% gradient-norm difference (MTP gradient root cause). Three bugs were fixed: (1) `cross_entropy_backward` manual `softmax-one_hot` formula differed from `F.cross_entropy` backward by ~1 ULP in bf16, amplified through V=130560 matmul; (2) `embedding_backward` used `index_add_` instead of `embedding_dense_backward`; (3) MTP embedding gradient used wrong `grad_in` (discarded `rms_norm_backward` output). The engine remains a genuine in-process implementation — no proxy, no forgery, no hardcoded metrics. Gate results: 8/8 loss bitwise, 6/8 grad_norm bitwise (2 ULP diffs), 2488/2496 hash match. Stage 1 stays in-progress.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `backward.py:392-430`: `cross_entropy_backward` uses `F.cross_entropy` autograd (same as ref's `masked_ce`) with fp32 `scale`
+- `backward.py:142-169`: `embedding_backward` uses `torch.ops.aten.embedding_dense_backward` (same as ref's `_EmbeddingFn`)
+- `train_loop.py:744-751`: MTP embedding backward uses `grad_mtp_emb * mup_emb_scale` (correct `rms_norm_backward` output)
+- `train_loop.py:871-890`: `_compute_grad_norm` uses `clip_grad_norm_` (same as ref)
+- anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)

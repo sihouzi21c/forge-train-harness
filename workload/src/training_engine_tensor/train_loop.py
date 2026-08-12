@@ -735,14 +735,19 @@ def _static_backward(
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.hidden_input_norm_weight, dw_mtp_hnorm)
 
         # mtp.emb_input_layernorm backward
-        _, dw_mtp_enorm = rms_norm_backward(
+        grad_mtp_emb, dw_mtp_enorm = rms_norm_backward(
             d_mtp_a, cache.mtp_emb, model.mtp.emb_input_norm_weight
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.emb_input_norm_weight, dw_mtp_enorm)
 
-        # MTP embedding backward
+        # MTP embedding backward: gradient flows through rms_norm then
+        # mup_emb_scale to reach the embedding weight.
+        # Forward: mtp_emb = F.embedding(ids, w) * mup_emb_scale
+        #          a = rms_norm(mtp_emb, enorm)
+        # Backward: grad_mtp_emb = rms_norm_backward(d_mtp_a, mtp_emb, ...)[0]
+        #           dw_emb = embedding_backward(grad_mtp_emb * mup_emb_scale, ids, V)
         dw_mtp_emb = embedding_backward(
-            d_mtp_a * mup_emb_scale, cache.mtp_input_ids, V
+            grad_mtp_emb * mup_emb_scale, cache.mtp_input_ids, V
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.tok_embeddings_weight, dw_mtp_emb)
 
@@ -865,23 +870,30 @@ def _static_backward(
 
 def _compute_grad_norm(
     fp32_grad_bufs: list[torch.Tensor],
+    fp32_master: list[torch.Tensor],
     device: torch.device,
     rank: int = 0,
+    opt_clip_grad: float = 1.0,
 ) -> torch.Tensor:
     """Compute the L2 norm of all gradients (FP32).
 
-    Uses the same computation path as ``torch.nn.utils.clip_grad_norm_``:
-    compute per-tensor L2 norm, then stack and compute the global L2 norm.
-    This ensures bitwise agreement with the ref's ``clip_grad_norm_`` call.
+    Mirrors the ref's ``clip_grad_norm_`` call
+    (``train_pure_mup_mtp.py:813``) exactly: sets ``.grad`` on the master
+    weights, calls ``clip_grad_norm_`` with the same ``max_norm`` the ref
+    uses, and clears ``.grad`` afterwards.  When the norm is below
+    ``max_norm`` the clip is a no-op (``clip_coef = 1.0``), but using the
+    same ``max_norm`` as the ref ensures the internal norm computation
+    follows the exact same kernel path.
 
     Returns a scalar tensor on the given device.
     """
-    # Match the ref's clip_grad_norm_ path: norm(stack([norm(g, 2) for g in grads]), 2)
-    # Using float32 (not float64) to match the ref's reduction dtype.
-    norms = [buf.norm(2).to(device) for buf in fp32_grad_bufs]
-    if not norms:
-        return torch.zeros((), device=device, dtype=torch.float32)
-    return torch.norm(torch.stack(norms), 2.0)
+    from torch.nn.utils import clip_grad_norm_
+    for p, buf in zip(fp32_master, fp32_grad_bufs):
+        p.grad = buf
+    norm = clip_grad_norm_(fp32_master, max_norm=opt_clip_grad, norm_type=2.0)
+    for p in fp32_master:
+        p.grad = None
+    return norm.to(device)
 
 
 def _clip_gradients(
@@ -1267,11 +1279,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             _ordered_teardown()
             return  # Not reached (SystemExit raised in _ordered_teardown)
 
-        # ── Compute gradient norm ─────────────────────────────────────
-        grad_norm_val = _compute_grad_norm(fp32_grad_bufs, device)
-
-        # ── Clip gradients ────────────────────────────────────────────
-        _clip_gradients(fp32_grad_bufs, opt_clip_grad, grad_norm_val)
+        # ── Compute gradient norm (also clips via clip_grad_norm_) ───────
+        grad_norm_val = _compute_grad_norm(fp32_grad_bufs, fp32_master, device, opt_clip_grad=opt_clip_grad)
 
         # ── Compute LR for this step ──────────────────────────────────
         # ref uses ``step + 1`` (1-indexed) for the LR schedule
