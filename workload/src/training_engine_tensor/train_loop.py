@@ -833,7 +833,6 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     """
     rank = _init_process_group()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
 
     # ── Seed ───────────────────────────────────────────────────────────
@@ -1093,15 +1092,18 @@ def _write_capture_output(config: TrainLoopConfig, records: dict | None, rank: i
 def _init_process_group() -> int:
     """Initialize the torch distributed process group.
 
+    Sets the CUDA device before init so NCCL knows the correct GPU.
     Returns the global rank.
     """
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     return rank
 
 
 def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then return.
+    """Ordered teardown: drain GPU, empty cache, barrier, destroy PG, then return.
 
     Returns normally (no ``os._exit``, no ``SystemExit``) so the interpreter
     can clean up without crashing the NCCL communicator during its destructor
@@ -1110,29 +1112,33 @@ def _ordered_teardown() -> None:
     """
     import gc
     try:
+        # 1. Drain in-flight GPU work so no kernel is still executing.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     except Exception:
         pass
     try:
-        gc.collect()
+        # 2. Free the CUDA allocator cache BEFORE destroying the PG so
+        #    no outstanding CUDA allocation holds a reference to the
+        #    NCCL communicator.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception:
         pass
     try:
+        # 3. Coordinate teardown across ranks, then release the PG.
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
     except Exception:
         pass
     try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 4. Final GC pass to collect any NCCL-related wrappers.
+        gc.collect()
     except Exception:
         pass
     if os.environ.get("RANK", "0") == "0":
         print("ALL DONE", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
-    # Return normally — do NOT raise SystemExit or os._exit.  The gate wrapper
-    # checks exit code 0; a SIGABRT from the NCCL destructor racing against
-    # Py_Finalize is a FAIL even when the artifact is valid.
+    # Return normally — do NOT raise SystemExit or os._exit.
