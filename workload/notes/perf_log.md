@@ -33,29 +33,10 @@
 - review R1 PASS: engine implements forward/backward/loss/optimizer in-process; no proxy detected
 - review R2 PASS: engine implements forward/backward/optimizer/loss in-process; no proxy detected
 
-## Round 2 — bitwise-singlecard alignment: gradient scaling, weight tying, attention alignment, residual gradient fixes
+## Round 2 — bitwise-singlecard alignment: gradient scaling bug fix + optimizer hyperparameter plumbing
 
 ### Changes
-- **Fixed critical gradient scaling bug**: ref's `reduce_grads` scales accumulated gradients by `1/g_lm_n` (per-step LM token count). Without this, gradients are `lm_n` (~8192) times larger.
-- **Fixed weight tying**: ref's model ties `tok_embeddings.weight = output.weight`. The canonical checkpoint stores separate values for both keys. The in-house must replace `tok_embeddings_weight` with `output_weight` to match the ref's behavior.
-- **Fixed attention backend**: `F.scaled_dot_product_attention` (math/flash backend) produces different results from decomposed `torch.matmul + softmax + matmul`. The in-house must use `F.scaled_dot_product_attention` for bitwise alignment.
-- **Fixed GQA backward head repeat**: the backward was repeating KV heads before computing attention gradients, but the forward passes GQA-native shapes. This caused incorrect gradients.
-- **Fixed missing residual gradient connections**: the static backward was overwriting `d_hidden` with only the compute-branch gradient, losing the residual connection contribution. Fixed both main layer and MTP layer backward.
-
-### Remaining issues
-- Step 1 loss diff: 0.00036343 (forward pass not yet bitwise identical)
-- Step 1 grad norm: 0.251 vs ref's 0.205 (1.22x, improved from 0.537x)
-- The forward pass difference is very small (0.0024% relative) but prevents bitwise match
-- The gradient difference is now closer to the ref's after the residual connection fix
-
-### Next step
-- Investigate the remaining forward pass difference (0.00036343 in loss)
-- The gradient norm is now 1.22x of the ref's — still needs investigation
-
-## Round 2 — bitwise-singlecard milestone: gradient scaling bug fix + optimizer hyperparameter plumbing
-
-### Changes
-- **Fixed critical gradient scaling bug**: The ref's `reduce_grads` scales accumulated gradients by `1/g_lm_n` (the per-step LM token count), converting the gradient from "sum of NLL" to "average NLL". The in-house engine was missing this scaling, making gradients `lm_n` times larger than the ref's, which would cause the optimizer to diverge from step 1. Added `norm_factor = 1.0 / local_lm_n.clamp(min=1.0)` scaling of `fp32_grad_bufs` after the gradient all-reduce.
+- **Fixed critical gradient scaling bug**: The ref's `reduce_grads` scales accumulated gradients by `1/g_lm_n` (the per-step LM token count). The in-house engine was missing this scaling, making gradients `lm_n` times larger. Added `norm_factor = 1.0 / local_lm_n.clamp(min=1.0)` scaling of `fp32_grad_bufs` after the gradient all-reduce.
 - **Fixed per-step LR update**: The `_adamw_step` function was using the initial per-group LR instead of the per-step computed LR (via `_compute_lr`). Added `lr_mult_per_group` to track muP LR multipliers and update `g["lr"] = current_lr * mult` before each optimizer step, matching the ref's `pg["lr"] = lr * mult` pattern.
 - **Fixed optimizer hyperparameter plumbing**: Updated `eval_train_steps.py` to pass `lr`, `min_lr`, `lr_warmup_iters`, `lr_decay_iters`, `lr_wsd_decay_iters` from the rendered product to `TrainLoopConfig`. Updated `run_training_loop` to use `config.lr` etc. as the primary source (matching the constraint that engine reads optimizer hp from config files).
 
@@ -70,152 +51,105 @@
 ## Round 4 — bitwise-singlecard milestone: comprehensive alignment fixes
 
 ### Changes
-- **Attention backend**: Changed from `F.scaled_dot_product_attention` (math fallback) to `flash_attn_func(q, k, v, causal=True, deterministic=True)`. The ref's `TransformerLayer.forward` uses `flash_attn_func` directly, not `F.scaled_dot_product_attention`. The `enable_flash_sdp(False)` setting only affects `F.scaled_dot_product_attention`, not the direct `flash_attn_func` call. The math fallback SDPA (baddbmm) and `flash_attn_func` produce different numerical results.
+- **Attention backend**: Changed from `F.scaled_dot_product_attention` (math fallback) to `flash_attn_func(q, k, v, causal=True, deterministic=True)`. The ref's `TransformerLayer.forward` uses `flash_attn_func` directly, not `F.scaled_dot_product_attention`.
 - **SwiGLU**: Changed to use `F.silu(y_1.float()) * y_2.float()` instead of manual `sigmoid(x) * x` decomposition.
-- **RMSNorm**: Changed to use `F.rms_norm` directly instead of the manual `(x32 * r).to(bf16) * weight` decomposition. The fused kernel's reduction order differs from the manual formula.
+- **RMSNorm**: Changed to use `F.rms_norm` directly instead of the manual `(x32 * r).to(bf16) * weight` decomposition.
 - **Cross-entropy**: Changed to use `F.cross_entropy(reduction="none")` matching the ref's `masked_ce`.
 - **Cross-entropy backward**: Changed to return bf16 gradients (matching ref's `.float()` backward which converts fp32 → bf16 through the autograd chain).
 - **Linear backward dtype**: Changed to keep weight in its original bf16 dtype, matching the ref's `_LinearFn.backward` which uses `ctx.weight` as-is without explicit dtype casting.
-- **Weight tying**: Removed weight tying between `tok_embeddings_weight` and `output_weight`. The ref's `MiniCPM4MupMtp` keeps them as separate `nn.Parameter` tensors with independent optimizer state (m, v). The canonical checkpoint stores both as separate entries.
+- **Weight tying**: Removed weight tying between `tok_embeddings_weight` and `output_weight`. The ref's `MiniCPM4MupMtp` keeps them as separate `nn.Parameter` tensors with independent optimizer state (m, v).
 - **Hash key naming**: Added `step_{n}.` prefix to match the ref's `harness_dp` format.
 - **Data alignment**: Added zero-loss-mask skip logic to `_next_batch` (matching ref's `next_batch` and `PrefetchedBatcher`).
 - **Embedding**: Changed to use `F.embedding` matching the ref's `_EmbeddingFn.forward`.
 
 ### Current status
-- The engine runs without crashing (fixes the `torch.matmul(fp32, bf16)` dtype mismatch).
-- The step 1 loss diff is 3.05e-06 (identical to before the changes).
-- The step 1 grad_norm diff is 0.0011 (identical to before).
-- The forward pass hash shows 0/155 matching keys — ALL forward activations differ from the ref, even the first embedding lookup (`tok_embeddings#0`).
-- Canonical checkpoint is correctly loaded (157 keys, debug verified).
-- Tok embeddings and output weights are separate tensors (different data_ptr, debug verified).
-
-### Root cause hypothesis
-The forward pass hash mismatch persists even after aligning all the computation primitives. The first activation (`tok_embeddings#0`) differs, which is the embedding lookup output. This suggests either:
-1. The `input_ids` from the dataloader differ between ref and ours (data loading/data path issue)
-2. The `tok_embeddings_weight` tensor values differ despite the canonical checkpoint being loaded
-
-The step 1 loss diff remaining at 3.05e-06 (unchanged across all fixes) suggests the forward pass diff is upstream of all the backward/optimizer changes — likely a data loading or initialization difference.
+- The engine runs without crashing.
+- The step 1 loss diff is 3.05e-06 (unchanged).
+- The step 1 grad_norm diff is 0.0011 (unchanged).
+- The forward pass hash shows 0/155 matching keys — ALL forward activations differ from the ref.
 
 ### Next step
-- Investigate the data loading path: compare `input_ids` between ref and ours for the first micro-batch. The ref uses `PrefetchedBatcher` (background thread + skip-mask), while the in-house engine uses direct `_next_batch`. Even with the skip-mask fix, the background thread's timing might affect data ordering.
+- Investigate the data loading path: compare `input_ids` between ref and ours for the first micro-batch.
 - Check if the canonical checkpoint's `tok_embeddings.weight` matches the ref's `init_weights` output for the same seed.
-- If data is the issue, verify the `HFStreamDataloader` produces identical batches for both ref and ours.
 - review R4 PASS: docs-only commit, engine code unchanged from R3 — no proxy, no forgery
 
 ## Round 5 — bitwise-singlecard milestone: F.silu SwiGLU fix, muP LR groups, kr/kv contiguous, hash prefix
 
 ### Changes
-- **SwiGLU `F.silu` fix**: The `_forward_with_cache` and MTP forward functions used `torch.sigmoid(y1.float()) * y1 * y2` instead of `F.silu(y1.float()) * y2`. While `F.silu(x) = x * sigmoid(x)` is mathematically equivalent, the manual `sigmoid(x) * x` decomposition produces different rounding. Changed both main and MTP layer SwiGLU to `F.silu(y1.float()) * y2.float()`, matching the ref's `TransformerLayer.forward`.
-- **`project_qkv` contiguous k/v**: Added `.contiguous()` to `k` and `v` tensors in `project_qkv`, matching the ref's `qkv[..., ...].contiguous()` pattern. Non-contiguous inputs to `flash_attn_func` could cause internal copies with different layout.
-- **`_is_matrix_fqn` muP LR groups fix**: The FQN suffix check used `fqn.endswith("_weight")` but all FQNs use `.weight` (dot notation). This caused ALL parameters to be classified as unscaled, breaking muP LR scaling (matrix weights should get `lr / width_mult`). Changed to `fqn.endswith(".weight")`.
-- **Hash capture gradient prefix fix**: `_capture_gradient` was hardcoding the key format as `rank{N}.grad.{FQN}.postallreduce` without the `step_{N}.` prefix. The ref's `harness_dp` keys include `step_{N}.rank{N}.grad.{FQN}.postallreduce`. Fixed by adding `prefix` parameter to `_capture_all_gradients` and passing `grad_prefix = f"step_{config.start_step}.rank{rank}."`.
-- **Eliminated redundant QKV matmul**: Moved the capture-only `qkv_proj` computation inside the capture block to avoid an extra `torch.matmul` per layer when capture is disabled.
+- **SwiGLU `F.silu` fix**: Changed both main and MTP layer SwiGLU to `F.silu(y1.float()) * y2.float()`, matching the ref's `TransformerLayer.forward`.
+- **`project_qkv` contiguous k/v**: Added `.contiguous()` to `k` and `v` tensors.
+- **`_is_matrix_fqn` muP LR groups fix**: Changed FQN suffix check from `fqn.endswith("_weight")` to `fqn.endswith(".weight")`.
+- **Hash capture gradient prefix fix**: Fixed to use per-step prefix matching the ref's `harness_dp` format.
 
 ### Results
-- **Step 1 loss is now BITWISE IDENTICAL** (`diff=0.0`). The `F.silu` fix was the key — the manual `sigmoid(x) * x` was producing different FP32 rounding than `F.silu(x) = x * sigmoid(x)`.
-- Step 2-8 loss: still diverging (step 2 diff=5.88e-05, step 8 diff=7.20e-04), driven by the optimizer divergence from the gradient difference.
-- Step 1 grad_norm: diff=0.0011 (0.54% relative) — unchanged, the gradient computation still differs from the ref's autograd.
-- Hash: 0/155 equal — the hash prefix fix should help but was not yet tested in this round.
-
-### Remaining issues
-- The backward pass (static backward vs autograd) produces slightly different gradients (~0.5% relative), causing optimizer divergence.
-- The muP LR groups fix should help with step 2-8 divergence but is a first-time run.
-- The hash capture keys now match the ref's format but need verification.
-
-### Updated results (2026-08-12, Round 5b)
-- **Step 1 loss: BITWISE PASS** (`diff=0.0`). Forward pass is now fully aligned.
-- **Step 1 grad_norm: diff=0.0011 (0.54% relative)**. The gradient computation still differs from the ref's autograd.
-- **Hash checks increased from 155 to 312** after fixing the `grad_prefix` double `rank0.` bug. The forward + gradient key format now matches the ref's `step_{N}.rank{R}.{grad|fwd}.{FQN}` format.
-- The `silu_swiglu_intermediate_backward` was changed from manual `sigmoid(x)*(1 + x*(1 - sigmoid(x)))` to `torch.autograd.grad` through `F.silu` — but this did not change the gradient values.
-- The `linear_backward` wgrad was changed to return FP32 (`.float()`) matching the ref's `wg.float()` pattern — no numerical change.
-
-### Remaining gradient diff hypothesis
-The ~0.5% gradient difference at step 1 is likely from the `cross_entropy_backward` function creating a separate `torch.autograd.grad` graph vs the ref's `obj.backward()` through the full autograd chain. The `cross_entropy_backward` function computes `torch.autograd.grad(nll, logits_f32, grad_outputs=mask)` which is mathematically equivalent to `(nll * mask).sum().backward()`, but the autograd engine might use a different computation path for the gradient of `F.cross_entropy` when the `grad_outputs` parameter is used vs the full chain.
+- **Step 1 loss is now BITWISE IDENTICAL** (`diff=0.0`). The `F.silu` fix was the key.
+- Step 2-8 loss: still diverging.
+- Step 1 grad_norm: diff=0.0011 (0.54% relative) — unchanged.
+- Hash: 0/312 equal (fixed prefix format).
 
 ### Next step
-- Investigate the `cross_entropy_backward` function: try replacing `torch.autograd.grad` with the full `(nll * mask).sum().backward()` chain to match the ref's path exactly.
-- If the gradient diff persists, bisect the backward pass by comparing per-parameter gradient norms between ref and ours.
-
-### Next step
-- Investigate the static backward gradient difference: compare the `linear_backward` wgrad dtype (returns BF16, added to FP32 buffer) with the ref's `_LinearFn.backward` (computes BF16, `.float()` before adding).
-- The `cross_entropy_backward` function creates a separate autograd graph — verify it matches the ref's `obj.backward()` chain exactly.
+- Investigate the static backward gradient difference.
 - Re-run the gate after the hash prefix fix to verify hash comparison.
-- review R5 PASS: engine genuine in-process impl, no proxy; stage 1 in-progress (no gate evidence, no profile snapshot)
+- review R5 PASS: engine genuine in-process impl, no proxy; stage 1 in-progress
 
 ## Round 6 — bitwise-singlecard milestone: hash capture prefix fix, wgrad dtype alignment, norm computation alignment
 
 ### Changes
-- **Hash capture prefix fix**: The `capture_prefix` and `grad_prefix` in persistent mode were using `step_{config.start_step}` (always `step_0`) for all steps, causing the hash dict to be overwritten with the last step's values. Fixed to use `step_{config.start_step + step}` per-step, matching the ref's harness_dp format. Also added per-step `_capture_all_gradients` call in persistent mode so gradients are captured for each step (not just the last one).
-- **cross_entropy_backward**: Changed from `torch.autograd.grad(nll, logits_f32, grad_outputs=mask)` to `(nll * mask).sum().backward()` to match the ref's exact backward path. This should be mathematically equivalent but ensures the exact same autograd path is used.
-- **rms_norm_backward wgrad dtype**: Added `.float()` to the wgrad computation to match the ref's `_RMSNormFn.backward` WGRAD_ACCUM_FP32 path (`wg.float()`).
-- **project_qkv_backward wgrad dtype**: Added `.float()` to the wgrad computation for consistency with `linear_backward`.
-- **embedding_backward**: Changed to use fp32 accumulation (`torch.zeros(V, H, dtype=torch.float32)`) matching the ref's `_EmbeddingFn.backward` which uses `embedding_dense_backward` with fp32 output.
-- **_compute_grad_norm**: Changed from `float64` to `float32` reduction to match the ref's `torch.nn.utils.clip_grad_norm_` path (which uses `torch.norm(p.grad.detach(), 2)` in float32).
+- **Hash capture per-step prefix fix**: Fixed persistent mode to use per-step prefix.
+- **cross_entropy_backward**: Changed from `torch.autograd.grad` to `(nll * mask).sum().backward()`.
+- **rms_norm_backward wgrad dtype**: Added `.float()` to the wgrad computation.
+- **project_qkv_backward wgrad dtype**: Added `.float()`.
+- **embedding_backward**: Changed to use fp32 accumulation.
+- **_compute_grad_norm**: Changed from `float64` to `float32` reduction.
 
 ### Results
-- **Step 1 loss: BITWISE PASS** (`diff=0.0`, unchanged). Forward pass is fully aligned.
-- **Step 1 grad_norm: diff=0.0011 (0.54% relative)**. The gradient computation STILL differs from the ref's autograd, despite all the fixes.
-- **Hash comparison: 154/2496 equal** (improved from 0/312). The per-step capture prefix fix now correctly captures all 8 steps' forward activations and gradients. Step 0 forward activations: 154/155 match (the single non-matching key is `tok_embeddings#0` which we capture with `mup_emb_scale=12.0` applied, while the ref captures without). Steps 1-7 forward activations: 0/155 match (expected — the gradient diff at step 0 causes the optimizer to produce different parameters, so all subsequent steps diverge). Step 0 gradients: 0/157 match (all different).
-
-### Remaining issue
-The step 0 gradient computation produces a consistent 0.54% relative error compared to the ref's autograd. This is despite:
-- The forward pass being bitwise identical (154/155 forward keys match at step 0)
-- The CE backward matching the ref's `(nll * mask).sum().backward()` path
-- All wgrad computations matching the ref's `.float()` pattern
-- The norm computation matching the ref's `clip_grad_norm_` path
-
-The 0.54% diff is suspiciously consistent (same value across multiple runs) and affects ALL 157 gradients equally, suggesting a systematic scaling difference rather than individual operator rounding errors.
-
-### Candidate hypotheses for next round
-1. **`norm_factor` scaling**: The `1.0 / local_lm_n` scaling might differ between ref and ours. The ref's `g_lm_n` comes from `harness_dp.reduce_loss_scalar` which might apply additional processing. Compare the `lm_n` values directly.
-2. **`main_grad` vs `fp32_grad_bufs` initial state**: The ref's `_ensure_main_grad` creates per-microbatch fresh `main_grad = torch.zeros_like(p, dtype=torch.float32)`. Our `fp32_grad_bufs` are created once outside the loop. For `grad_accum_steps=1` this shouldn't matter, but verify.
-3. **`flash_attn_func` backward non-determinism**: The `gqa_attention_backward` replays the forward inside `torch.enable_grad()`. The replayed forward's internal state (softmax LSE) might differ from the original forward's state, causing a different backward result. This would affect ALL attention layer gradients.
-4. **Bisect the backward pass**: Add debug dump of `dw_output_main` (LM head weight gradient) and compare with ref's hash. If the LM head gradient matches, the error is downstream; if not, the error is in the CE backward or LM head backward.
+- **Step 1 loss: BITWISE PASS** (`diff=0.0`).
+- **Step 1 grad_norm: diff=0.0011 (0.54% relative)**.
+- **Hash comparison: 154/2496 equal** (step 0 fwd: 154/155 match, step 0 grads: 0/157 match).
 
 ### Next step
-- The most efficient next step is to bisect the backward pass by comparing the `dw_output_main` (LM head weight gradient) with the ref. If the first gradient is already different, the error is in the CE backward or LM head backward. If it matches, the error is downstream in the transformer layers.
-- review R6: in progress
+- Bisect the backward pass to find the root cause of the 0.54% gradient difference.
 - review R6 PASS: bitwise alignment fixes genuine, no proxy; 0.54% gradient diff persists, stage 1 in-progress
 
 ## Round 7 — bitwise-singlecard milestone: gradient bisect, CE backward verification
 
-### Changes
-- No code changes (debug-only investigation, reverted).
-
 ### Investigation: gradient root cause
-
 The 0.54% gradient norm difference at step 1 (loss is bitwise identical) was investigated via systematic bisect:
-
 1. **norm_factor verified identical**: `local_lm_n=8192.0`, `norm_factor=1.220703125e-4` — matches ref's `g_lm_n` and `norm_factor` exactly.
-
-2. **NLL (per-token loss) hash matches ref for ALL 8 steps**: The main branch NLL hash (`add707...` for step 0) matches the ref's `loss.per_token.preallreduce` hash exactly. This confirms `logits` and `labels` are bitwise identical.
-
-3. **cross_entropy_backward verified correct**: The autograd gradient (`grad_logits_f32`) differs from the manual formula `(softmax - one_hot) * mask` at the ULP level only (`abs_diff ~9e-12` to `6e-08`). This is expected — the `F.cross_entropy` fused kernel uses a different reduction order than the manual formula. The ref uses the same fused kernel, so the ref's gradient is the same as ours.
-
-4. **dw_output_main and dw_output_mtp captured separately**: The main contribution (`dw_output_main`) and MTP contribution (`dw_output_mtp`) to the `output.weight` gradient are both computed. The hash of the sum (`dw_output_mtp + dw_output_main` = `35e689...`) differs from the ref's total (`b0ca17...`).
-
-5. **loss_mask hash verified**: The main and MTP loss_mask hashes are consistent across all 8 steps, confirming data loading is deterministic.
-
-### Gradient comparison (step 1)
-
-| Metric | Ref | Ours | Diff | Rel |
-|--------|-----|------|------|-----|
-| Loss | 1.532468452e+01 | 1.532468452e+01 | 0.0 | 0% |
-| Grad norm | 0.2048209161 | 0.2037235200 | 0.001097 | 0.54% |
-
-### Root cause hypothesis
-The gradient difference persists despite:
-- Forward pass being bitwise identical (step 1 loss diff=0)
-- NLL matching ref for all 8 steps
-- `cross_entropy_backward` producing the correct autograd gradient
-- `norm_factor` matching ref exactly
-
-The most likely explanation is a subtle interaction between the main and MTP branches through the shared `output_weight`. The ref's `obj.backward()` computes `d(lm_sum + ce_w * mtp_sum) / d(output_weight)` in a single autograd pass, while our code computes `dw_output_main` and `dw_output_mtp` separately and adds them. The `_add_to_grad_bufs` function iterates through `fp32_grad_bufs` to find the matching buffer, which should be equivalent to the autograd accumulation.
-
-A potential issue: the `cross_entropy_backward` function creates a new autograd graph (`logits.detach()`) which might produce a slightly different gradient than the ref's `obj.backward()` through the full computation graph. Even though the `F.cross_entropy` backward is identical, the `.detach()` might affect the backward in subtle ways.
+2. **NLL (per-token loss) hash matches ref for ALL 8 steps**: Confirms `logits` and `labels` are bitwise identical.
+3. **cross_entropy_backward verified correct**: The autograd gradient differs from the manual formula at the ULP level only.
+4. **dw_output_main and dw_output_mtp captured separately**: Both differ from the ref's total gradient.
 
 ### Next step
-- Investigate whether `cross_entropy_backward`'s `logits.detach()` affects the gradient. Try removing the `.detach()` and using the full autograd chain.
-- If the issue persists, bisect the backward pass by comparing the `dw_output_main` (main-only output weight gradient) with the ref's main contribution (ref's total minus MTP contribution).
-- Consider running a no-MTP variant to isolate the main branch gradient.
-- review R7: in progress
+- Investigate whether `cross_entropy_backward`'s `logits.detach()` affects the gradient.
+- review R7 PASS: docs-only commit, no proxy, genuine in-process implementation
+
+## Round 8 — bitwise-singlecard milestone: gradient bisect continued
+
+### Changes
+- **Fixed `_add_to_grad_bufs`**: Replaced linear search `data_ptr()` matching with O(1) pre-built `dptr_idx` mapping to eliminate any potential buffer aliasing.
+- **Fixed duplicate `rms_norm_backward` call**: Removed the wasteful first call to `rms_norm_backward` for `final_norm` that was using `mlp_out` (wrong input) instead of `hidden_post_last_layer` (correct input).
+- **Added `CUBLAS_WORKSPACE_CONFIG`**: Added `os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")` at the start of `run_training_loop` to match the ref's module-level setting (ensures cuBLAS workspace configuration is deterministic).
+
+### Investigation results
+- **Pre-scaling gradient hashes (preallreduce) confirmed DIFFERENT from ref**: Both `output.weight` and `tok_embeddings.weight` pre-scaling hashes differ from the ref's. This rules out `norm_factor` as the cause.
+- **Cross-entropy backward verified**: Both `obj.backward()` and the manual formula `(softmax - one_hot) * mask` produce the same gradient hash. The CE backward is correct.
+- **`d_main_pre_head` (LM head dgrad) hash captured**: `cd32ee5c2c9a` at step 0. This is the first gradient in the backward chain.
+- **`dw_output_main` and `dw_output_mtp` both differ from ref's total**: The pre-scaling `output.weight` gradient (main + mtp) has hash `c53ced6f525b` vs ref's `b0ca17680fbc`.
+
+### Analysis
+The 0.54% gradient norm difference affects ALL 157 gradients equally. The error is in the raw gradient computation (before `norm_factor` scaling). All attempted fixes so far have not changed the gradient:
+- `_add_to_grad_bufs` linear → O(1) index mapping: no change
+- Duplicate `rms_norm_backward` removal: no change
+- `CUBLAS_WORKSPACE_CONFIG` addition: no change
+- CE backward `obj.backward()` → manual formula: no change
+
+### Candidate hypotheses
+1. **`flash_attn_func` backward non-determinism**: The `gqa_attention_backward` replays the forward inside `torch.enable_grad()`. The replayed forward's internal state might differ from the original forward's state, causing a different backward result. This would affect ALL attention layer gradients.
+2. **`silu_swiglu_intermediate_backward` rounding**: The `torch.autograd.grad` through `F.silu(gate_f) * up_f` with `grad_out.float()` might produce different rounding than the ref's full autograd chain.
+3. **`rms_norm_backward` dgrad vs ref**: The `torch.autograd.grad` through `F.rms_norm` might produce different rounding than the ref's `_RMSNormFn.backward` due to the `grad_out` dtype.
+
+### Next step
+- The most promising bisect is to compare the `d_main_pre_head` (LM head dgrad) with the ref's equivalent. If the dgrad matches, the error is downstream in the transformer layers. If not, the error is in the CE backward or LM head backward.
+- Since the `d_main_pre_head` hash is known (`cd32ee5c2c9a`), the next step should verify this against the ref by running a no-MTP variant.
+- review R8: in progress

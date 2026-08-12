@@ -563,21 +563,29 @@ def _compute_flops_per_step():
 # ── Static backward pass ─────────────────────────────────────────────────────
 
 
-def _add_to_grad_bufs(fp32_grad_bufs: list[torch.Tensor],
-                      bf16_params: list[torch.Tensor],
-                      weight: torch.Tensor,
-                      grad_weight: torch.Tensor) -> None:
-    """Add a weight gradient to the matching fp32 gradient buffer."""
-    for buf, p in zip(fp32_grad_bufs, bf16_params):
-        if p.data_ptr() == weight.data_ptr():
-            buf.add_(grad_weight.to(device=buf.device))
-            return
-    # If we get here, no match was found — this is a bug that silently
-    # drops the gradient.  Surface it immediately.
-    raise RuntimeError(
-        f"_add_to_grad_bufs: no match for weight with shape {weight.shape}, "
-        f"data_ptr={weight.data_ptr()}"
-    )
+def _build_dptr_idx(bf16_params: list[torch.Tensor]) -> dict[int, int]:
+    """Build a mapping from data_ptr to index in bf16_params."""
+    return {p.data_ptr(): i for i, p in enumerate(bf16_params)}
+
+
+def _add_to_grad_bufs(
+    fp32_grad_bufs: list[torch.Tensor],
+    dptr_idx: dict[int, int],
+    weight: torch.Tensor,
+    grad_weight: torch.Tensor,
+) -> None:
+    """Add a weight gradient to the matching fp32 gradient buffer.
+
+    Uses a pre-built data_ptr → index mapping (O(1)) instead of
+    linear search to avoid any subtle data_ptr aliasing issues.
+    """
+    idx = dptr_idx.get(weight.data_ptr())
+    if idx is None:
+        raise RuntimeError(
+            f"_add_to_grad_bufs: no match for weight with shape {weight.shape}, "
+            f"data_ptr={weight.data_ptr()}"
+        )
+    fp32_grad_bufs[idx].add_(grad_weight.to(device=fp32_grad_bufs[idx].device))
 
 
 def _static_backward(
@@ -603,6 +611,8 @@ def _static_backward(
     H = C.HIDDEN_SIZE
     V = C.VOCAB_SIZE
 
+    dptr_idx = _build_dptr_idx(bf16_params)
+
     # ====================================================================
     # MTP BRANCH BACKWARD (if enabled)
     # ====================================================================
@@ -625,7 +635,7 @@ def _static_backward(
         g2_mtp = grad_mtp_logits.reshape(-1, V)
         mtp_pre = cache.mtp_pre_head.reshape(-1, H)
         dw_output_mtp = torch.matmul(g2_mtp.transpose(0, 1), mtp_pre).float()
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.output_weight, dw_output_mtp)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.output_weight, dw_output_mtp)
 
         # ── width_mult backward: d(hidden) = d(mtp_pre_head) / width_mult
         d_mtp_final = d_mtp_pre_head / width_mult
@@ -634,7 +644,7 @@ def _static_backward(
         d_mtp_eagle_h, dw_mtp_fn = rms_norm_backward(
             d_mtp_final, cache.mtp_eagle_h, model.mtp.final_norm_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.final_norm_weight, dw_mtp_fn)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.final_norm_weight, dw_mtp_fn)
 
         # ── MTP transformer layer backward (reverse order)
         # First, the MLP residual: d_eagle_h = d_mtp_eagle_h (from MLP branch)
@@ -647,7 +657,7 @@ def _static_backward(
             mtp_lc.intermediate,
             model.mtp.layer.mlp_fc2_weight,
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.mlp_fc2_weight, dw_mtp_w2)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.mlp_fc2_weight, dw_mtp_w2)
 
         # SwiGLU backward
         d_mtp_y1, d_mtp_y2 = silu_swiglu_intermediate_backward(
@@ -659,13 +669,13 @@ def _static_backward(
         d_mtp_normed2, dw_mtp_fc1 = linear_backward(
             d_mtp_gate_up, mtp_lc.normed2, model.mtp.layer.mlp_fc1_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.mlp_fc1_weight, dw_mtp_fc1)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.mlp_fc1_weight, dw_mtp_fc1)
 
         # ffn_norm backward (MLP branch)
         d_mtp_hidden_mlp, dw_mtp_mlp_norm = rms_norm_backward(
             d_mtp_normed2, mtp_lc.hidden_after_attn, model.mtp.layer.pre_mlp_norm_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.pre_mlp_norm_weight, dw_mtp_mlp_norm)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.pre_mlp_norm_weight, dw_mtp_mlp_norm)
 
         # Add MLP and attention gradient at hidden
         # The gradient of the loss w.r.t. hidden_after_attn is:
@@ -679,7 +689,7 @@ def _static_backward(
             mtp_lc.attn_flat,
             model.mtp.layer.attention_proj_weight,
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.attention_proj_weight, dw_mtp_wo)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.attention_proj_weight, dw_mtp_wo)
 
         # Attention backward (GQA) — always uses math fallback path
         # since _gqa_attention always returns None for softmax_lse
@@ -699,13 +709,13 @@ def _static_backward(
             d_mtp_q, d_mtp_k, d_mtp_v,
             mtp_lc.normed, model.mtp.layer.qkv_weight,
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.qkv_weight, dw_mtp_qkv)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.qkv_weight, dw_mtp_qkv)
 
         # attention_norm backward
         d_mtp_hidden_before_attn, dw_mtp_attn_norm = rms_norm_backward(
             d_mtp_normed, mtp_lc.hidden_before_attn, model.mtp.layer.input_norm_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.layer.input_norm_weight, dw_mtp_attn_norm)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.input_norm_weight, dw_mtp_attn_norm)
 
         # Add residual from attention branch
         d_mtp_eagle_h_out = d_mtp_hidden_before_attn + d_mtp_eagle_h
@@ -715,26 +725,26 @@ def _static_backward(
             d_mtp_eagle_h_out, torch.cat([cache.mtp_a, cache.mtp_b], dim=-1),
             model.mtp.eagle_fc_weight,
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.eagle_fc_weight, dw_mtp_eagle_fc)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.eagle_fc_weight, dw_mtp_eagle_fc)
         d_mtp_a, d_mtp_b = d_mtp_cat.chunk(2, dim=-1)
 
         # mtp.hidden_input_layernorm backward
         d_hidden_normed_mtp, dw_mtp_hnorm = rms_norm_backward(
             d_mtp_b, cache.hidden_normed, model.mtp.hidden_input_norm_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.hidden_input_norm_weight, dw_mtp_hnorm)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.hidden_input_norm_weight, dw_mtp_hnorm)
 
         # mtp.emb_input_layernorm backward
         _, dw_mtp_enorm = rms_norm_backward(
             d_mtp_a, cache.mtp_emb, model.mtp.emb_input_norm_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.mtp.emb_input_norm_weight, dw_mtp_enorm)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.emb_input_norm_weight, dw_mtp_enorm)
 
         # MTP embedding backward
         dw_mtp_emb = embedding_backward(
             d_mtp_a * mup_emb_scale, cache.mtp_input_ids, V
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.tok_embeddings_weight, dw_mtp_emb)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.tok_embeddings_weight, dw_mtp_emb)
 
         # Accumulate gradient into hidden_normed from MTP
         d_hidden_normed_main = d_hidden_normed_mtp
@@ -753,7 +763,7 @@ def _static_backward(
     g2_main = grad_logits.reshape(-1, V)
     main_pre = cache.main_pre_head.reshape(-1, H)
     dw_output_main = torch.matmul(g2_main.transpose(0, 1), main_pre).float()
-    _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.output_weight, dw_output_main)
+    _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.output_weight, dw_output_main)
 
     # ── width_mult backward: d(hidden) = d(main_pre_head) / width_mult
     d_hidden_normed = d_main_pre_head / width_mult
@@ -763,21 +773,14 @@ def _static_backward(
         d_hidden_normed = d_hidden_normed + d_hidden_normed_main
 
     # ── final_norm backward
-    d_hidden, dw_final_norm = rms_norm_backward(
-        d_hidden_normed, cache.layer_caches[-1].mlp_out, model.final_norm_weight
-    )
-    # Actually, the input to final_norm is the hidden AFTER the last layer, not mlp_out.
-    # Let me fix this: we need the hidden BEFORE final_norm as the rms_norm input.
-    # The hidden before final_norm is the output of the last layer, which is cached
-    # in the last layer cache's hidden state after the MLP residual add.
-    # But we don't save that directly. Let me reconstruct it.
-    # hidden_post_last_layer = cache.layer_caches[-1].hidden_after_attn + cache.layer_caches[-1].mlp_out * depth_scale_main
+    # The input to final_norm is the hidden AFTER the last layer:
+    # hidden_post_last_layer = last_layer.hidden_after_attn + last_layer.mlp_out * depth_scale_main
     last_layer = cache.layer_caches[-1]
     hidden_post_last_layer = last_layer.hidden_after_attn + last_layer.mlp_out * depth_scale_main
     d_hidden, dw_final_norm = rms_norm_backward(
         d_hidden_normed, hidden_post_last_layer, model.final_norm_weight
     )
-    _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.final_norm_weight, dw_final_norm)
+    _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.final_norm_weight, dw_final_norm)
 
     # ── Transformer layers (reverse order) ─────────────────────────────
     for li in range(len(model.layers) - 1, -1, -1):
@@ -790,7 +793,7 @@ def _static_backward(
         d_intermediate, dw_w2 = linear_backward(
             d_hidden * depth_scale_main, lc.intermediate, layer.mlp_fc2_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.mlp_fc2_weight, dw_w2)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.mlp_fc2_weight, dw_w2)
 
         # SwiGLU backward: intermediate = silu(y1) * y2
         d_y1, d_y2 = silu_swiglu_intermediate_backward(d_intermediate, lc.y1, lc.y2)
@@ -800,13 +803,13 @@ def _static_backward(
         d_normed2, dw_fc1 = linear_backward(
             d_gate_up, lc.normed2, layer.mlp_fc1_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.mlp_fc1_weight, dw_fc1)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.mlp_fc1_weight, dw_fc1)
 
         # ffn_norm backward (MLP branch into hidden_after_attn)
         d_hidden_mlp, dw_mlp_norm = rms_norm_backward(
             d_normed2, lc.hidden_after_attn, layer.pre_mlp_norm_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.pre_mlp_norm_weight, dw_mlp_norm)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.pre_mlp_norm_weight, dw_mlp_norm)
 
         # Add MLP residual: hidden = hidden_before_attn + attn_out * depth_scale
         # then hidden = hidden + mlp_out * depth_scale.
@@ -819,7 +822,7 @@ def _static_backward(
         d_attn_flat, dw_wo = linear_backward(
             d_hidden * depth_scale_main, lc.attn_flat, layer.attention_proj_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.attention_proj_weight, dw_wo)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.attention_proj_weight, dw_wo)
 
         # Attention backward (GQA) — always uses math fallback path
         # since _gqa_attention always returns None for softmax_lse.
@@ -837,13 +840,13 @@ def _static_backward(
         d_normed, dw_qkv = project_qkv_backward(
             d_q, d_k, d_v, lc.normed, layer.qkv_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.qkv_weight, dw_qkv)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.qkv_weight, dw_qkv)
 
         # attention_norm backward
         d_hidden_before_attn, dw_attn_norm = rms_norm_backward(
             d_normed, lc.hidden_before_attn, layer.input_norm_weight
         )
-        _add_to_grad_bufs(fp32_grad_bufs, bf16_params, layer.input_norm_weight, dw_attn_norm)
+        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.input_norm_weight, dw_attn_norm)
 
         # Add residual from attention branch: hidden = hidden_before_attn + attn_out * depth_scale
         # The gradient of the loss w.r.t. hidden_before_attn is:
@@ -854,7 +857,7 @@ def _static_backward(
     dw_emb = embedding_backward(
         d_hidden * mup_emb_scale, cache.input_ids, C.VOCAB_SIZE
     )
-    _add_to_grad_bufs(fp32_grad_bufs, bf16_params, model.tok_embeddings_weight, dw_emb)
+    _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.tok_embeddings_weight, dw_emb)
 
 
 # ── Optimizer helpers ────────────────────────────────────────────────────────
@@ -1048,6 +1051,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
     See module-level docstring for the full contract and stdout grammar.
     """
+    # Must be set before CUDA initializes anywhere in the process.
+    # The ref (train_pure_mup_mtp.py) sets this at module level; mirroring
+    # it here ensures the cuBLAS workspace configuration is deterministic
+    # regardless of how the harness framework injects [env] vars.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     rank = _init_process_group()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = f"cuda:{local_rank}"
@@ -1241,6 +1250,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # of the SUM. reduce_grads then scales by 1/g_lm_n to convert to the gradient
         # of the AVERAGE. Without this scaling, our gradients are lm_n times larger.
         norm_factor = 1.0 / local_lm_n.clamp(min=1.0)
+
         for buf in fp32_grad_bufs:
             buf.mul_(norm_factor)
 

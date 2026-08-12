@@ -92,3 +92,22 @@ None.
 - `train_loop.py:1160-1170`: per-step capture prefix fix — hash comparison improved from 0/312 to 154/2496 matching keys
 
 ---
+
+## [stage1] Round 7 — 2026-08-12 22:47:21
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 84b49a9 — Docs: record Round 7 gradient bisect findings in perf_log
+
+### Key conclusions
+This is a docs-only commit — no code changes (debug-only investigation, reverted). The engine remains a genuine in-process implementation; no subprocess calls to ref/ scripts, no hardcoded synthetic metrics, no renamed proxy variants. The only `from ref.*` imports at `train_loop.py:212,258` are data-loader utilities (HF streaming and Megatron binary), not core training logic. The gradient diff (0.54% at step 1) persists and the dev agent has documented the bisect findings — forward pass, CE backward, and norm_factor all verified correct. No `STAGE_STATUS: finished` in the commit message, so stage 1 stays in-progress.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `git diff HEAD~1 HEAD --name-only` yields only `workload/notes/perf_log.md` and `workload/notes/review.md` — zero code files touched
+- No `import ref`, `subprocess`, `os.system`, `os.popen`, proxy naming, or hardcoded metric literals in the engine source
+- Engine has been verified as genuine in-process implementation across review rounds 5 and 6 (same finding)
+
+---
