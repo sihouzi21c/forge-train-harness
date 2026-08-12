@@ -1,0 +1,32 @@
+# perf-bitwise.toml — M4 单一源(MiniCPM4-8B 满 32 层真实规模;DP×TP bitwise + MFU)
+#
+# 8-GPU TP2×DP4(用户指定):跑满官方 32 层(不再压到 16 层 proxy),层数对齐
+# 真实 8B 规模。MFU 只有在真实层数下才有意义。逐位部分(loss/grad hash)仍
+# 硬性逐位等价。grad_accum = GBS/(MBS·DP) = 32/(2·4) = 4。
+[shared]
+world_size_override           = 8
+tensor_parallel_size_override = 2
+num_layers_override           = 32
+num_steps_override            = 25
+micro_batch_size_override     = 2
+global_batch_size_override    = 32
+gate_window                   = [11, 26]
+
+[shared.gate]
+gate_bitwise            = true
+gate_atol               = 0
+hash_capture_level      = 1
+mfu_e2e_target          = 20.0   # M4 是 det-ON + hash-capture 逐位路径(比 det-off 吞吐慢一截),故门设 20;autotune 48% 是 det-off 吞吐,不可直接套
+warmup_steps            = 10
+loss_abs_threshold      = 0
+grad_norm_abs_threshold = 0
+forge_init_ones         = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = true
+
+[ours]
+deterministic = true

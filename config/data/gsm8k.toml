@@ -1,0 +1,8 @@
+# Data source: gsm8k local-dev (auto-prep on first use).
+#
+# To use: cp config/data/gsm8k.toml config/data.toml
+# Then: export GSM8K_DIR=/path/to/hf/gsm8k/main  (first run only)
+
+[data]
+conf_path = "ref/reference/gsm8k_data_conf.sh"
+data_loader = "megatron_binary"

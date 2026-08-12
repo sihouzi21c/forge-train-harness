@@ -1,0 +1,17 @@
+[defaults]
+report = "text"
+default_timeout_s = 1800
+output_tail_limit = 50000
+
+[artifacts]
+root = ".artifacts"
+
+[artifacts.subtrees]
+runs = "runs"
+
+# Sliding-window retention for `.artifacts/runs/<suite>-*`. Before a new
+# run dir is allocated, the oldest entries of the same suite are deleted
+# until `per_suite - 1` remain (the new one takes the last slot). `0`
+# disables pruning. See `harness/app.py::_prune_old_runs`.
+[artifacts.retention]
+per_suite = 3

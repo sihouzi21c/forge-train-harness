@@ -1,0 +1,22 @@
+# Reference implementation: pure-PyTorch (muP, no MTP) backend for the
+# MiniCPM4-8B DP+TP harness.
+#
+# To use: cp config/ref/torch_minicpm4_8b.toml config/ref.toml
+
+[ref]
+backend = "torch"
+# Shared launcher for both single-card (proxy) and 4-GPU DP+TP runs;
+# topology is selected by the gate's *_override knobs, matching the 0.5B
+# one-script convention.
+ref_script = "run_minicpm4_8b_dptp.sh"
+megatron = "git@codeup.aliyun.com:modelbest/scaling/Megatron-LM.git"
+megatron_branch = "cpm_core_r0.15.0"
+tokenizer = "openbmb/MiniCPM4-8B"
+# Local directory holding the tokenizer file. snapshot_download writes
+# tokenizer.model here on cache miss. Default matches the Dockerfile bake
+# layout; override on hosts that store data elsewhere.
+forge_tokenizer_dir = "/opt/forge-data/tokenizer"
+
+# checkpoint_root is auto-derived to <repo>/.artifacts/checkpoints/<backend>/
+# when omitted. Set FORGE_CHECKPOINT_ROOT (env) or --checkpoint-root (CLI)
+# to override.

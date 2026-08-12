@@ -1,0 +1,21 @@
+# Data source: gsm8k via the generic streaming HF loader (dev/CI vehicle).
+#
+# Same streaming dataloader (hf_stream_dataloader) as ultra_fineweb.toml,
+# pointed at tiny baked gsm8k so every Stage 1 torch-ref gate runs offline.
+#
+# To use: cp config/data/gsm8k_hf.toml config/data.toml
+#
+# On first launch the harness checks for each ``download_files`` entry under
+# ``forge_data_dir`` and pulls anything missing via ``hf_hub_download``.
+
+[data]
+conf_path = "ref/reference/gsm8k_hf_data_conf.sh"
+data_loader = "hf"
+dataset = "openai/gsm8k"
+forge_data_dir = "/opt/forge-data/gsm8k"
+
+# Map of <local relative path under forge_data_dir> = <path inside the HF
+# repo>. The local layout matches the Dockerfile bake and the data_conf.sh
+# glob (``train-*.parquet`` at the root of forge_data_dir).
+[data.download_files]
+"train-00000-of-00001.parquet" = "main/train-00000-of-00001.parquet"

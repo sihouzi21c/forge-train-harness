@@ -1,0 +1,380 @@
+# ============================================================================
+# dense_training_qwen3.toml — 套件注册表(gate-config 重构目标态,Qwen3 0.6B)
+#
+# 这个文件就是活跃 eval.toml 的源:`cp` 成 <loop>/config/eval.toml 使用。
+#
+# 重构后职责切分(见 gate_param_refactor_design.md 的 E / D12,gate_config_layout.md):
+#   * 本文件 = 注册表:只装「身份 + 分发路由 + 全局段」,不装任何 per-gate 可调参数。
+#   * 每个 gate 的 shape / 阈值 / init / determinism / model·optim override
+#     → 搬进 gate_config/<gate>.toml(单一源),由 tools/render_gate_configs.py
+#     渲染成 ref/config/<gate>.toml + workload/src/config/<gate>.toml 两份产物。
+#   * 两者按 gate 名关联,字段不重叠。
+#
+# 全局段(渲染器直接读)— 段名即渲染器约定,勿改:
+#   [suite]              枚举 + gate_config 目录定位
+#   [defaults].seed      seed 全局默认(某 gate 要改在其 gate_config [shared] override)
+#   [runtime.distributed] MASTER_ADDR / MASTER_PORT 来源
+#   [env]                全局 env 清单(传输分类器:在此 → 产物 [env];否则 → [cli])
+#
+# 注:flat 旧注册表 ../dense_training_qwen3.toml 保留作参考,不再是活跃源。
+# ============================================================================
+
+
+# ── 套件标识 + gate_config 定位(渲染器读 [suite]) ──────────────────────────
+# new-looptask Decision A coupling SSOT — read by enumerating config/eval/*/
+# and loading each registry's [family]; no hardcoded family map in the skill.
+[family]
+label = "Qwen3 0.6B"
+model = "qwen3_0.6b"
+ref   = "torch_qwen3_0.6b"
+optim = "qwen3_0.6b"
+
+[suite]
+name            = "dense_training_qwen3"
+gate_config_dir = "gate_config"   # 同级子目录,装 <gate>.toml 单一源
+
+# ── seed 全局默认 ────────────────────────────────────────────────────────────
+# 渲染基线最低层;某 gate 需不同 seed 时在其 gate_config [shared] 里 seed_override。
+[defaults]
+seed = 1234
+
+# ── torch.distributed rendezvous(基础设施,只能走 env) ─────────────────────
+# 渲染成 MASTER_ADDR / MASTER_PORT。"auto" → 每次套件调用分配空闲端口
+# (evals._common._resolve_master_port);渲染器对 auto 写 "<runtime>" 占位,
+# 由 dispatcher 运行时填实。
+[runtime.distributed]
+master_addr = "localhost"
+master_port = "auto"
+
+# ── 全局 env 清单(传输分类器) ───────────────────────────────────────────────
+# 任意裸键,其大写名出现在此 → 走产物 [env](大写)下发;否则默认走 [cli]。
+# gate 的 [ours]/[ref] 可用 @unset 抹掉其中任意键(long-horizon ours 抹确定性栈)。
+#
+# F1 — 库/确定性栈(6):cuBLAS / NCCL / TransformerEngine 直接读 env,无 CLI
+# 通道 → 合法的「必须用 env」例外(设计 F1 / D5)。引擎转发 flag(FP32_GRAD_ACCUM
+# 等)不再静态钉在 [env]:它们是 ours 侧引擎旋钮,经 model/optim 轴 + gate_config
+# 渲染进 ours 产物,不走全局 env。
+[env]
+PYTORCH_CUDA_ALLOC_CONF          = "expandable_segments:True"
+NVTE_ALLOW_NONDETERMINISTIC_ALGO = "0"
+NVTE_FUSED_ATTN                  = "1"
+CUBLAS_WORKSPACE_CONFIG          = ":4096:8"
+CUDA_DEVICE_MAX_CONNECTIONS      = "1"
+TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"
+
+
+# ── 套件身份 ─────────────────────────────────────────────────────────────────
+[workload]
+id = "qwen3_0.6b_training_engine_unified"
+display_name = "Qwen3 0.6B Training Engine (Unified Harness)"
+description = "Unified harness for the Qwen3 0.6B dense (GQA + QK-Norm) reference, covering stage1 (alignment → long-horizon milestones: alignment forward+backward bitwise, bitwise-singlecard → bitwise-perf ref-vs-ours bitwise trajectories on real dataloader, resume bitwise, long-horizon optimization) and stage2 (per-op optimization)."
+requires_cuda = true
+
+# ── 共享 ref 采集线缆(I:单一 bridge 路径 + alignment 张量 dump 文件名) ─────────────
+# hash_capture_level>0 的 gate 共用 bridge.sh;采集级别本身是 per-gate 旋钮,
+# 在各 gate_config [shared.gate].hash_capture_level。
+# bridge.sh 按 FORGE_BACKEND 分流:torch 分支直透 launcher(train_*.py 经
+# harness_dp 自插桩),megatron 分支仍走 interposer 源码插桩。
+[ref]
+ref_capture_script = "ref/bridges/bridge.sh"
+ref_capture_basename = "ref_capture.pt"
+candidate_capture_basename = "candidate_capture.pt"
+
+
+# ##########################################################################
+#                    本地边界套件(off-GPU,GPU 工作前先跑)
+# ##########################################################################
+
+[local_suites.guard]
+stage = "local"
+runner_kind = "guard"
+description = "Run the local framework boundary guard"
+local = true
+requires_cuda = false
+args_min = 0
+args_max = 0
+
+[local_suites.unit]
+stage = "local"
+runner_kind = "unit"
+description = "Run local CPU unit tests"
+local = true
+requires_cuda = false
+args_min = 0
+args_max = 0
+
+[local_suites.anti-proxy]
+stage = "local"
+runner_kind = "anti-proxy"
+description = "Lint candidate engine for proxy / synthesis patterns"
+local = true
+requires_cuda = false
+args_min = 0
+args_max = 0
+
+
+# ##########################################################################
+#         STAGE 1 训练 gate(参数已搬进 gate_config/<gate>.toml)
+# ##########################################################################
+#
+# 以下每个 [evals.<gate>] 只保留分发路由元数据;shape / 阈值 / init /
+# determinism / optim override 在对应 gate_config/<gate>.toml,渲染下发。
+
+# alignment.forward:单步 DP=1 张量采集对齐(forward 子集)
+[evals.forward-align]
+stage = "stage1"
+runner_kind = "forward-align"
+milestone = "alignment.forward"
+script = "evals/scripts/eval_capture_align.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 600
+# 薄 dispatcher 路由:通用三步执行器(ref/run_gate.sh → run_ours.sh → verdict)。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "align"
+
+# alignment.backward:同 alignment.forward 采集,取 grad 子集
+[evals.backward-align]
+stage = "stage1"
+runner_kind = "backward-align"
+milestone = "alignment.backward"
+script = "evals/scripts/eval_capture_align.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 600
+# 薄 dispatcher 路由:同 forward-align,verdict 按 milestone 值选比较子集。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "align"
+
+# bitwise-singlecard:单卡多步 bitwise(DP=1)
+[evals.multistep-1gpu]
+stage = "stage1"
+runner_kind = "stage1-bitwise-trajectory"
+milestone = "bitwise-singlecard"
+script = "evals/scripts/eval_train_steps.py"
+launcher = "evals/scripts/launch_dp.py"
+use_real_dataloader = true
+timeout_s = 600
+# 薄 dispatcher 路由:通用三步执行器。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "bitwise"
+
+# bitwise-multicard:多卡多步 bitwise(DP=2)
+[evals.multistep]
+stage = "stage1"
+runner_kind = "stage1-bitwise-trajectory"
+milestone = "bitwise-multicard"
+script = "evals/scripts/eval_train_steps.py"
+launcher = "evals/scripts/launch_dp.py"
+use_real_dataloader = true
+timeout_s = 600
+# 薄 dispatcher 路由:同 multistep-1gpu。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "bitwise"
+
+# bitwise-perf:bitwise + MFU≥8%(DP=2)
+[evals.perf-bitwise]
+stage = "stage1"
+runner_kind = "stage1-bitwise-trajectory"
+milestone = "bitwise-perf"
+script = "evals/scripts/eval_train_steps.py"
+launcher = "evals/scripts/launch_dp.py"
+use_real_dataloader = true
+timeout_s = 720
+# ref 侧独立 wall-clock 上限(config_runtime.suite_ref_timeout_s),独立于 timeout_s。
+# Qwen3-0.6B 在同 Level 1 采集开销下比 0.5B 更慢(28 层 / tied-embedding / QK-Norm),
+# ref 采集是绑定 wall,900s 留余量。
+ref_timeout_s = 900
+# 薄 dispatcher 路由:同 multistep-1gpu。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "bitwise"
+
+# resume + long-horizon 回归 gate:checkpoint save→load 确定性(DP=2,两段)
+[evals.resume-gate-20]
+stage = "stage1"
+runner_kind = "resume-gate"
+milestone = "resume"
+script = "evals/scripts/eval_resume_train.py"
+launcher = "evals/scripts/launch_dp.py"
+# 历史 derive max(1800, 20*20+600)=1800 冻结值,SSOT 在此,勿重新派生。
+timeout_s = 1800
+# 薄 dispatcher 路由:ours-only——[LOSS_REF]/[LOSS_RES] 两条轨迹由
+# eval_resume_train.py 单进程产出,无 ref 子进程;形状仍读渲染后的 ref 产物。
+needs_ref = false
+ours_runner = "run_ours"
+verdict = "resume"
+
+# resume-startup-90 — 续训启动时间门禁 (resume milestone, ours-only)
+# 从 step 90 续训:dataloader seek(build → advance 到断点流位 → 取首个 micro-batch)
+# 必须在 resume_startup_budget_s 内完成。replay-by-discard 续训按 O(consumed) 重放
+# 前面所有 step 的数据(GPU 空转),必挂;O(1) cursor-restore seek 通过。shape 同本
+# variant 的 resume-gate-20;budget 按各 variant 形状定(1B 实测 ~0.021s/microbatch +
+# ~3.6s buffer,其余按此 slope 估算,待实测细调)。
+# 形状(world_size / micro_batch_size / seq_length / grad_accum_steps /
+# resume_save_step / resume_post_steps)全部来自渲染后的 ours 产物
+# (gate_config/resume-startup-90.toml → workload/src/config/),runner 经 --config
+# 读;dispatcher 只从产物取 world_size + save_step·grad_accum 算 consumed。
+[evals.resume-startup-90]
+stage = "stage1"
+runner_kind = "resume-startup"
+milestone = "resume"
+script = "evals/scripts/eval_resume_startup.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 600
+resume_startup_budget_s = 16.0   # ours-only 判定阈值(不进产物);估算 replay@90≈26s;0 = 关闭门禁
+# 薄 dispatcher 路由:ours-only,无 ref 轨迹。
+needs_ref = false
+ours_runner = "run_ours"
+verdict = "resume_startup"
+
+# long-horizon 主门禁:长程优化(loss_rel≤2.5% + MFU≥40%)
+[evals.long-train]
+stage = "stage1"
+runner_kind = "long-train"
+milestone = "long-horizon"
+script = "evals/scripts/eval_long_train.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 3600
+# 薄 dispatcher 路由:通用三步执行器。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "long_train"
+
+# long-horizon-smoke:同 long-train 形状,20 步快速反馈(非 commit gate)
+[evals.long-train-smoke]
+stage = "stage1"
+runner_kind = "long-train"
+milestone = "long-horizon-smoke"
+script = "evals/scripts/eval_long_train.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 600
+# 薄 dispatcher 路由:同 long-train。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "long_train"
+
+# long-horizon 辅助:loss-only 长程检查(无 MFU 门,非 commit gate)
+[evals.loss-gate-200]
+stage = "stage1"
+runner_kind = "loss-gate"
+milestone = "long-horizon"
+script = "evals/scripts/eval_long_train.py"
+launcher = "evals/scripts/launch_dp.py"
+# 历史 derive max(1800, 200*10+600)=2600 冻结值,SSOT 在此,勿重新派生。
+timeout_s = 2600
+# 薄 dispatcher 路由:loss-only 长程检查。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "loss_gate"
+
+# production:ours-only 生产长训(DP=2,10k 步,4 段 checkpoint)。无 ref 对比。
+[evals.production-train]
+stage = "stage1"
+runner_kind = "production-train"
+milestone = "production"
+script = "evals/scripts/eval_production_train.py"
+launcher = "evals/scripts/launch_dp.py"
+# 每「段」(2500 步)的 wall-clock 上限 = 24h;非整 10k 步上限。超时的段被 kill,
+# 下次 harness run production-train 从其最后 checkpoint 续跑。
+timeout_s = 86400
+# 薄 dispatcher 路由:ours-only 分段续训(run_ours_production.sh 段循环 +
+# production_ckpt.py 续点发现),verdict 只验 checkpoint 完整性。
+needs_ref = false
+ours_runner = "run_ours_production"
+verdict = "production"
+
+# bitwise-perf/long-horizon 迭代 profile 快照(非 commit gate)。无自有 shape:经 mirror_gate
+# 镜像被测 gate 的形状(bitwise-perf→perf-bitwise,long-horizon→long-train),故无 gate_config 文件,
+# 仅诊断用的 num_steps / warmup_steps 留在此。
+[evals.profile-snapshot]
+stage = "stage1"
+runner_kind = "profile-snapshot"
+script = "evals/scripts/eval_profile_snapshot.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 900
+warmup_steps = 5
+num_steps = 12
+mirror_gate = { "bitwise-perf" = "perf-bitwise", "long-horizon" = "long-train" }
+# 薄 dispatcher 路由:ours-only。渲染器按 mirror_gate 逐 milestone 合成变体产物
+# profile-snapshot@<milestone>.toml;run_ours.sh 依 $3 标签选变体。
+needs_ref = false
+ours_runner = "run_ours"
+verdict = "profile"
+requires_label = true
+
+
+# ##########################################################################
+#       STAGE 1 里程碑进度序列(进度引擎排序唯一源 —— 详见 milestone_rename_design.md §5)
+# ##########################################################################
+#
+# 改名 / 重排 / 增删已有 runner 类型的里程碑,只改本列表(+ 对应 gate 的 milestone
+# 字段 + prompt 文件);进度引擎只读这里,不读各 gate 的 milestone 字段。
+[stage1]
+milestone_order = [
+    "alignment",
+    "bitwise-singlecard",
+    "bitwise-multicard",
+    "bitwise-perf",
+    "resume",
+    "long-horizon",
+    "production",
+]
+
+
+# ##########################################################################
+#       STAGE 2 算子门禁(设计 D7 范围外 —— 原样保留,本次不收编)
+# ##########################################################################
+
+# Stage 2 运行时默认 —— 空表:checkpoint_root/megatron_root/data_path 走继承。
+[stage2]
+
+# Stage 2 主 agent 扇出旋钮。
+[automation.stage2]
+max_concurrent = 6
+max_op_long_failures = 3
+
+# M1 gate:校验 scout 产物(registry / 脚手架 / worktree / dispatcher 接线)。
+[evals.op-inventory]
+stage = "stage2"
+runner_kind = "op-inventory"
+description = "M1 gate: validate Stage 2 scout artifacts (registry / scaffolding / worktrees / dispatcher wiring)"
+requires_cuda = false
+execution_scope = "suite-runner"
+timeout_s = 120
+
+# 单算子 DP=2 长程集成 gate(subagent 自驱;GPU flock 串行化)。
+[evals.op-long]
+stage = "stage2"
+runner_kind = "op-long"
+description = "DP=2 long-horizon integration gate (subagent self-drives; GPU flock serializes per slice)"
+args_usage = "[names...]"
+args_min = 0
+args_unbounded = true
+env_inputs = ["BACKEND", "CHECKPOINT_ROOT", "MEGATRON_ROOT", "DATA_PATH", "MICRO_BATCH_SIZE", "NUM_STEPS", "GLOBAL_BATCH_SIZE", "NUM_PROCS", "MASTER_ADDR", "MASTER_PORT", "OP_NAMES", "SEED", "SEQ_LENGTH", "GRAD_ACCUM_STEPS"]
+timeout_s = 3600
+rel_diff_threshold = 0.01
+forge_init_ones = 1
+[evals.op-long.optim_overrides]
+lr_warmup_iters = 0
+
+[evals.op-long.ref_env]
+WORLD_SIZE                = "2"
+NUM_STEPS_OVERRIDE        = "200"
+MICRO_BATCH_SIZE_OVERRIDE = "2"
+GLOBAL_BATCH_SIZE_OVERRIDE = "80"
+GATE_WINDOW_START         = "101"
+GATE_WINDOW_END           = "201"
+
+[evals.op-long.ours_env]
+MICRO_BATCH_SIZE_OVERRIDE = "4"
+
+# M2 gate:从 registry + git 真值聚合算子状态。
+[evals.op-status]
+stage = "stage2"
+runner_kind = "op-status"
+description = "M2 gate: aggregate per-op merged/failed status from registry + git"
+requires_cuda = false
+execution_scope = "suite-runner"

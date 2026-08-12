@@ -1,0 +1,25 @@
+# multistep-1gpu.toml — bitwise-singlecard 单一源(DP=1 多步 bitwise)
+[shared]
+world_size_override        = 1
+num_steps_override         = 8
+micro_batch_size_override  = 2
+global_batch_size_override = 2
+gate_window                = [1, 9]
+
+[shared.gate]
+gate_bitwise            = true
+gate_atol               = 0      # bitwise 套件现靠 dispatcher 默认 0,这里显式化
+hash_capture_level      = 2
+mfu_e2e_target          = 0
+loss_abs_threshold      = 0
+grad_norm_abs_threshold = 0
+forge_init_ones         = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = true
+
+[ours]
+deterministic = true

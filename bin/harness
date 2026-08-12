@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Auto-generated per-workspace harness shim. DO NOT COMMIT.
+# Workspace: /Users/sunhj/Downloads/hjsun/ForgeInference/.artifacts/forge_train/77459cccb4da/workspace
+export PYTHONPATH="/Users/sunhj/Downloads/hjsun/ForgeInference/.artifacts/forge_train/77459cccb4da/workspace${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m harness.cli "$@"

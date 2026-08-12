@@ -1,0 +1,66 @@
+# Model architecture + identity: Qwen3 0.6B (dense GQA + QK-Norm).
+#
+# To use: cp config/model/qwen3_0.6b.toml config/model.toml
+#
+# This is the [model] axis: it owns model architecture, identity,
+# initialization, and the universal structural switches — orthogonal to
+# [ref] (backend / source code), [data] (training corpus), [remote]
+# (where to run), [agent] (loop tunables), and [eval] (gates / suites).
+#
+# Geometry / vocab mirror HF ``Qwen/Qwen3-0.6B`` config.json exactly
+# (num_hidden_layers=28, hidden_size=1024, intermediate_size=3072,
+# num_attention_heads=16, num_key_value_heads=8, head_dim=128,
+# vocab_size=151936, rope_theta=1e6, rms_norm_eps=1e-6,
+# tie_word_embeddings=true, attention_bias=false). Unlike MiniCPM, Qwen3
+# is standard-parameterized (NO muP) and has NO MTP — those knobs are set
+# to neutral values the Qwen3 reference ignores, kept present only so the
+# strict universal [model] schema stays 1:1 with the engine ModelHParams.
+
+[model]
+name = "qwen3_0.6b"
+
+# Backbone architecture.
+num_layers = 28
+hidden_size = 1024
+ffn_hidden_size = 3072
+num_attention_heads = 16
+num_query_groups = 8
+# Independent head dimension. 1024/16 = 64, but Qwen3 uses 128 —
+# head_dim is an explicit knob exactly for this decoupling.
+head_dim = 128
+# Training window. HF max_position_embeddings is 40960; the harness data
+# pipeline packs to a fixed 4096 sequence length (shared with MiniCPM),
+# and RoPE here is computed against this window with theta=1e6.
+seq_length = 4096
+max_position_embeddings = 4096
+# vocab_size 151936 is already a multiple of 128 (151936 = 128 * 1187),
+# so no extra padding is required.
+padded_vocab_size = 151936
+rotary_base = 1000000
+norm_epsilon = 1e-6
+
+# Initialization (HF initializer_range = 0.02, applied uniformly — no muP
+# width rescale).
+init_method_std = 0.02
+
+# muP — OFF for Qwen3 (standard parameterization). Neutral values: the
+# Qwen3 reference (model_qwen3.py) does not read these (width_mult ≡ 1.0,
+# no emb scale, no depth scale, single lr group), but the universal schema
+# requires the keys to be present and numeric.
+mup_base_hidden_size = 1024
+mup_emb_scale = 1.0
+mup_depth_scale = 1.0
+
+# MTP / Eagle — OFF for Qwen3. mtp_num_layers = 0 means no Eagle layer and
+# no MTP loss term; mtp_loss_weight is then unused.
+mtp_num_layers = 0
+mtp_loss_weight = 0.0
+
+# NOTE: Qwen3's two defining structural features — per-head QK-Norm (RMSNorm
+# on Q/K before RoPE) and tied word embeddings (LM head reuses the input
+# embedding matrix) — are NOT [model] knobs. They are intrinsic to the Qwen3
+# reference and hardcoded in its launcher/model (run_qwen3_dense.sh +
+# model_qwen3.py), so they stay out of the shared [model] schema (no
+# FORGE_USE_QK_NORM / FORGE_TIE_WORD_EMBEDDINGS injection, and the MiniCPM
+# templates need not declare them). If a future Qwen-family size ever needs
+# to toggle them, promote them to a model knob then.

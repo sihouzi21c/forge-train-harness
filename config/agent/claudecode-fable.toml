@@ -1,0 +1,33 @@
+# Agent profile: Claude Code CLI pinned to the Fable model.
+#
+# To use: cp config/agent/claudecode-fable.toml config/agent.toml
+#
+# Unlike `claudecode-default.toml`, this profile pins an explicit model
+# id (`CLAUDE_aeqq93[1m]`). The claude-code backend forwards `--model
+# CLAUDE_aeqq93[1m]` to the CLI because the slug is non-empty (see
+# web/agents/backends.py::_build_claude_command). The `[1m]` suffix is
+# the llm-center proxy's selector for the model's 1M-context variant.
+# Only use a slug the proxy actually routes — an unrouted id yields a
+# 500 "模型不存在" error.
+#
+# `effort` is empty so the model uses its built-in default reasoning
+# budget. Set it to low / medium / high / xhigh / max to override; see
+# `claudecode-default.toml` for the full semantics.
+
+[agent]
+backend = "claude-code"
+model = "CLAUDE_aeqq93[1m]"
+effort = ""
+runs_per_stage = 0
+poll_seconds = 5
+agent_round_tries = 8
+retry_base_sleep = 4
+retry_continue_prompt = "Transient agent CLI / network disconnect. Continue exactly where you left off; do not restart the whole iteration from scratch."
+state_dir = ".artifacts/agent-loop-state"
+max_consecutive_review_fails = 3
+# Per-command wall-clock cap (claude-code only). Every Bash command the
+# CLI runs is wrapped in `timeout <cmd_timeout>` via a fake-$SHELL shim
+# (web/agents/timeout_shell), group-killing runaway background poll-loops
+# that would otherwise keep `claude -p` alive past its turn result. Any
+# coreutils DURATION ("40m", "1h", "3600s"); empty disables the cap.
+cmd_timeout = "40m"

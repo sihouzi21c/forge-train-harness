@@ -1,0 +1,34 @@
+# Reference implementation: pure-PyTorch Qwen3 dense (QK-Norm) backend.
+#
+# To use: cp config/ref/torch_qwen3_0.6b.toml config/ref.toml
+#
+# Unlike torch_1b.toml / torch_minicpm4_0.5b.toml, this points at the
+# Qwen3-specific launcher (run_qwen3_dense.sh → train_qwen3_dense.py →
+# model_qwen3.py), which implements standard parameterization (no muP),
+# no MTP, split q/k/v with per-head QK-Norm, and a tied LM head. Model
+# geometry is still injected via FORGE_* from the active [model] axis
+# (config/model/qwen3_0.6b.toml).
+#
+# The tokenizer points at Qwen/Qwen3-0.6B. Qwen3 ships ONLY a HuggingFace
+# fast tokenizer (tokenizer.json — a BPE vocab; no SentencePiece
+# tokenizer.model), which the torch data path consumes through
+# hf_stream_dataloader → gsm8k_prepare_torch._HFTokenizerAdapter
+# (encode(text)+[eos], no BOS). eos is resolved from tokenizer_config.json
+# (Qwen3 eos_token = "<|im_end|>", id 151645).
+
+[ref]
+backend = "torch"
+ref_script = "run_qwen3_dense.sh"
+# Megatron coordinates are inherited for schema-shape parity with the
+# other torch refs; the torch backend never clones Megatron.
+megatron = "git@codeup.aliyun.com:modelbest/scaling/Megatron-LM.git"
+megatron_branch = "cpm_core_r0.15.0"
+tokenizer = "Qwen/Qwen3-0.6B"
+# Local directory holding the tokenizer files. snapshot_download writes
+# tokenizer.json + tokenizer_config.json + special_tokens_map.json here on
+# cache miss. Override on hosts that store assets elsewhere.
+forge_tokenizer_dir = "/opt/forge-data/tokenizer/qwen3_0.6b"
+
+# checkpoint_root is auto-derived to <repo>/.artifacts/checkpoints/<backend>/
+# when omitted. Set FORGE_CHECKPOINT_ROOT (env) or --checkpoint-root (CLI)
+# to override.

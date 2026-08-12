@@ -1,0 +1,18 @@
+# Reference implementation: Megatron backend.
+#
+# To use: cp config/ref/megatron_minicpm4_0.5b.toml config/ref.toml
+
+[ref]
+backend = "megatron"
+ref_script = "train_minicpm4_0.5b_fineweb_modelbestsdk.sh"
+megatron = "git@codeup.aliyun.com:modelbest/scaling/Megatron-LM.git"
+megatron_branch = "cpm_core_r0.15.0"
+tokenizer = "openbmb/MiniCPM4-0.5B"
+# Local directory holding the tokenizer file. snapshot_download writes
+# tokenizer.model here on cache miss. Default matches the Dockerfile bake
+# layout; override on hosts that store data elsewhere.
+forge_tokenizer_dir = "/opt/forge-data/tokenizer"
+
+# checkpoint_root is auto-derived to <repo>/.artifacts/checkpoints/<backend>/
+# when omitted. Set FORGE_CHECKPOINT_ROOT (env) or --checkpoint-root (CLI)
+# to override.

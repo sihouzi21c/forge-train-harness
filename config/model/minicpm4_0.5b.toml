@@ -1,0 +1,56 @@
+# Model architecture + identity: MiniCPM4 0.5B (the historical default).
+#
+# To use: cp config/model/minicpm4_0.5b.toml config/model.toml
+#
+# This is the [model] axis: it owns model architecture, identity,
+# initialization, muP, and MTP — orthogonal to [ref] (backend / source
+# code), [data] (training corpus), [remote] (where to run), [agent]
+# (loop tunables), and [eval] (gates / suites). Switching to a
+# different model size means swapping this file only.
+#
+# The harness reads each value below and injects a corresponding
+# FORGE_<UPPER_KEY> env var into the L0 ref-script subprocess; both
+# the Megatron-side .sh launchers (train_minicpm4_0.5b_*.sh) and the
+# torch-side launcher (run_16gpu_1000step_pure_mup_mtp.sh) consume
+# them via cascading FORGE_* / bare-name / hardcoded-default
+# fallbacks, so direct script invocation (without the harness)
+# transparently falls back to these same 0.5B values.
+
+[model]
+# Identity (used by the runtime, e.g. for log prefixes; checkpoint
+# subdirectory derivation may extend this in the future).
+name = "minicpm4_0.5b"
+
+# Backbone architecture.
+num_layers = 24
+hidden_size = 1024
+ffn_hidden_size = 4096
+num_attention_heads = 16
+num_query_groups = 2
+# Attention head dimension. 0.5B happens to equal hidden_size //
+# num_attention_heads (1024/16=64), but it is an independent knob:
+# MiniCPM5-1B sets head_dim=128 while hidden_size//heads would be 96.
+# Declared explicitly so the [model] schema (strict key set) matches
+# the 1B template that must carry this same key.
+head_dim = 64
+seq_length = 4096
+max_position_embeddings = 4096
+padded_vocab_size = 73448
+rotary_base = 10000
+norm_epsilon = 1e-6
+
+# Initialization.
+init_method_std = 0.1
+
+# muP (Maximal Update Parameterization). Always on for MiniCPM models;
+# tuning these knobs is how the project does width-/depth-scale studies
+# without re-tuning a learning-rate schedule per size.
+mup_base_hidden_size = 256
+mup_emb_scale = 12.0
+mup_depth_scale = 1.4
+
+# MTP / Eagle (Multi-Token Prediction). Always on for MiniCPM models;
+# this invalidates any historical Megatron baseline captured without
+# MTP — see the C3/C4 commit messages for the explicit trade-off.
+mtp_num_layers = 1
+mtp_loss_weight = 0.3

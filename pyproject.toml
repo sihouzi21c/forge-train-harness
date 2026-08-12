@@ -1,0 +1,134 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "training-engine-harness"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1",
+    "pandas",
+    "pyarrow",
+    "sentencepiece",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+# `full` is the GPU-host extras bundle.  Gates load real data via
+# Megatron's standard ``GPTDataset`` against HuggingFace data
+# preprocessed into Megatron binary format (see
+# ``ref/reference/prepare_gsm8k_data.sh``); no internal-only
+# dataloader dependency.
+full = [
+    "transformer_engine",
+]
+# `pure_torch` is the GPU-host extras bundle for the alternative
+# pure-PyTorch + muP + MTP ref stack (``run_16gpu_1000step_pure_mup_mtp.sh``
+# + ``train_pure_mup_mtp.py``).  Selected via
+# ``config/ref/torch_minicpm4_0.5b.toml``; loads weighted shards through
+# ``modelbest_sdk.dataset.modelbest_dataloader.ModelbestDataloader``.
+# Independent of ``[full]`` because the two stacks are alternative L0
+# baselines, never running together.
+pure_torch = [
+    "modelbest_sdk",
+]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    # Linters wired via .pre-commit-config.yaml at the repo root. Kept
+    # opt-in under the [dev] extras so end-user installs of
+    # ``training-engine-harness`` are not weighed down by tooling
+    # dependencies. Contributors run ``pip install -e harness/[dev]``.
+    "codespell",
+    "yamllint",
+    "bandit",
+    "detect-secrets",
+    "validate-pyproject",
+    "pyyaml",  # consumed by scripts/lint/file_hygiene.py (check-yaml)
+]
+
+# NOTE: deliberately no [project.scripts] entry. A global
+# ``harness`` entrypoint (e.g. /usr/local/bin/harness from a
+# sibling worktree's ``pip install -e .``) silently shadows the
+# per-workspace harness package and burned ~60-70 min of agent
+# debugging twice in the bitwise-singlecard/bitwise-perf incident class. Every workspace
+# now ships its own ``<workspace>/bin/harness`` shim, generated
+# at provision time with the workspace's absolute path baked in;
+# the agent-loop.sh bootstrap and web ``_provision_workspace``
+# both prepend that directory to PATH so ``harness`` always
+# resolves to the workspace-local Python module.
+
+[tool.setuptools.packages.find]
+include = ["harness*", "evals*"]
+
+# ---------- Linter (ruff) ----------
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Vendored upstream Megatron reference — frozen snapshot, not our code.
+extend-exclude = ["ref/reference"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "UP",        # pyupgrade
+    "B",         # flake8-bugbear
+    "SIM",       # flake8-simplify
+    "TCH",       # flake8-type-checking
+    "RUF",       # ruff-specific
+]
+ignore = [
+    "E501",      # line length handled by formatter
+    "RUF002",    # ambiguous unicode in docstrings — intentional × / – / − in technical docs
+    "RUF003",    # ambiguous unicode in comments — same rationale as RUF002
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["harness", "evals", "workload"]
+
+[tool.ruff.lint.per-file-ignores]
+# These entry-point scripts adjust sys.path before importing repo-local modules.
+"tools/profile_step.py" = ["E402"]
+"tools/stage2_op_router.py" = ["E402"]
+# Test scaffolding intentionally uses class-level mutable defaults and nested
+# with/if blocks for table-driven readability; SIM noise drowns real findings.
+"harness/tests/*" = ["RUF012", "SIM102", "SIM117", "E741"]
+
+# ---------- Type checker (mypy) ----------
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_equality = true
+check_untyped_defs = true
+disallow_untyped_defs = false          # tighten later once stubs arrive
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["tomli", "torch", "torch.*", "huggingface_hub", "pandas"]
+ignore_missing_imports = true
+
+# Test suite is intentionally weakly typed — it uses positional-arg fixtures,
+# monkeypatch dicts, and dynamic attribute injection that mypy cannot follow
+# without a full stub layer. Silence the noisy categories so real findings in
+# production code stay visible.
+[[tool.mypy.overrides]]
+module = ["harness.tests.*"]
+disable_error_code = [
+    "import-not-found", "attr-defined", "union-attr", "index",
+    "name-defined", "arg-type", "unused-ignore", "assignment", "misc",
+    "var-annotated", "no-redef", "call-overload", "return-value",
+    "method-assign",
+]
+
+# ---------- Dependency DAG enforcement ----------
+#
+# Kept self-contained in harness/tests/test_layer_dag.py so local hooks do not depend
+# on an undeclared import-linter installation.

@@ -1,0 +1,28 @@
+# multistep.toml — bitwise-multicard 单一源(Qwen3 0.6B;DP=2 多步 bitwise;WS=2 / GBS=40)
+# GBS 统一钉死为 40(全 suite 一致,与 1B 相同):MBS 2 × WS 2 → grad_accum = 40/4 = 10,
+# 从 20 砍半,hash_capture_level=2 下每次尝试的 ref+ours 成本减半。GBS 由 launch 时
+# 冻结的 ref 产物单点供给(dispatcher 只从 ref 侧读 GBS),dev agent 不可改。
+[shared]
+world_size_override        = 2
+num_steps_override         = 8
+micro_batch_size_override  = 2
+global_batch_size_override = 40
+gate_window                = [1, 9]
+
+[shared.gate]
+gate_bitwise            = true
+gate_atol               = 0
+hash_capture_level      = 2
+mfu_e2e_target          = 0
+loss_abs_threshold      = 0
+grad_norm_abs_threshold = 0
+forge_init_ones         = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = true
+
+[ours]
+deterministic = true

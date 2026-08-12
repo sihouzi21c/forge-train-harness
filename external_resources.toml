@@ -1,0 +1,32 @@
+# External-resource manifest (SSOT for declared, content-addressed deps).
+#
+# Each [[entry]] block declares one external artifact the workspace
+# depends on (tokenizer model, checkpoint weights, reference source
+# tree). At provision time, harness.resources walks the declared
+# sources in order and symlinks the first verifying source to
+# <workspace>/<canonical_relpath>. harness.config_runtime resolvers
+# read from the canonical path only — no remote download, no remote
+# clone, no convention-based path guessing.
+#
+# Schema:
+#   kind = "file" | "git-checkout" | "tree"
+#   sha256 = "<hex>"  # OPTIONAL; "" / omitted = existence+kind check only
+#   canonical_relpath = ".resources/<type>/<name>/<basename>"
+#   sources = [...]  # ordered; first source that exists (and, if sha256
+#                    # is set, verifies) wins
+#
+# Source URI schemes (case-sensitive):
+#   file://<abs-path>           — local filesystem (default offline path)
+#   hf://<repo>#<filename>      — HuggingFace download (network; gated by
+#                                 FORGE_ALLOW_NETWORK_RESOURCES=1)
+#   git+ssh://<url>#<ref>       — remote git clone (network; same gate)
+#
+# sha256 is opt-in drift detection. Leave it out to author entries
+# offline for artifacts whose truth bytes live on a remote box: at
+# provision time on that box, the first existing source of the right
+# kind (file vs directory) is symlinked to <workspace>/<canonical_relpath>.
+# Add sha256 later (`sha256sum <file>` / `git -C <checkout> rev-parse HEAD`)
+# if you want a swapped/corrupt artifact to fail provision instead.
+
+[meta]
+version = 1

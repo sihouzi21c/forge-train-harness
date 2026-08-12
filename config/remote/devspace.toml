@@ -1,0 +1,68 @@
+# Remote execution: auto-provisioned per-loop `cctl` devspace on the
+# yingbo H100 cluster (英博 H100 集群) with the Ultra-FineWeb-baked image.
+#
+# Like `ssh` (transport is rsync + ssh), PLUS a full lifecycle managed
+# by harness/tools/lease.py:
+#   * claim   — on launch, `cctl devspace create` provisions a fresh
+#               EXCLUSIVE per-loop devspace from the spec below, so two
+#               loops launched in the same second never share a physical
+#               GPU. The wrapper resolves the new node's real Teleport
+#               name via `tsh ls`, synthesizes a reachable ~/.ssh/config
+#               stanza, and rewrites `hostname` to the derived `ds-<id>`
+#               before freezing the config dir.
+#   * rebind  — if the devspace drops mid-run, the dev agent re-creates it
+#               (`cctl devspace create`) and calls `lease rebind` so the
+#               EXIT-trap release stops the live machine, not the dead one.
+#   * release — on exit, `cctl devspace stop` the created devspace.
+#
+# For a static host you manage yourself (no create / stop), use
+# config/remote/ssh.toml instead.
+#
+# To use: cp config/remote/devspace.toml config/remote.toml
+# Then edit config/remote.toml to fill the spec fields below.
+#
+# Pre-conditions:
+#   1. `cctl` is on $PATH (override the binary via the CCTL_BIN env-var).
+#   2. `tsh` is logged in (`tsh status`); the lease discovers the created
+#      devspace's Teleport node via `tsh ls` (override via TSH_BIN).
+#   3. rsync 3.x on the remote non-interactive $PATH.
+#
+# Field semantics (each maps 1:1 to a `cctl devspace create` flag):
+#   * `project`       — cctl project name (--project).
+#   * `cluster`       — cluster name (--cluster). Verified: yingbo_train.
+#                       paratera_shandong / wuxi_train / sichuan_train are
+#                       alternatives but require a different pool.
+#   * `resource_pool` — resource pool with GPU quota (--resource-pool).
+#                       Pool↔cluster mapping (as of 2026-06):
+#                         - yingbo_train       → multimodal  (faxin has 0 GPU quota here)
+#                         - paratera_shandong  → faxin
+#   * `image`         — image ID / name / canonicalName (--image).
+#   * `gpu_count`     — GPUs the COMPUTE needs (--gpu), baked into the
+#                       long-lived EXCLUSIVE devspace and held for the
+#                       whole loop. (For per-suite ephemeral GPU jobs off a
+#                       0-GPU gateway instead, use config/remote/job.toml,
+#                       which is a peer `kind` — not a sub-mode here.)
+#   * `gpu_model`     — GPU model, e.g. h100 / a100 / 910b (--gpu-model).
+#   * `priority`      — HIGH | NORMAL (--priority).
+#   * `billing_account_id` — billing account for resource attribution
+#     (--billing-account-id). Required when the server enforces
+#     BILLING_ACCOUNT_REQUIRED. List via `cctl billing-account list`.
+#     Empty → flag omitted (fine for clusters that don't require it).
+#   * `workspace`     — parent directory on the remote that holds the
+#     harness checkout. Defaults to the remote $HOME when empty.
+#     `harness sync push` syncs into `<workspace>/.forge_train`.
+#   * `hostname`      — leave empty; the lease writes the derived
+#     `ds-<id>` here at launch. Do not set by hand.
+
+[remote]
+kind = "devspace"
+project = "loopharness"
+cluster = "paratera_shandong"
+resource_pool = "faxin"
+image = "infra/forge_train:0.9"
+gpu_count = 2
+gpu_model = "h100"
+priority = "NORMAL"
+billing_account_id = "N00007"
+workspace = ""
+hostname = ""

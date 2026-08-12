@@ -1,0 +1,28 @@
+# resume-gate-20.toml — M5 单一源(MiniCPM4-8B 满 32 层真实规模;两段 checkpoint resume 逐位)
+#
+# 8-GPU TP2×DP4(用户指定),满 32 层(层数对齐真实 8B 规模)。save@10 切
+# 两段:step 0..10 存 ckpt,load 后续跑 10..25,与一气呵成的 25 步轨迹在 window
+# [10,25] 内逐位等价 —— 验证 checkpoint save/load 在 DP×TP 下的确定性。
+# grad_accum = 32/(2·4) = 4。
+[shared]
+world_size_override           = 8
+tensor_parallel_size_override = 2
+num_layers_override           = 32
+num_steps_override            = 25
+micro_batch_size_override     = 2
+global_batch_size_override    = 32
+gate_window                   = [10, 25]
+resume_save_step              = 10
+
+[shared.gate]
+hash_capture_level = 1
+forge_init_ones    = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = true
+
+[ours]
+deterministic = true

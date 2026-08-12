@@ -1,0 +1,32 @@
+# Agent profile: Claude Code CLI at max reasoning effort (`--effort max`).
+#
+# To use: cp config/agent/claudecode-default-max.toml config/agent.toml
+#
+# Same Claude Code CLI as `claudecode-default.toml`, with `effort = "max"`
+# so the backend appends `--effort max` to the CLI invocation. That
+# selects the highest of the five reasoning-effort levels
+# (low / medium / high / xhigh / max), routing
+# `output_config={"effort":"max"}` into the API request body. Opus 4
+# defaults to `high` without this flag.
+#
+# `model` is left empty (Claude Code CLI's own default). Set a non-empty
+# slug only if the llm-center proxy routes it — see
+# `claudecode-default.toml` for the rationale.
+
+[agent]
+backend = "claude-code"
+model = ""
+effort = "max"
+runs_per_stage = 0
+poll_seconds = 5
+agent_round_tries = 8
+retry_base_sleep = 4
+retry_continue_prompt = "Transient agent CLI / network disconnect. Continue exactly where you left off; do not restart the whole iteration from scratch."
+state_dir = ".artifacts/agent-loop-state"
+max_consecutive_review_fails = 3
+# Per-command wall-clock cap (claude-code only). Every Bash command the
+# CLI runs is wrapped in `timeout <cmd_timeout>` via a fake-$SHELL shim
+# (web/agents/timeout_shell), group-killing runaway background poll-loops
+# that would otherwise keep `claude -p` alive past its turn result. Any
+# coreutils DURATION ("40m", "1h", "3600s"); empty disables the cap.
+cmd_timeout = "40m"

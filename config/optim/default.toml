@@ -1,0 +1,47 @@
+# Optimizer hyperparameters: project default profile.
+#
+# To use: cp config/optim/default.toml config/optim.toml
+#
+# This is the [optim] axis: it owns optimizer hyperparameters
+# (learning rate / schedule, AdamW betas, weight decay, gradient
+# clipping). Orthogonal to [model] (which owns architecture / muP /
+# MTP), [ref] (backend), [data] (corpus), [remote] (where), [agent]
+# (loop), and [eval] (gates).
+#
+# **Explicit opt-in only — no auto-template fallback.** The torch
+# reference (run_16gpu_1000step_pure_mup_mtp.sh) historically uses
+# LR=1e-2 (muP-rescaled against base_hidden=256) while the Megatron
+# references use LR=3.0e-4; loading the [optim] axis means accepting
+# that one of those baselines will shift to the value below. The
+# harness therefore loads config/optim.toml ONLY when that file
+# exists at the user's checkout — it does not silently fall back to
+# this committed default like the [model] axis does.
+#
+# Once opted in, the harness reads each value below and injects
+# FORGE_<UPPER_KEY> env vars into BOTH the L0 ref-script subprocess
+# and the ours-side engine subprocess. Per-suite overrides flow
+# through a sibling ``[evals.<name>.optim_overrides]`` table
+# (lowercase keys matching this schema, e.g. ``lr_warmup_iters = 0``
+# for the bitwise alignment gates). That override is applied on top
+# of the FORGE_* baseline at env-composition time, so both the ref
+# bash and the ours engine observe the same effective optim shape.
+
+[optim]
+# Learning rate (peak) and floor under WSD decay.
+lr = 3.0e-4
+min_lr = 0.0
+
+# Warmup / decay schedule. The 0.5B reference uses Megatron-style
+# WSD decay with no separate WSD anneal (lr_wsd_decay_iters = 0
+# means "stay at peak until lr_decay_iters, then drop to min_lr").
+lr_warmup_iters = 2000
+lr_decay_iters = 250000
+lr_wsd_decay_iters = 0
+
+# AdamW.
+weight_decay = 0.1
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+
+# Gradient clipping.
+clip_grad = 1.0

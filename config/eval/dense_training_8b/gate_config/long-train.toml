@@ -1,0 +1,44 @@
+# long-train.toml — M6 主门禁(MiniCPM4-8B 满 32 层真实规模;确定性 OFF;非逐位 loss 趋势)
+#
+# 8-GPU TP2×DP4,满 32 层,200 步长程。非逐位:确定性关闭,比 loss 的相对收敛
+# 趋势(ref vs ours,window 末段平均相对差 ≤ loss_rel_threshold)。verdict 仅
+# loss(吞吐由 review 侧审计,不在此文件设数值门)。
+# MBS=2(autotune 最优:mbs2=48.3%/54GB 比 mbs4=48.7%/74GB 省 20GB 几乎同速),
+# grad_accum = 32/(2·4) = 4。层数对齐真实 8B 规模。
+[shared]
+world_size_override           = 8
+tensor_parallel_size_override = 2
+num_layers_override           = 32
+num_steps_override            = 200
+micro_batch_size_override     = 2
+global_batch_size_override    = 32
+gate_window                   = [101, 201]
+
+[shared.gate]
+loss_rel_threshold = 0.025
+forge_init_ones    = 1
+# ── dev-visible MFU bar(可选)──────────────────────────────────────────
+# 设置后渲染进 dev 产物,dispatcher 对 verdict 生效(0/缺省 = loss-only,
+# 吞吐由 review 侧把关)。autotune(Megatron 8×H100 TP2/DP4/mbs2)实测 ~48.3%。
+# mfu_e2e_target   = 45.0
+# ── review-side 吞吐门槛 + 弹性策略(渲染器剥除,不进 dev 产物)────────
+# review bar 恒生效;弹性:最近 mfu_elastic_rounds 次 long-train 全部落在
+# [bar − mfu_elastic_tolerance, bar) 且极差 ≤ mfu_elastic_eps(稳定平台)
+# 也判 PASS。dev bar 设置时,同一套弹性参数同样作用于 dispatcher verdict。
+review_mfu_target     = 45.0
+mfu_elastic_tolerance = 2.0
+mfu_elastic_rounds    = 3
+mfu_elastic_eps       = 0.5
+mfu_full_every_smokes = 3     # 每累计 N 次 smoke 后由 harness 自动跑一次 200 步 long-train(证据节奏)
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = false                         # → --no-deterministic
+
+[ours]
+deterministic              = false            # → DETERMINISTIC=0
+micro_batch_size_override  = 2                # ref/ours 同 MBS=2(autotune 最优)
+cublas_workspace_config          = "@unset"   # 覆盖全局 [env] → 这侧不 export
+nvte_allow_nondeterministic_algo = "@unset"

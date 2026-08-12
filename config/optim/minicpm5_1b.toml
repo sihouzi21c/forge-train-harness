@@ -1,0 +1,39 @@
+# Optimizer hyperparameters: MiniCPM5 1B profile.
+#
+# To use: cp config/optim/minicpm5_1b.toml config/optim.toml
+#
+# This is the [optim] axis: it owns optimizer hyperparameters
+# (learning rate / schedule, AdamW betas, weight decay, gradient
+# clipping). Orthogonal to [model] (architecture / muP / MTP), [ref]
+# (backend), [data] (corpus), [remote] (where), [agent] (loop), and
+# [eval] (gates).
+#
+# **Explicit opt-in only — no auto-template fallback.** The harness
+# loads config/optim.toml ONLY when that file exists at the user's
+# checkout.
+#
+# Values are taken from an actual from-scratch stable pretrain run of a
+# MiniCPM5 0.9B model: the entry-command optimizer overrides for the
+# stable phase. They are NOT a stale in-script baseline, and NOT the
+# long-context anneal continuation (a different training stage with a
+# different schedule).
+
+[optim]
+# Learning rate (peak) and floor under WSD decay.
+lr = 5.22e-4
+min_lr = 5.22e-5
+
+# Warmup / decay schedule. lr_wsd_decay_iters = 0 means
+# the stable phase stays at peak until lr_decay_iters, with no separate
+# WSD anneal window (the anneal is done as a later continuation stage).
+lr_warmup_iters = 2000
+lr_decay_iters = 240000
+lr_wsd_decay_iters = 0
+
+# AdamW.
+weight_decay = 0.1
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+
+# Gradient clipping.
+clip_grad = 1.0

@@ -1,0 +1,29 @@
+# Agent profile: Codex CLI (uses Codex config/default model resolution).
+#
+# To use: cp config/agent/codex-default.toml config/agent.toml
+#
+# Model selection is left to Codex's own config and provider catalogue:
+# `model` is empty here. The codex backend does not expose Web-side model
+# selection; it resolves a routable provider model from ~/.codex/config.toml
+# when spawning the CLI.
+#
+# `effort` maps to Codex's `model_reasoning_effort` config override:
+# low / medium / high are passed through; xhigh / max are clamped to high
+# because the Codex CLI only accepts low / medium / high for this field.
+# Empty (the default here) omits the override and lets Codex use its own
+# configured/default reasoning effort.
+#
+# `max_mode` is cursor-cli-only and has no effect on codex; use `effort`
+# to raise the reasoning budget for this backend.
+
+[agent]
+backend = "codex"
+model = ""
+effort = ""
+runs_per_stage = 0
+poll_seconds = 5
+agent_round_tries = 8
+retry_base_sleep = 4
+retry_continue_prompt = "Transient agent CLI / network disconnect. Continue exactly where you left off; do not restart the whole iteration from scratch."
+state_dir = ".artifacts/agent-loop-state"
+max_consecutive_review_fails = 3

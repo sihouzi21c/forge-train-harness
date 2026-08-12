@@ -1,0 +1,59 @@
+# Model architecture + identity: MiniCPM4 8B.
+#
+# To use: cp config/model/minicpm4_8b.toml config/model.toml
+#
+# This is the [model] axis: it owns model architecture, identity,
+# initialization, and muP — orthogonal to [ref] (backend / source code),
+# [data] (training corpus), [remote] (where to run), [agent] (loop
+# tunables), and [eval] (gates / suites). Switching model size means
+# swapping this file only.
+#
+# The harness reads each value below and injects a corresponding
+# FORGE_<UPPER_KEY> env var into the L0 ref-script subprocess. Values are
+# the OFFICIAL openbmb/MiniCPM4-8B config (verified against the published
+# config.json + modeling_minicpm.py), with the harness 4096 training
+# window convention (seq_length = max_position_embeddings = 4096, plain
+# RoPE — the longrope rescaling is an inference-time long-context path and
+# is not exercised at the 4096 training window, matching the 0.5B ref).
+
+[model]
+# Identity (used by the runtime, e.g. for log prefixes).
+name = "minicpm4_8b"
+
+# Backbone architecture (official MiniCPM4-8B).
+num_layers = 32
+hidden_size = 4096
+ffn_hidden_size = 16384
+num_attention_heads = 32
+num_query_groups = 2
+# Attention head dimension. 8B has head_dim = hidden_size //
+# num_attention_heads (4096/32 = 128); declared explicitly because the
+# [model] schema is a strict key set shared with the other templates.
+head_dim = 128
+seq_length = 4096
+max_position_embeddings = 4096
+padded_vocab_size = 73448
+rotary_base = 10000
+norm_epsilon = 1e-6
+
+# Initialization.
+init_method_std = 0.1
+
+# muP (Maximal Update Parameterization). On for MiniCPM4-8B. These map
+# 1:1 to the official knobs: mup_base_hidden_size = dim_model_base (256),
+# so width_mult = hidden_size / dim_model_base = 4096/256 = 16;
+# mup_emb_scale = scale_emb (12), mup_depth_scale = scale_depth (1.4).
+# The muP formulas are identical to the 0.5B ref (emb*scale_emb; residual
+# + branch*(scale_depth/sqrt(num_layers)); logits = lm_head(hidden/
+# width_mult)). The config's `mup_denominator=32` is vestigial — the
+# official forward uses standard 1/sqrt(head_dim) attention and never
+# references it — so it is intentionally NOT carried here.
+mup_base_hidden_size = 256
+mup_emb_scale = 12.0
+mup_depth_scale = 1.4
+
+# MTP / Eagle (Multi-Token Prediction). DISABLED for 8B: the official
+# MiniCPM4-8B config has no eagle/nextn fields. mtp_num_layers = 0 turns
+# the Eagle head off entirely.
+mtp_num_layers = 0
+mtp_loss_weight = 0.0

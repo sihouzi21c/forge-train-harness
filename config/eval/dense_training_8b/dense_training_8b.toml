@@ -1,0 +1,293 @@
+# ============================================================================
+# dense_training_8b.toml — 套件注册表(MiniCPM4-8B muP DP×TP)
+#
+# 活跃 eval.toml 的源:`cp` 成 <loop>/config/eval.toml 使用。
+#
+# 职责切分(同 dense_training_qwen3,见 gate_config_layout.md):
+#   * 本文件 = 注册表:身份 + 分发路由 + 全局段;无 per-gate 可调参数。
+#   * 每个 gate 的 shape / 阈值 / init / determinism / override
+#     → gate_config/<gate>.toml(单一源),由 tools/render_gate_configs.py
+#     渲染成 ref/config/<gate>.toml + workload/src/config/<gate>.toml。
+#
+# 8B 与 0.5B / Qwen3 的差异只在 [model]/[ref] 轴(minicpm4_8b + torch_8b)
+# 与本套件枚举的 gate;采集 / 分发 / 拓扑机制完全复用现有通用 runner。
+# DP×TP 的 dptp gate 经通用 stage1-bitwise-trajectory:launch_dp 平铺
+# NUM_PROCS=world_size,TP 组在训练脚本内按渲染产物 tensor_parallel_size
+# 自建,dispatcher 无需 TP 专属改动。
+# ============================================================================
+
+
+# ── 套件标识 + gate_config 定位 ─────────────────────────────────────────────
+# new-looptask Decision A coupling SSOT — read by enumerating config/eval/*/
+# and loading each registry's [family]; no hardcoded family map in the skill.
+[family]
+label = "MiniCPM4 8B"
+model = "minicpm4_8b"
+ref   = "torch_minicpm4_8b"
+optim = "default"
+
+[suite]
+name            = "dense_training_8b"
+gate_config_dir = "gate_config"
+
+# ── seed 全局默认 ────────────────────────────────────────────────────────────
+[defaults]
+seed = 1234
+
+# ── torch.distributed rendezvous ───────────────────────────────────────────
+[runtime.distributed]
+master_addr = "localhost"
+master_port = "auto"
+
+# ── 全局 env 清单(传输分类器:在此 → 产物 [env];否则 → [cli]) ──────────────
+[env]
+PYTORCH_CUDA_ALLOC_CONF          = "expandable_segments:True"
+NVTE_ALLOW_NONDETERMINISTIC_ALGO = "0"
+NVTE_FUSED_ATTN                  = "1"
+CUBLAS_WORKSPACE_CONFIG          = ":4096:8"
+CUDA_DEVICE_MAX_CONNECTIONS      = "1"
+TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"
+
+
+# ── 套件身份 ─────────────────────────────────────────────────────────────────
+[workload]
+id = "minicpm4_8b_training_engine_dptp"
+display_name = "MiniCPM4 8B Training Engine (muP DP×TP)"
+description = "MiniCPM4-8B muP (no MTP) reference covering stage1 DP×TP bitwise alignment: the 4-GPU dptp gate runs a 4-layer proxy under data_parallel(2)×tensor_parallel(2) and bitwise-compares fwd + bwd + loss + grad against the ref trajectory on the real Ultra-FineWeb dataloader."
+requires_cuda = true
+
+# ── 共享 ref 采集线缆(bridge.sh 按 FORGE_BACKEND 分流;torch 直透 launcher) ──
+[ref]
+ref_capture_script = "ref/bridges/bridge.sh"
+ref_capture_basename = "ref_capture.pt"
+candidate_capture_basename = "candidate_capture.pt"
+
+
+# ##########################################################################
+#                    本地边界套件(off-GPU,GPU 工作前先跑)
+# ##########################################################################
+
+[local_suites.guard]
+stage = "local"
+runner_kind = "guard"
+description = "Run the local framework boundary guard"
+local = true
+requires_cuda = false
+args_min = 0
+args_max = 0
+
+[local_suites.unit]
+stage = "local"
+runner_kind = "unit"
+description = "Run local CPU unit tests"
+local = true
+requires_cuda = false
+args_min = 0
+args_max = 0
+
+[local_suites.anti-proxy]
+stage = "local"
+runner_kind = "anti-proxy"
+description = "Lint candidate engine for proxy / synthesis patterns"
+local = true
+requires_cuda = false
+args_min = 0
+args_max = 0
+
+
+# ##########################################################################
+#                         STAGE 1 训练 gate
+# ##########################################################################
+#
+# 每个 [evals.<gate>] 只保留分发路由元数据;shape / 阈值 / init /
+# determinism / optim override 在对应 gate_config/<gate>.toml,渲染下发。
+
+# alignment.forward:单步 DP=1 张量采集对齐(forward 子集,4 层 proxy)
+[evals.forward-align]
+stage = "stage1"
+runner_kind = "forward-align"
+milestone = "alignment.forward"
+script = "evals/scripts/eval_capture_align.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 600
+# 薄 dispatcher 路由:通用三步执行器(ref/run_gate.sh → run_ours.sh → verdict)。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "align"
+
+# alignment.backward:同 alignment.forward 采集,取 grad 子集
+[evals.backward-align]
+stage = "stage1"
+runner_kind = "backward-align"
+milestone = "alignment.backward"
+script = "evals/scripts/eval_capture_align.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 600
+# 薄 dispatcher 路由:同 forward-align,verdict 按 milestone 值选比较子集。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "align"
+
+# bitwise-singlecard:单卡多步 bitwise(DP=1,4 层 proxy)—— dptp 的单卡前置
+[evals.multistep-1gpu]
+stage = "stage1"
+runner_kind = "stage1-bitwise-trajectory"
+milestone = "bitwise-singlecard"
+script = "evals/scripts/eval_train_steps.py"
+launcher = "evals/scripts/launch_dp.py"
+use_real_dataloader = true
+timeout_s = 600
+# 薄 dispatcher 路由:通用三步执行器。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "bitwise"
+
+# bitwise-dptp:4-GPU DP(2)×TP(2) 多步逐位门禁(fwd+bwd+loss+grad,4 层 proxy)
+[evals.dptp]
+stage = "stage1"
+runner_kind = "stage1-bitwise-trajectory"
+milestone = "bitwise-dptp"
+script = "evals/scripts/eval_train_steps.py"
+launcher = "evals/scripts/launch_dp.py"
+use_real_dataloader = true
+timeout_s = 900
+# ref 侧独立 wall-clock 上限。8B(4 层 proxy)Level-2 采集 + 4-GPU rendezvous
+# 比 0.5B 慢,1200s 留余量。
+ref_timeout_s = 1200
+# 薄 dispatcher 路由:同 multistep-1gpu。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "bitwise"
+
+# bitwise-perf:4-GPU DP(2)×TP(2) 逐位 + MFU,**16 层真实规模**(非 4 层 proxy —— MFU 需真实算力占用)
+[evals.perf-bitwise]
+stage = "stage1"
+runner_kind = "stage1-bitwise-trajectory"
+milestone = "bitwise-perf"
+script = "evals/scripts/eval_train_steps.py"
+launcher = "evals/scripts/launch_dp.py"
+use_real_dataloader = true
+timeout_s = 1800
+# ref 侧独立上限。8B 16 层 25 步逐位采集比 4 层 proxy 慢一个量级,2400s 留余量。
+ref_timeout_s = 2400
+# 薄 dispatcher 路由:同 multistep-1gpu。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "bitwise"
+
+# resume:4-GPU DP(2)×TP(2) 两段 checkpoint resume 逐位,**16 层真实规模**
+[evals.resume-gate-20]
+stage = "stage1"
+runner_kind = "resume-gate"
+milestone = "resume"
+script = "evals/scripts/eval_resume_train.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 3600
+# 薄 dispatcher 路由:ours-only——[LOSS_REF]/[LOSS_RES] 两条轨迹由
+# eval_resume_train.py 单进程产出,无 ref 子进程;形状仍读渲染后的 ref 产物。
+needs_ref = false
+ours_runner = "run_ours"
+verdict = "resume"
+
+# resume-startup-90 — 续训启动时间门禁 (resume milestone, ours-only)
+# 从 step 90 续训:dataloader seek(build → advance 到断点流位 → 取首个 micro-batch)
+# 必须在 resume_startup_budget_s 内完成。replay-by-discard 续训按 O(consumed) 重放
+# 前面所有 step 的数据(GPU 空转),必挂;O(1) cursor-restore seek 通过。shape 同本
+# variant 的 resume-gate-20;budget 按各 variant 形状定(1B 实测 ~0.021s/microbatch +
+# ~3.6s buffer,其余按此 slope 估算,待实测细调)。
+# 形状(world_size / tensor_parallel_size / micro_batch_size / seq_length /
+# grad_accum_steps / resume_save_step / resume_post_steps)全部来自渲染后的 ours
+# 产物(gate_config/resume-startup-90.toml → workload/src/config/),runner 经
+# --config 读;dispatcher 只从产物取 world_size + save_step·grad_accum 算 consumed。
+[evals.resume-startup-90]
+stage = "stage1"
+runner_kind = "resume-startup"
+milestone = "resume"
+script = "evals/scripts/eval_resume_startup.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 600
+resume_startup_budget_s = 8.0    # ours-only 判定阈值(不进产物);估算 DP4→consumed@90=360,replay≈11s;0 = 关闭
+# 薄 dispatcher 路由:ours-only,无 ref 轨迹。
+needs_ref = false
+ours_runner = "run_ours"
+verdict = "resume_startup"
+
+# long-horizon 主门禁:长程优化(loss_rel + MFU),**16 层真实规模**,确定性 OFF
+[evals.long-train]
+stage = "stage1"
+runner_kind = "long-train"
+milestone = "long-horizon"
+script = "evals/scripts/eval_long_train.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 7200
+# 薄 dispatcher 路由:通用三步执行器。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "long_train"
+
+# long-horizon-smoke:同 long-train 形状,20 步快速反馈(非 commit gate)
+[evals.long-train-smoke]
+stage = "stage1"
+runner_kind = "long-train"
+milestone = "long-horizon-smoke"
+script = "evals/scripts/eval_long_train.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 1200
+# 薄 dispatcher 路由:同 long-train。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "long_train"
+
+# long-horizon 辅助:loss-only 长程检查(无 MFU 门,非 commit gate)
+[evals.loss-gate-200]
+stage = "stage1"
+runner_kind = "loss-gate"
+milestone = "long-horizon"
+script = "evals/scripts/eval_long_train.py"
+launcher = "evals/scripts/launch_dp.py"
+timeout_s = 7200
+# 薄 dispatcher 路由:loss-only 长程检查。
+needs_ref = true
+ours_runner = "run_ours"
+verdict = "loss_gate"
+
+# production:ours-only 生产长训(DP×TP,10k 步),**16 层真实规模**。无 ref 对比。
+[evals.production-train]
+stage = "stage1"
+runner_kind = "production-train"
+milestone = "production"
+script = "evals/scripts/eval_production_train.py"
+launcher = "evals/scripts/launch_dp.py"
+# 每段(2500 步)wall-clock 上限 24h;超时段被 kill,下次从最后 checkpoint 续。
+timeout_s = 86400
+# 薄 dispatcher 路由:ours-only 分段续训(run_ours_production.sh 段循环 +
+# production_ckpt.py 续点发现),verdict 只验 checkpoint 完整性。
+needs_ref = false
+ours_runner = "run_ours_production"
+verdict = "production"
+
+
+# ##########################################################################
+#       STAGE 1 里程碑进度序列(进度引擎排序唯一源)
+# ##########################################################################
+[stage1]
+milestone_order = [
+    "alignment",
+    "bitwise-singlecard",
+    "bitwise-dptp",
+    "bitwise-perf",
+    "resume",
+    "long-horizon",
+    "production",
+]
+
+
+# ##########################################################################
+#       STAGE 2 算子门禁(本套件暂不收编 —— 空表占位,继承运行时默认)
+# ##########################################################################
+
+[stage2]
+
+[automation.stage2]
+max_concurrent = 6
+max_op_long_failures = 3

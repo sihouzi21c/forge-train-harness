@@ -1,0 +1,36 @@
+# Optimizer hyperparameters: Qwen3 0.6B profile.
+#
+# To use: cp config/optim/qwen3_0.6b.toml config/optim.toml
+#
+# This is the [optim] axis: optimizer hyperparameters (learning rate /
+# schedule, AdamW betas, weight decay, gradient clipping). Orthogonal to
+# [model] (architecture), [ref] (backend), [data] (corpus), [remote]
+# (where), [agent] (loop), and [eval] (gates).
+#
+# **Explicit opt-in only — no auto-template fallback.** The harness loads
+# config/optim.toml ONLY when that file exists at the user's checkout.
+#
+# Qwen3 is standard-parameterized (NOT muP), so the LR is a plain global
+# AdamW LR (the torch ref applies one lr group to every parameter), not a
+# muP-rescaled value. 3e-4 peak with a 2k linear warmup and a long cosine
+# decay is a stable, conservative dense-pretrain schedule for the 0.6B
+# geometry; tune lr / lr_decay_iters per token budget.
+
+[optim]
+# Learning rate (peak) and floor.
+lr = 3.0e-4
+min_lr = 3.0e-5
+
+# Warmup / decay schedule. lr_wsd_decay_iters = 0 means a plain
+# warmup→decay cosine (no separate WSD anneal window).
+lr_warmup_iters = 2000
+lr_decay_iters = 150000
+lr_wsd_decay_iters = 0
+
+# AdamW.
+weight_decay = 0.1
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+
+# Gradient clipping.
+clip_grad = 1.0

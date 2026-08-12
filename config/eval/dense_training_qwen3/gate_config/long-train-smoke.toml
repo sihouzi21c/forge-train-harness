@@ -1,0 +1,27 @@
+# long-train-smoke.toml — long-horizon-smoke(Qwen3 0.6B;同 long-train,20 步 / window [5,20) / warmup=5)
+# 注:ours MBS=10(非 long-train 的 4)——忠实搬运 flat 源 [evals.long-train-smoke.ours_env]
+# MICRO_BATCH_SIZE_OVERRIDE="10"。该值与 long-horizon 主门禁 ours MBS=4 不一致,疑似 flat 旧表
+# 历史复制残留;迁移阶段原样保留,不在此静默改正。
+[shared]
+world_size_override        = 2
+num_steps_override         = 20
+micro_batch_size_override  = 2
+global_batch_size_override = 80
+gate_window                = [5, 20]
+
+[shared.gate]
+loss_rel_threshold = 0.025
+warmup_steps       = 5
+forge_init_ones    = 1
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = false
+
+[ours]
+deterministic              = false
+micro_batch_size_override  = 10               # flat 源原值,见文件头注
+cublas_workspace_config          = "@unset"
+nvte_allow_nondeterministic_algo = "@unset"

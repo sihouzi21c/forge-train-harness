@@ -1,0 +1,29 @@
+# long-train-smoke.toml — M6-smoke(MiniCPM4-8B 满 32 层真实规模;同 long-train 形状,20 步快速反馈)
+#
+# 与 long-train 同 8-GPU TP2×DP4 / 满 32 层 / MBS=2,只跑 20 步、window
+# [5,20)、warmup=5,供迭代期快速反馈(非 commit gate)。
+[shared]
+world_size_override           = 8
+tensor_parallel_size_override = 2
+num_layers_override           = 32
+num_steps_override            = 20
+micro_batch_size_override     = 2
+global_batch_size_override    = 32
+gate_window                   = [5, 20]
+
+[shared.gate]
+loss_rel_threshold = 0.025
+warmup_steps       = 5
+forge_init_ones    = 1
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = false
+
+[ours]
+deterministic              = false
+micro_batch_size_override  = 2
+cublas_workspace_config          = "@unset"
+nvte_allow_nondeterministic_algo = "@unset"

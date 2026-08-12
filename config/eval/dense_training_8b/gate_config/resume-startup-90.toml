@@ -1,0 +1,24 @@
+# resume-startup-90.toml — 续训启动时间门禁单一源 (resume milestone, ours-only)
+# MiniCPM4-8B 满 32 层,8-GPU TP2×DP4。从 step 90 续训:dataloader 必须 O(1)
+# cursor-restore seek。形状同本 variant 的 resume-gate-20(GBS32 / MBS2 / DP4 /
+# grad_accum4)。判定阈值 resume_startup_budget_s 不在此文件 —— 按设计 §5 放注册表
+# [evals.resume-startup-90](冻结 eval.toml)。
+[shared]
+world_size_override           = 8
+tensor_parallel_size_override = 2
+num_layers_override           = 32
+num_steps_override            = 100
+micro_batch_size_override     = 2
+global_batch_size_override    = 32
+resume_save_step              = 90
+resume_post_steps             = 10
+
+[shared.gate]
+hash_capture_level = 0
+forge_init_ones    = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ours]
+deterministic = true

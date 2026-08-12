@@ -1,0 +1,39 @@
+# dptp.toml — MiniCPM4-8B DP×TP bitwise 门禁单一源
+#
+# 4-GPU 拓扑:world_size=4 = data_parallel(2) × tensor_parallel(2)
+# (Megatron 排布,TP 在内:global_rank = dp_rank*tp_size + tp_rank)。
+# 渲染器据 tensor_parallel_size 派生 dp_size = world_size//tp_size = 2,
+# grad_accum = GBS/(MBS·DP) = 16/(2·2) = 4;通用投影把 tensor_parallel_size
+# 以 TENSOR_PARALLEL_SIZE 导出(ref launcher 直接消费),ours 引擎从自身
+# 渲染产物读 tensor_parallel_size 自建 TP 组(launch_dp 平铺 NUM_PROCS=4)。
+#
+# 代理:num_layers_override=4 把官方 32 层压成 4 层快采 proxy(ref 与 ours
+# 同读产物 num_layers=4,逐位可比不受影响)。hash level 2 = fwd/bwd 模块
+# + grad pre/post-allreduce + loss pre/post-allreduce;harness_dptp.finalize
+# 把各 TP 分片 all_gather 合并成单一 dump 供 comparator 读。
+[shared]
+world_size_override           = 4
+tensor_parallel_size_override = 2
+num_steps_override            = 8
+micro_batch_size_override     = 2
+global_batch_size_override    = 16
+num_layers_override           = 4
+gate_window                   = [1, 9]
+
+[shared.gate]
+gate_bitwise            = true
+gate_atol               = 0
+hash_capture_level      = 2
+mfu_e2e_target          = 0
+loss_abs_threshold      = 0
+grad_norm_abs_threshold = 0
+forge_init_ones         = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = true
+
+[ours]
+deterministic = true

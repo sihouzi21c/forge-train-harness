@@ -1,0 +1,39 @@
+# Agent profile: Claude Code CLI pinned to the Kimi K3 model.
+#
+# To use: cp config/agent/claudecode-kimi.toml config/agent.toml
+#
+# Like `claudecode-fable.toml`, this profile pins an explicit model and
+# relies on the CLI's own logged-in auth — no base_url / api_key override
+# here. It uses the routed model NAME `kimi-k3` (not an opaque id like
+# `KIMI_55771a`) so the slug stays human-readable and survives id
+# rotation. The claude-code backend forwards `--model kimi-k3[1m]` to the
+# CLI because the slug is non-empty (see
+# web/agents/backends.py::_build_claude_command). The CLI parses the
+# `[1m]` suffix client-side: it sets the local context window to
+# 1,000,000 tokens (this is what drives compaction) and forwards the bare
+# `kimi-k3` upstream. Only use a slug the routing layer actually serves —
+# an unrouted slug yields a 500 "模型不存在" error (verified: `kimi-k3`
+# routes; the upstream answered with its own quota 429, not a routing
+# 500). Drop `[1m]` to run at the 200K window.
+#
+# `effort` is left empty: Kimi tolerates the Claude effort beta header
+# (request still 200s) but does not act on it, so pinning a level is a
+# no-op.
+
+[agent]
+backend = "claude-code"
+model = "kimi-k3[1m]"
+effort = ""
+runs_per_stage = 0
+poll_seconds = 5
+agent_round_tries = 8
+retry_base_sleep = 4
+retry_continue_prompt = "Transient agent CLI / network disconnect. Continue exactly where you left off; do not restart the whole iteration from scratch."
+state_dir = ".artifacts/agent-loop-state"
+max_consecutive_review_fails = 3
+# Per-command wall-clock cap (claude-code only). Every Bash command the
+# CLI runs is wrapped in `timeout <cmd_timeout>` via a fake-$SHELL shim
+# (web/agents/timeout_shell), group-killing runaway background poll-loops
+# that would otherwise keep `claude -p` alive past its turn result. Any
+# coreutils DURATION ("40m", "1h", "3600s"); empty disables the cap.
+cmd_timeout = "40m"

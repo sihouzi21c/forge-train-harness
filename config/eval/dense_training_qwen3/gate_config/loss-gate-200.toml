@@ -1,0 +1,23 @@
+# loss-gate-200.toml — long-horizon 辅助(Qwen3 0.6B;loss-only,无 MFU 门;ref MBS=2 / ours MBS=10)
+[shared]
+world_size_override        = 2
+num_steps_override         = 200
+micro_batch_size_override  = 2
+global_batch_size_override = 80
+gate_window                = [101, 201]
+
+[shared.gate]
+max_avg_relative_loss_diff = 0.025
+forge_init_ones            = 1
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = false
+
+[ours]
+deterministic              = false
+micro_batch_size_override  = 10
+cublas_workspace_config          = "@unset"
+nvte_allow_nondeterministic_algo = "@unset"

@@ -1,0 +1,61 @@
+# Data source: Ultra-FineWeb (openbmb/Ultra-FineWeb) streaming HF loader.
+#
+# Real-pretraining target: weighted two-source en+zh, tokenized on the fly
+# through the generic streaming dataloader (hf_stream_dataloader).
+#
+# To use: cp config/data/ultra_fineweb.toml config/data.toml
+#
+# On first launch the harness checks for each ``download_files`` entry under
+# ``forge_data_dir``; missing files are pulled via ``hf_hub_download`` and
+# copied into the listed local path. Files baked into the image already
+# satisfy the check and are not re-downloaded.
+#
+# ``forge_data_dir`` is WORKSPACE-RELATIVE: a relative value resolves
+# against the harness repo root (see config_runtime.resolve_forge_data_dir),
+# so the prefetch writer, the dataloader (via FORGE_DATA_DIR) and the production
+# prefetch sentinel all land under the per-loop workspace tree — which
+# ``harness sync push`` already excludes from rsync, and where production's
+# checkpoints also live (<repo>/.artifacts/checkpoints/). Point it at an
+# absolute scratch mount (e.g. /opt/forge-data/ultra_fineweb) to share a
+# pre-staged mirror across loops instead.
+
+[data]
+conf_path = "ref/reference/ultra_fineweb_data_conf.sh"
+# Dataloader kind (was DATA_LOADER in the data_conf). This axis is the SOLE
+# source: every side reads it from here via FORGE_DATA_TOML (ref/sisters
+# --data-config, ours runtime_config.data_loader()); build_dataloader dispatches
+# on it. Never rendered into the gate product, never a DATA_LOADER env value.
+data_loader = "hf"
+dataset = "openbmb/Ultra-FineWeb"
+forge_data_dir = ".artifacts/forge-data/ultra_fineweb"
+# Image bake location of the dev slice. When set, the pre-production gates seed
+# the (workspace-relative) forge_data_dir by COPYING the download_files
+# parts from here instead of re-downloading from the HF mirror (which
+# stalls behind shandong's whitelist proxy). Copying — not symlinking —
+# keeps forge_data_dir a real writable tree the production prefetch can extend
+# without writing through into this shared baked dir. Leave empty on
+# hosts with no bake (the gates then fall back to hf_hub_download).
+baked_data_dir = "/opt/forge-data/ultra_fineweb"
+
+# production background corpus prefetch (tools/prefetch_data.py). The REAL amount of
+# data staged is this knob: agent-loop.sh launches the prefetch in the
+# background after config freeze, and the production-train runner blocks
+# on the `.prefetch_done` sentinel under forge_data_dir before its first
+# segment. 0 / absent = off (only the baked download_files slice below).
+#   prefetch_target_gb     GB of en+zh parquet to stage (the size param)
+#   prefetch_en_fraction   English share of the staged mix (default 0.9)
+#   prefetch_wait_timeout_s production's max wait on the sentinel (default 6h)
+# 10 GB is the initial validation pull; raise to ~100 for the full
+# production corpus (10k steps × GBS=1280 × 4096 ≈ 52B tokens).
+prefetch_target_gb = 10
+prefetch_en_fraction = 0.9
+
+# Map of <local relative path under forge_data_dir> = <path inside the HF
+# repo>. The local layout matches what the Dockerfile bakes and what the
+# data_conf.sh glob (``en/*.parquet`` / ``zh/*.parquet``) expects, so the
+# baked-image path and the on-demand-download path resolve to the same
+# files. Add more parts here to pull a larger slice; point ``forge_data_dir``
+# at a pre-staged mirror to skip downloading entirely.
+[data.download_files]
+"en/ultrafineweb-en-part-0001-of-2048.parquet" = "data/ultrafineweb_en/ultrafineweb-en-part-0001-of-2048.parquet"
+"zh/ultrafineweb-zh-part-001-of-256.parquet" = "data/ultrafineweb_zh/ultrafineweb-zh-part-001-of-256.parquet"

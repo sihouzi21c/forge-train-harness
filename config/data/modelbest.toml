@@ -1,0 +1,7 @@
+# Data source: modelbest fineweb weighted-shard (production).
+#
+# To use: cp config/data/modelbest.toml config/data.toml
+
+[data]
+conf_path = "ref/reference/minicpm4_0.5.stable.sh"
+data_loader = "modelbest"

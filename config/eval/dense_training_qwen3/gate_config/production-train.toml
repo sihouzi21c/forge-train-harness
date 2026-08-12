@@ -1,0 +1,16 @@
+# production-train.toml — production(Qwen3 0.6B;ours-only,不起 ref)
+# GBS=1280 / MBS=10 是 0.6B 生产全局批(与 0.5B 同档),非 bitwise
+# 套件的下采样 GBS=80;grad_accum = 1280/(10·2) = 64。
+[shared]
+world_size_override        = 2
+num_steps_override         = 10000
+micro_batch_size_override  = 10
+global_batch_size_override = 1280
+seed_override              = 1234     # = 全局默认,ours-only 显式留存
+seq_length_override        = 4096     # 覆盖 model.toml 基线(若不同)
+
+[shared.gate]
+forge_init_ones = 1
+
+[ours]
+# ours-only:无 [ref] 段;deterministic 用默认(ON),如需关再显式声明

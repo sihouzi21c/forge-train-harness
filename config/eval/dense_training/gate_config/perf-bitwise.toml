@@ -1,0 +1,28 @@
+# perf-bitwise.toml — bitwise-perf 单一源(bitwise + MFU≥9%)
+[shared]
+world_size_override        = 2
+num_steps_override         = 50
+micro_batch_size_override  = 4
+global_batch_size_override = 80
+gate_window                = [21, 51]
+
+[shared.gate]
+gate_bitwise            = true
+gate_atol               = 0
+hash_capture_level      = 1
+# 9.0 = ~90% of recorded REF MFU 9.99% (loop 71d34b5ef03c, 2026-07-09);
+# parity gate — deep MFU work belongs to long-horizon.
+mfu_e2e_target          = 9.0
+warmup_steps            = 20
+loss_abs_threshold      = 0
+grad_norm_abs_threshold = 0
+forge_init_ones         = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = true
+
+[ours]
+deterministic = true

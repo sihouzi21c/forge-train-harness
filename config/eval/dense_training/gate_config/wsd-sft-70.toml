@@ -1,0 +1,65 @@
+# wsd-sft-70.toml — WSD-SFT 三段切换正确性门禁 (resume 里程碑)
+#
+# ours 引擎跑 stable→decay→sft 三段(全程**不崩**,两遍:主跑 + clean 基准),
+# 逐相位逐 step loss bitwise 自比较 + [PHASE] 结构断言。证明:
+#   ① 三段驱动线 run-to-run 确定(两遍独立跑,逐 step bitwise 相等);
+#   ② 两个切换点**确实发生**且形状正确 —— decay 满恢复(start_step 续接、
+#      语料换、optim 保留)、sft weights-only(step 归 0、新 optim、语料再换、
+#      lr 落到新峰值)。
+# 规模 20/20/20 步、2 卡、分钟级,验的是切换形状(schedule/optim/step/corpus
+# handoff),不是收敛。
+#
+# comparison_basis="self":本线 pure-torch L0 ref 尚无三段 wrapper(ref 侧无
+# --resume-from/--init-weights 原语),vs-ref bitwise 不可用;基准 = 第二遍
+# 不崩的 ours(train_ours_al.sh)。[PHASE] 结构断言是防"退化成全程 stable
+# 也能 self-comp"的假过的那道闸。
+#
+# 崩溃续训(SIGKILL+resume bitwise)在 production 里程碑的 production-resume-70
+# 验(同 runner,加 crash_steps);本门禁不崩。
+#
+# 相位表用扁平 per-phase 键(stable_*/decay_*/sft_*)放 [shared],经渲染器落到
+# 产物 [cli](扁平 scalar overlay,渲染器零改动),verdict 模块 evals/verdicts/
+# wsd_sft.py 从 ours 产物读取。LR 数值 = config/train/wsdsft_05b_prod.toml 的相位表(生产配方
+# SSOT);改一处须同步另一处。
+
+[shared]
+world_size_override        = 2
+micro_batch_size_override  = 2
+global_batch_size_override = 32       # GBS32 / MBS2 / DP2 → grad_accum 8
+seq_length                 = 4096
+
+# 三段相位表(扁平键 → 产物 [cli];LR 与生产 SSOT toml 逐项一致)。
+stable_steps   = 20
+stable_lr      = 1e-2
+stable_min_lr  = 0
+stable_warmup  = 2
+
+decay_steps    = 20
+decay_lr       = 1e-2
+decay_min_lr   = 5e-4
+decay_warmup   = 0        # 生产一致:续训不再 warmup
+
+sft_steps      = 20
+sft_lr         = 5e-4
+sft_min_lr     = 1e-6
+sft_warmup     = 3
+sft_wsd        = 17       # SFT_ITERS - SFT_WARMUP
+# decay wsd_decay 恒 = decay_steps、lr_decay_iters 恒 = stable+decay(绝对目标),
+# sft lr_decay_iters 恒 = sft_steps —— 均由 driver 按公式派生,不在此列。
+
+# 两遍引擎路径一致:即便本门禁不崩,也开 save_interval(写版本化 ckpt 不改
+# loss),与 production-resume-70 的引擎路径逐位一致。
+save_interval  = 10
+
+[shared.gate]
+# ours 必须同 init 才能两遍逐 step 对齐。
+forge_init_ones    = 1
+hash_capture_level = 0
+# 自比较基准:第二遍不崩的 ours(本线无三段 ref wrapper,见头注)。
+comparison_basis   = "self"
+# 逐 step loss **bitwise 相等**门禁:wsd_sft verdict 判决 = 每相位每 step
+# abs(baseline_loss - ours_loss) <= gate_atol;gate_atol=0 → 只有 max==0 才过。
+gate_atol          = 0
+
+[ours]
+deterministic = true

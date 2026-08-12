@@ -1,0 +1,14 @@
+# production-train.toml — production(ours-only,不起 ref)
+[shared]
+world_size_override        = 2
+num_steps_override         = 10000
+micro_batch_size_override  = 4
+global_batch_size_override = 1024
+seed_override              = 1234     # = 全局默认,ours-only 显式留存
+seq_length_override        = 4096     # 覆盖 model.toml 基线(若不同)
+
+[shared.gate]
+forge_init_ones = 1
+
+[ours]
+# ours-only:无 [ref] 段;deterministic 用默认(ON),如需关再显式声明

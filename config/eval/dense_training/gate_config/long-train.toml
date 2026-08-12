@@ -1,0 +1,36 @@
+# long-train.toml — long-horizon 主门禁(确定性 OFF;ours MBS=10 + @unset 抹确定性 env 栈)
+[shared]
+world_size_override        = 2
+num_steps_override         = 200
+micro_batch_size_override  = 4
+global_batch_size_override = 80
+gate_window                = [101, 201]
+
+[shared.gate]
+loss_rel_threshold = 0.025
+forge_init_ones    = 1
+# ── dev-visible MFU bar(可选)──────────────────────────────────────────
+# 设置后渲染进 dev 产物,dispatcher 对 verdict 生效(0/缺省 = loss-only,
+# 吞吐由 review 侧把关)。
+# mfu_e2e_target   = 40.0
+# ── review-side 吞吐门槛 + 弹性策略(渲染器剥除,不进 dev 产物)────────
+# review bar 恒生效;弹性:最近 mfu_elastic_rounds 次 long-train 全部落在
+# [bar − mfu_elastic_tolerance, bar) 且极差 ≤ mfu_elastic_eps(稳定平台)
+# 也判 PASS。dev bar 设置时,同一套弹性参数同样作用于 dispatcher verdict。
+review_mfu_target     = 40.0
+mfu_elastic_tolerance = 2.0
+mfu_elastic_rounds    = 3
+mfu_elastic_eps       = 0.5
+mfu_full_every_smokes = 3     # 每累计 N 次 smoke 后由 harness 自动跑一次 200 步 long-train(证据节奏)
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = false                         # → --no-deterministic
+
+[ours]
+deterministic              = false            # → DETERMINISTIC=0
+micro_batch_size_override  = 10               # 覆盖 [shared] 的 4(ours 侧)
+cublas_workspace_config          = "@unset"   # 覆盖全局 [env] → 这侧不 export
+nvte_allow_nondeterministic_algo = "@unset"

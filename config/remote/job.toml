@@ -1,0 +1,75 @@
+# Remote execution: per-loop GPU work as ephemeral `cctl` pytorchjobs,
+# off an auto-provisioned 0-GPU `cctl` devspace "gateway".
+#
+# This is a peer kind to `devspace` (held GPU box) and `ssh` (static
+# host). At launch harness/tools/lease.py `cctl devspace create`s a
+# per-loop devspace claimed with **0 GPUs** — a filesystem gateway only:
+# the rsync target, the host you ssh into to read artifacts in place, and
+# the shared-volume owner. Each GPU suite then runs as a short-lived
+# `cctl pytorchjob` (tools/gpu_job.py) of `nodes` pods (default 1 — the
+# single-pod behaviour of the retired `cctl job`/BATCH path) that each
+# request `gpu_count` GPUs, execute on the same shared user filesystem
+# where `sync push` landed the code, and free the GPUs the moment they
+# finish. Multi-node pods get the platform-injected RANK / WORLD_SIZE
+# (=nodes) / MASTER_ADDR / MASTER_PORT / GPUS_PER_NODE rendezvous env.
+# This lifts cluster GPU utilisation (GPUs are returned between gates)
+# at the cost of a per-suite job-scheduling latency.
+#
+# vs `devspace`: same lifecycle (claim / rebind / release) and the same
+# cctl spec below, but the box holds 0 GPUs and the compute is ephemeral
+# jobs rather than the box itself.
+#
+# To use: cp config/remote/job.toml config/remote.toml
+# Then edit config/remote.toml to fill the spec fields below.
+#
+# Pre-conditions:
+#   1. `cctl` is on $PATH (override the binary via the CCTL_BIN env-var).
+#   2. `tsh` is logged in (`tsh status`); the lease discovers the created
+#      gateway's Teleport node via `tsh ls` (override via TSH_BIN).
+#   3. rsync 3.x on the remote non-interactive $PATH.
+#
+# Field semantics (each maps 1:1 to a `cctl pytorchjob create` flag for
+# the per-suite GPU jobs; the gateway devspace itself is always claimed
+# with 0 GPUs regardless of `gpu_count`):
+#   * `project`       — cctl project name (--project).
+#   * `cluster`       — cluster name (--cluster).
+#   * `resource_pool` — resource pool with GPU quota (--resource-pool).
+#                       Pool↔cluster mapping (as of 2026-06):
+#                         - yingbo_train       → multimodal  (faxin has 0 GPU quota here)
+#                         - paratera_shandong  → faxin
+#   * `image`         — image ID / name / canonicalName (--image).
+#   * `nodes`         — pod count per suite job (--nodes, default 1).
+#                       1 = single-node, identical UX to the old BATCH
+#                       path; >1 = multi-node (world_size = nodes ×
+#                       gpu_count; entry consumes the injected
+#                       RANK/MASTER_ADDR env for rendezvous).
+#   * `gpu_count`     — GPUs **per node** each GPU suite requests as an
+#                       ephemeral cctl pytorchjob (--gpu). The gateway
+#                       devspace is always 0-GPU.
+#   * `gpu_model`     — GPU model, e.g. h100 / a100 / 910b (--gpu-model).
+#   * `priority`      — HIGH | NORMAL (--priority).
+#   * `billing_account_id` — billing account for resource attribution
+#     (--billing-account-id). Required when the server enforces
+#     BILLING_ACCOUNT_REQUIRED. List via `cctl billing-account list`.
+#     Empty → flag omitted (fine for clusters that don't require it).
+#   * `workspace`     — REQUIRED shared persistent cluster path (e.g.
+#     `/user/<username>`), rw-mounted on BOTH the gateway and every GPU
+#     job. Must NOT be empty / `$HOME` / `/root` (pod-local — the job
+#     cannot see code synced to the gateway's /root). The lease fails fast
+#     otherwise. `harness sync push` syncs into `<workspace>/.forge_train`.
+#   * `hostname`      — leave empty; the lease writes the derived
+#     `ds-<id>` (the gateway) here at launch. Do not set by hand.
+
+[remote]
+kind = "job"
+project = "loopharness"
+cluster = "paratera_shandong"
+resource_pool = "faxin"
+image = "infra/forge-train-hjsun-ngc2501:20260612-qwen3_0.6b_tokenizer"
+nodes = 1
+gpu_count = 2
+gpu_model = "h100"
+priority = "NORMAL"
+billing_account_id = "N00007"
+workspace = ""
+hostname = ""

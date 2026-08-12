@@ -1,0 +1,15 @@
+# Agent profile: Claude Opus 4 (requires Max Mode).
+#
+# To use: cp config/agent/opus.toml config/agent.toml
+
+[agent]
+backend = "cursor-cli"
+model = "claude-opus-4-8-thinking-high"
+max_mode = true
+runs_per_stage = 0
+poll_seconds = 5
+agent_round_tries = 8
+retry_base_sleep = 4
+retry_continue_prompt = "Transient Cursor API/network disconnect. Continue exactly where you left off; do not restart the whole iteration from scratch."
+state_dir = ".artifacts/agent-loop-state"
+max_consecutive_review_fails = 3

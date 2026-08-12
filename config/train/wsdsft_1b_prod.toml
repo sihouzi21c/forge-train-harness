@@ -1,0 +1,47 @@
+# wsdsft_1b_prod.toml — production WSD-SFT 3-phase recipe SSOT (MiniCPM5-1B)
+#
+# 1B sibling of wsdsft_05b_prod.toml (see that file's header for the recipe
+# rationale, the full-scale reference recipe, and the machine-read contract —
+# everything there applies here). Delta vs 0.5B: the production global batch
+# is 1024 (the 1B production shape, = dense_training_1b's production-train
+# gate_config) with MBS 4; the phase table and per-phase LR corners are the
+# same downscaled schedule.
+#
+# A 1B loop selects this file explicitly on the launcher:
+#   RECIPE_REL=config/train/wsdsft_1b_prod.toml bash evals/scripts/launch_production.sh
+# (the launcher reads [launch] locally and passes the pod-visible path via
+# --env TRAIN_RECIPE_TOML, so both sides read this one file).
+
+[launch]
+gpus_per_node = 4             # 2..4 under the per-person card cap
+workers       = 0             # single node (master only) — quota guard
+
+[common]
+global_batch_size = 1024      # 1B production global batch — do NOT downscale
+micro_batch_size  = 4         # memory-bound knob; accum absorbs it
+seq_length        = 4096
+seed              = 1234
+stable_save_interval = 200
+decay_save_interval  = 50
+sft_save_interval    = 25
+
+[phases.stable]
+iters   = 1800
+lr      = 1e-2
+min_lr  = 0.0
+warmup  = 40
+wsd_decay_iters = 0           # pure plateau — never anneals
+
+[phases.decay]
+iters   = 360                 # absolute end step = 1800 + 360 = 2160
+lr      = 1e-2                # SAME peak — the stable curve continues
+min_lr  = 5e-4
+warmup  = 0                   # continuation: no re-warmup
+wsd_decay_iters = 360         # the whole phase is the anneal tail
+
+[phases.sft]
+iters   = 180                 # its own counter — starts back at step 0
+lr      = 5e-4                # NEW curve: peak = decay's floor
+min_lr  = 1e-6
+warmup  = 6
+wsd_decay_iters = 174         # iters - warmup: anneals nearly all phase

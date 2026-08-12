@@ -1,0 +1,29 @@
+# loss-gate-200.toml — M6 辅助(MiniCPM4-8B 满 32 层真实规模;loss-only,无 MFU 门)
+#
+# 与 long-train 同形状(8-GPU TP2×DP4 / 满 32 层 / 200 步 / MBS=2),只看 loss:
+# window 末段 ref vs ours 平均相对 loss 差 ≤ max_avg_relative_loss_diff,无 MFU 门
+# (非 commit gate)。grad_accum = 32/(2·4) = 4。
+[shared]
+world_size_override           = 8
+tensor_parallel_size_override = 2
+num_layers_override           = 32
+num_steps_override            = 200
+micro_batch_size_override     = 2
+global_batch_size_override    = 32
+gate_window                   = [101, 201]
+
+[shared.gate]
+max_avg_relative_loss_diff = 0.025
+forge_init_ones            = 1
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = false
+
+[ours]
+deterministic              = false
+micro_batch_size_override  = 2
+cublas_workspace_config          = "@unset"
+nvte_allow_nondeterministic_algo = "@unset"

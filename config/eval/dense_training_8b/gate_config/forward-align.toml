@@ -1,0 +1,26 @@
+# forward-align.toml — alignment.forward 单一源(MiniCPM4-8B 4 层 proxy;单卡张量采集)
+# 单步 DP=1 forward 子集逐位对齐;num_layers_override=4 压成快采 proxy
+# (ref 与 ours 同读 FORGE_NUM_LAYERS=4,逐位可比)。
+# grad_accum = GBS/(MBS·DP) = 2/(2·1) = 1。
+[shared]
+world_size_override        = 1
+num_steps_override         = 1
+micro_batch_size_override  = 2
+global_batch_size_override = 2
+num_layers_override        = 4
+gate_window                = [0, 1]
+
+[shared.gate]
+gate_bitwise       = true
+gate_atol          = 0
+hash_capture_level = 2
+forge_init_ones    = 0
+
+[optim]
+lr_warmup_iters_override = 0
+
+[ref]
+deterministic = true
+
+[ours]
+deterministic = true

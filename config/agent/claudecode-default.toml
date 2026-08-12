@@ -1,0 +1,51 @@
+# Agent profile: Claude Code CLI pinned to Claude Opus 4.8 at `high` effort.
+#
+# To use: cp config/agent/claudecode-default.toml config/agent.toml
+#
+# `model = "claude-opus-4-8[1m]"` is the canonical Anthropic slug for
+# Claude Opus 4.8 (see https://platform.claude.com/docs/en/about-claude/models/overview)
+# with the `[1m]` suffix selecting the 1M-token context window (a native
+# Claude Code model-alias toggle — without it the CLI defaults to the 200K
+# window). 1M Opus is included on Max/Team/Enterprise subscriptions.
+# The claude-code backend forwards the slug verbatim as
+# `--model claude-opus-4-8[1m]` (see
+# web/agents/backends.py::_build_claude_command). Drop the `[1m]` suffix to
+# run at 200K; leave the value empty to fall back to the CLI's own default
+# model instead.
+#
+# `effort` is the Claude-Code reasoning-effort knob: one of
+# low / medium / high / xhigh / max. The backend passes `--effort <value>`
+# to the CLI, which routes `output_config={"effort":...}` into the API
+# request and auto-attaches the `effort-2025-11-24` beta header. Opus 4.8
+# already defaults to `high` on every surface (per the official docs), so
+# pinning `"high"` here is explicit rather than additive; raise to `xhigh`
+# / `max` if you want deeper reasoning budget.
+#
+# `max_mode` is cursor-cli-only and has no effect on claude-code; use
+# `effort` to raise the reasoning budget for this backend.
+
+[agent]
+backend = "claude-code"
+model = "claude-opus-4-8[1m]"
+effort = "high"
+# Opus 4.8 emits NO chain-of-thought into the stream-json transcript
+# unless the request's thinking config asks for `display: summarized`
+# (forwarded by the backend as `--thinking-display=summarized`). Keep
+# this set on every profile that pins an Opus 4.8 id — directly like
+# this one, or via an llm-center alias (e.g. CLAUDE_hxx5qi) — so loop
+# logs stay debuggable. Models that emit thinking by default (Fable 5)
+# leave it empty. Allowed: "summarized" / "omitted" / "".
+thinking_display = "summarized"
+runs_per_stage = 0
+poll_seconds = 5
+agent_round_tries = 8
+retry_base_sleep = 4
+retry_continue_prompt = "Transient agent CLI / network disconnect. Continue exactly where you left off; do not restart the whole iteration from scratch."
+state_dir = ".artifacts/agent-loop-state"
+max_consecutive_review_fails = 3
+# Per-command wall-clock cap (claude-code only). Every Bash command the
+# CLI runs is wrapped in `timeout <cmd_timeout>` via a fake-$SHELL shim
+# (web/agents/timeout_shell), group-killing runaway background poll-loops
+# that would otherwise keep `claude -p` alive past its turn result. Any
+# coreutils DURATION ("40m", "1h", "3600s"); empty disables the cap.
+cmd_timeout = "40m"

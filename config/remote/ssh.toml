@@ -1,0 +1,36 @@
+# Remote execution: plain SSH to a static host (on-prem GPU box, cloud
+# VM, a devspace you manage by hand, …). The harness only assumes plain
+# `ssh <hostname>` works; it does NOT manage the host's lifecycle.
+#
+# For an auto-provisioned, per-loop exclusive `cctl` devspace (copy on
+# launch, stop on exit, recover on drop), use config/remote/devspace.toml
+# instead.
+#
+# To use: cp config/remote/ssh.toml config/remote.toml
+# Then edit config/remote.toml to fill `hostname` (and optionally
+# `workspace`).
+#
+# Pre-conditions:
+#   1. ~/.ssh/config has the `hostname` alias configured (proxy / cert /
+#      port / identity) so plain `ssh <hostname> <cmd>` works without
+#      extra flags.
+#   2. rsync 3.x on the remote non-interactive $PATH (transport for
+#      `harness sync push`; agents call the CLI, not rsync directly).
+#   3. (Optional) unset http(s)_proxy in remote ~/.bashrc if the host
+#      auto-sets an internal-only whitelist proxy.
+#
+# Field semantics:
+#   * `hostname` — the SSH alias / host the harness connects to. Used
+#     as-is (no lease derivation); the host you name is the host the
+#     harness runs on.
+#   * `workspace` — the parent directory on the remote that holds the
+#     harness checkout. Defaults to the remote $HOME when empty.
+#     `harness sync push` syncs into `<workspace>/.forge_train`, so
+#     the final remote workdir is `${workspace:-$HOME}/.forge_train`.
+#     `$HOME` is left unexpanded here and resolved by the remote shell
+#     at command-execution time.
+
+[remote]
+kind = "ssh"
+hostname = ""
+workspace = ""

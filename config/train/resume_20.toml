@@ -1,0 +1,39 @@
+# resume_20.toml — resume-milestone remote-job recipe (ref & ours short train)
+#
+# The machine-read source for the resume-stage PyTorchJob scripts:
+#   * evals/scripts/launch_resume.sh       — reads [launch] for the job topology
+#   * evals/scripts/resume_train_ref.sh    — ref-side per-pod entry
+#   * evals/scripts/resume_train_ours.sh   — ours-side per-pod entry
+# All three project it via tools/train_recipe_to_env.py (env-wins: an explicit
+# env override beats the TOML). Change the card count or the step count HERE.
+#
+# Purpose: a SHORT real remote-GPU training job per side (default 20 steps —
+# the resume-gate-20 scale) that proves each engine trains and checkpoints as
+# a cctl PyTorchJob on the devspace pool before the production 3-phase job is
+# spent. The ours side writes versioned step_<abs>/ ckpts every save_interval
+# and is checkpoint-driven on re-submit (same SAVE_ROOT → resumes, not step 0);
+# the ref side is the L0 truth run (no resume primitive on the ref entry).
+#
+# Shape mirrors gate_config/resume-gate-20.toml (MBS 4 / GBS 80 / warmup 0) so
+# the job exercises the same recipe scale the resume gate proved bitwise.
+# Geometry / muP / MTP / optimizer constants are NOT here — both sides read
+# them from the rendered resume-gate-20 products (ref/config/<gate>.toml and
+# workload/src/config/<gate>.toml); this file owns only the run shape.
+
+[launch]
+# Per-person quota on this line is 2-4 concurrent cards; the short resume job
+# takes the low end so it can coexist with other runs. workers 0 = single node.
+gpus_per_node = 2
+workers       = 0
+
+[train]
+iters             = 20        # "epochs" of the short job — the ONE knob to grow
+save_interval     = 10        # ours: versioned ckpt every N absolute steps
+micro_batch_size  = 4
+global_batch_size = 80        # grad_accum = 80 / (4 × DP) — DP 2 → 10
+seq_length        = 4096
+seed              = 1234
+lr                = 1e-2
+min_lr            = 0.0
+warmup            = 0         # = resume-gate-20 (lr_warmup_iters_override 0)
+wsd_decay_iters   = 0         # plateau — the short job never anneals

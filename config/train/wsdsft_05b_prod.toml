@@ -1,0 +1,83 @@
+# wsdsft_05b_prod.toml — production WSD-SFT 3-phase recipe SSOT (MiniCPM4-0.5B)
+#
+# The SINGLE source for the production stable→decay→sft schedule, and it is
+# MACHINE-READ at run time: launch_production.sh reads [launch] for the job
+# topology, and production_train.sh projects the whole file into env via
+# tools/train_recipe_to_env.py (env-wins: an explicit env override still beats
+# the TOML) before exec'ing train_ours_al.sh. Change the card count or the
+# phase step counts HERE — not in the scripts.
+# Two consumers still must stay numerically identical by hand:
+#   * gate_config/{wsd-sft-70,production-resume-70}.toml — the gate-scale
+#     phase table (same LRs, downscaled steps)
+#   * prompt/.../stage1/production.md     — the numbers quoted to the agent
+# (train_ours_al.sh keeps hardcoded fallbacks for a bare-metal run without the
+# TOML, but the production path always sources this file, so those fallbacks
+# are last-ditch, not a consumer to sync.)
+#
+# ── Scale note (per-person card cap) ─────────────────────────────────────
+# This is the DOWNSCALED production recipe. The full-scale reference recipe
+# it preserves the shape of is the MiniCPM5 production run:
+#     stable 100000 / decay 19000 / sft 9500  @  GBS 1280, 256 cards
+#     warmup 2000 / 0 / 300;  save cadence 5000 / 1000 / 500
+# This line's cluster policy caps each person at 2-4 GPUs, so the step
+# counts are scaled ~×1/55 keeping (a) the 10.5 : 2 : 1 phase ratio,
+# (b) the warmup:iters ratios, and (c) the EXACT per-phase LR corners —
+# the LR schedule SHAPE is scale-invariant, so switch correctness and
+# crash-resume are proven on the same curve geometry the full recipe uses.
+# GBS / MBS / seq are NOT downscaled: production trains at the production
+# token-per-step shape; grad_accum absorbs the small DP world
+# (GBS 1280 / (MBS 10 × DP 4) = accum 32; DP 2 → accum 64).
+#
+# At a measured ~<step_time>s/step on 4 cards the 1800/360/180 total
+# (2340 steps) targets a ~1 day wall-clock. The production.md contract
+# requires the agent to MEASURE step time with a short probe and report it
+# before submitting; if the projection blows the window the agent escalates
+# rather than silently shrinking steps (this file is frozen post-launch).
+
+[launch]
+# PyTorchJob topology — read by launch_production.sh (submitter, GPU_PER_NODE /
+# WORKERS defaults) AND by production_train.sh (pod side, torchrun nproc).
+# The per-person quota on this line is 2-4 cards: gpus_per_node must stay in
+# 2..4 and workers must stay 0 (single node) unless a human clears the quota
+# (the launcher enforces both with I_HAVE_QUOTA).
+gpus_per_node = 4             # 2 for a 2-card run
+workers       = 0             # extra nodes beyond the master; 0 = single node
+
+[common]
+global_batch_size = 1280      # production global batch — do NOT downscale
+micro_batch_size  = 10        # the only memory-bound knob; accum absorbs it
+seq_length        = 4096
+seed              = 1234
+# Per-phase periodic-save cadence (absolute steps). ~9 intermediate ckpts in
+# stable, ~7 in decay+sft — a crash never loses more than one interval
+# (~1-2 h at the projected step time).
+stable_save_interval = 200
+decay_save_interval  = 50
+sft_save_interval    = 25
+
+[phases.stable]
+iters   = 1800
+lr      = 1e-2
+min_lr  = 0.0
+warmup  = 40                  # full-scale 2000/100000 ≈ 2% of the phase
+wsd_decay_iters = 0           # pure plateau — never anneals
+# data conf: ref/reference/wsdsft_stable_data_conf.sh (pretrain mix)
+# ckpt: fresh init from CHECKPOINT_ROOT; --save to <SAVE_ROOT>/stable
+
+[phases.decay]
+iters   = 360                 # absolute end step = 1800 + 360 = 2160
+lr      = 1e-2                # SAME peak — the stable curve continues
+min_lr  = 5e-4
+warmup  = 0                   # continuation: no re-warmup (production parity)
+wsd_decay_iters = 360         # the whole phase is the anneal tail
+# data conf: ref/reference/wsdsft_decay_data_conf.sh (anneal mix)
+# ckpt: FULL resume from stable final (params + optim m/v/step + counter)
+
+[phases.sft]
+iters   = 180                 # its own counter — starts back at step 0
+lr      = 5e-4                # NEW curve: peak = decay's floor
+min_lr  = 1e-6
+warmup  = 6                   # full-scale 300/9500 ≈ 3% of the phase
+wsd_decay_iters = 174         # iters - warmup: anneals nearly all phase
+# data conf: ref/reference/wsdsft_sft_data_conf.sh (SFT corpus, loss_mask)
+# ckpt: WEIGHTS-ONLY from decay final (fresh optimizer, step reset to 0)

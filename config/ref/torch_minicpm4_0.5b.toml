@@ -1,0 +1,18 @@
+# Reference implementation: pure-PyTorch (muP + MTP) backend.
+#
+# To use: cp config/ref/torch_minicpm4_0.5b.toml config/ref.toml
+
+[ref]
+backend = "torch"
+ref_script = "run_16gpu_1000step_pure_mup_mtp.sh"
+megatron = "git@codeup.aliyun.com:modelbest/scaling/Megatron-LM.git"
+megatron_branch = "cpm_core_r0.15.0"
+tokenizer = "openbmb/MiniCPM4-0.5B"
+# Local directory holding the tokenizer file. snapshot_download writes
+# tokenizer.model here on cache miss. Default matches the Dockerfile bake
+# layout; override on hosts that store data elsewhere.
+forge_tokenizer_dir = "/opt/forge-data/tokenizer"
+
+# checkpoint_root is auto-derived to <repo>/.artifacts/checkpoints/<backend>/
+# when omitted. Set FORGE_CHECKPOINT_ROOT (env) or --checkpoint-root (CLI)
+# to override.

@@ -1,0 +1,20 @@
+# production-train.toml — M7(MiniCPM4-8B 满 32 层真实规模;ours-only,不起 ref)
+#
+# 8-GPU TP2×DP4(用户指定),满 32 层,10k 步生产长训。ours-only:无 [ref] 段,
+# 无逐位对比 —— 只跑候选引擎、分段 checkpoint 续训。GBS=32(用户统一档),
+# grad_accum = 32/(2·4) = 4。层数对齐真实 8B 规模。
+[shared]
+world_size_override           = 8
+tensor_parallel_size_override = 2
+num_layers_override           = 32
+num_steps_override            = 10000
+micro_batch_size_override     = 2
+global_batch_size_override    = 32
+seed_override                 = 1234     # = 全局默认,ours-only 显式留存
+seq_length_override           = 4096
+
+[shared.gate]
+forge_init_ones = 1
+
+[ours]
+# ours-only:无 [ref] 段;deterministic 用默认(ON),如需关再显式声明

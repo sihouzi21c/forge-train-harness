@@ -1,0 +1,66 @@
+# production-resume-70.toml — WSD-SFT 崩溃续训 self-comp 门禁 (production 里程碑,step 1)
+#
+# 在**融合后的生产引擎**上,ours 引擎跑 stable→decay→sft 三段**两遍** ——
+# 一遍全程不崩(基准,train_ours_al.sh),一遍按 crash_steps 在三段各 SIGKILL
+# 一次并从最新 step_<abs>/ ckpt 续训(train_ours_al_resume.sh)—— 逐相位逐 step
+# loss **bitwise 相等**(gate_atol=0),证明崩溃续训在生产 kernel 路径上**自洽**;
+# 同时跑 [PHASE] 结构断言,证明语料切换/优化器状态转换**确实发生**(挡住
+# "退化成全程 stable 也能 self-comp"的假过)。
+#
+# 为何 self-comp 而非 vs-ref:long-horizon 算子融合改变计算路径后,ours 已无法
+# 对 ref 逐位一致;ours-vs-ours 里融合在两侧抵消,故 self-comp 可达。相位切换
+# 的结构正确性由 M5 的 wsd-sft-70 + 本门禁的 [PHASE] 断言共同保证。
+#
+# 这是 production 里程碑的 STEP 1(预演门禁):过了才允许提交 pytorchjob
+# (production.md 契约)。规模 20/20/20 步、2 卡、分钟级。
+#
+# 相位表 / 逐相位 LR 与 wsd-sft-70 逐项一致(同一条生产配方的门禁量级),
+# 改一处须同步。
+
+[shared]
+world_size_override        = 2
+micro_batch_size_override  = 2
+global_batch_size_override = 32       # GBS32 / MBS2 / DP2 → grad_accum 8
+seq_length                 = 4096
+
+# 三段相位表(与 wsd-sft-70 逐项对齐)。
+stable_steps   = 20
+stable_lr      = 1e-2
+stable_min_lr  = 0
+stable_warmup  = 2
+
+decay_steps    = 20
+decay_lr       = 1e-2
+decay_min_lr   = 5e-4
+decay_warmup   = 0        # 生产一致:续训不再 warmup
+
+sft_steps      = 20
+sft_lr         = 5e-4
+sft_min_lr     = 1e-6
+sft_warmup     = 3
+sft_wsd        = 17       # SFT_ITERS - SFT_WARMUP
+
+# 崩溃续训:引擎每 save_interval 个"绝对 step"写一份版本化 ckpt
+# (<save_path>/step_<abs>/training_state.pt),相位末再存一份最终 ckpt。
+# save_interval=10 → 每段(20 步)中途落 step_10、末尾落 step_20,保证 crash_steps
+# 三个崩点都发生在"某次 interval 存盘之后",可从本段最新 step_ 续。基准(不崩)
+# 那遍也用同 save_interval:写版本化 ckpt 不改 loss,两遍引擎路径逐位一致。
+save_interval  = 10
+
+[shared.gate]
+# 两遍都是 ours 且 init-ones + deterministic,故基准遍逐 run 可复现;主跑与基准
+# 的唯一差异是"崩+续",任何逐 step 差异都归因于崩溃续训。
+forge_init_ones    = 1
+hash_capture_level = 0
+# 自比较基准来源:"self" = 第二遍不崩的 ours。
+comparison_basis   = "self"
+# 逐 step loss **bitwise 相等**门禁。
+gate_atol          = 0
+# 崩溃续训崩点(连续编号 1..stable+decay+sft=1..60)。套壳 train_ours_al_resume.sh
+# 逐个映射到 (相位,发射step):12→stable12、33→decay33、54→sft14,在 stable/decay/
+# sft 各 SIGKILL 一次;每次崩前均已过一次 save_interval 存盘,故可从本段最新
+# step_ 续。
+crash_steps        = [12, 33, 54]
+
+[ours]
+deterministic = true

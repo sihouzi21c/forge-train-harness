@@ -1,0 +1,7 @@
+# Remote execution: disabled (all commands run locally).
+#
+# To use: cp config/remote/local.toml config/remote.toml
+# (or simply omit config/remote.toml — local is the default)
+
+[remote]
+kind = "local"

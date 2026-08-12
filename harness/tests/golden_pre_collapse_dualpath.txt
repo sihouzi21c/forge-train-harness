@@ -1,0 +1,39 @@
+# Golden 输出冻结 —— 门禁参数透传坍缩前基线
+#
+# 来源:在双路 commit 2c3c901e(step-5 完整 ref SSOT)上,devspace 用 products 路
+# (FORGE_GATE_SHAPE_SOURCE=source / FORGE_GATE_TRANSPORT=products)跑全部可跑门禁,
+# 与 env 路逐字节对拍 BITWISE_OK 后冻结。ref_loss.txt 已剥墙钟(time_s/mfu)再哈希。
+#
+# 坍缩(Phase 1-5)完成后,Phase 6 终验:重跑同门,逐字节比对本表;
+# 任意不符 = 回退 `git checkout pre-collapse-dualpath`。
+# 关联:gate_param_collapse_design.md §D6 / Phase 0 / Phase 6。
+#
+# 复现命令(devspace,cwd=harness):
+#   python3 tools/render_gate_configs.py            # 渲染全部产物
+#   FORGE_GATE_SHAPE_SOURCE=source FORGE_GATE_TRANSPORT=products \
+#     python3 -m evals.dispatcher --gate <gate> [--gpu 0]
+
+[multistep-1gpu]              # M1 多步 1gpu
+gate_metadata.json           = fd4301c36868aab6830a04af7c2b448fddad820846747f224f800a83aa536374
+ref_loss.txt(timing-stripped)= 1506e90caf79b0ef90578d834eea5ad3f47414daa73615214cebfae6802115ab
+
+[multistep]                  # M2 多步
+gate_metadata.json           = 2d6126d4bc656a4467c743a0ec47cfdf868cc4f82b9194ecf292169abe868bc5
+ref_loss.txt(timing-stripped)= 2c548d89a60f8debb50620fbc6eed15a81e66d8c2d700f440f427c4bb382932b
+
+[perf-bitwise]               # M3 性能-bitwise
+gate_metadata.json           = 9c8095be8bb32ab41b775d5f93be740885d1937eb6e8a87fb675e46ac9bd6b46
+ref_loss.txt(timing-stripped)= c2e2588f3d13d95f431b021645c6636c982a6a698abe814bc26be3b73e9d491e
+
+[backward-align]             # M4 反向对齐
+gate_metadata.json           = 866e7ac59839175503cd1d21232eba7734f24b4aa8832fb6dd4dc7396a26fe3e
+ref_capture.pt               = 188e80733c15f50829aa7af9888c71c5116b70eb7b4d02d91c8db07f9b97d172
+ref_capture.pt.graph.json    = ac4cb39c86151fc4fb2407c6baf3f0d5fb59617ac90676f9e8e7c89eafc808a6
+
+# 变异反证(mutation proof):backward-align 产物 mup_emb_scale
+#   12.0 -> ref_capture.pt 188e80733c15f50829aa7af9888c71c5116b70eb7b4d02d91c8db07f9b97d172  (A 基线)
+#    6.0 -> ref_capture.pt 95c82680ab328b0e3c7a49b72b45d7e0d42a8834ac810c9c653f8715c904214c  (B' 变异)
+# => 产物 mup_emb_scale 真实驱动 ref 运行(capture 改变),MUTATION_LIVE。
+#
+# 范围说明:M5(resume-gate-20)走 ours 引擎非 ref-shell,M6/M7 视 devspace 资源而定,
+# Stage-2 op-long 按设计 D5 显式豁免,均不入本 golden 表。
