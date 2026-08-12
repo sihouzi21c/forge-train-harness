@@ -135,7 +135,7 @@ None.
 
 - **Verdict**: PASS
 - **Stage status**: in-progress
-- **Commit**: <pending>
+- **Commit**: f4258af — Docs: record Round 10 gradient bisect — MTP branch identified as systematic gradient root cause
 
 ### Key conclusions
 The dev agent performed a systematic gradient bisect, adding intermediate gradient captures to both the ref and in-house engine. The bisect traced the 0.54% gradient norm difference to the MTP branch: `grad_mtp_logits` differs at step 0 even though all inputs (mtp_logits, mtp_labels, mtp_loss_mask) are bitwise identical between ref and in-house. The `d_main_pre_head` (main branch LM head dgrad) is bitwise identical. The MTP gradient error cascades through `d_hidden_normed_mtp` → `d_hidden_normed` → `d_hidden` → all 157 weight gradients. The `cross_entropy_backward` function is verified correct for the main loss but produces different results for the MTP loss with the same inputs. The engine remains a genuine in-process implementation — no proxy, no forgery, no hardcoded metrics.
@@ -165,5 +165,25 @@ None.
 ### Evidence highlights
 - anti-proxy guard: PASS — no proxy patterns detected
 - guard suite: PASS — framework guard OK
+
+---
+
+## [stage1] Round 10 (review) — 2026-08-13 02:55:00
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: f4258af — Docs: record Round 10 gradient bisect — MTP branch identified as systematic gradient root cause
+
+### Key conclusions
+Docs-only commit — no engine code was modified. The dev agent performed a systematic gradient bisect that traced the 0.54% gradient norm difference to the MTP branch (`grad_mtp_logits` mismatch at step 0 despite identical inputs). The `d_main_pre_head` (main branch LM head dgrad) is bitwise identical. The engine remains a genuine in-process implementation — no proxy, no forgery, no hardcoded metrics, no shell-outs to ref. The anti-proxy and guard suites both pass. Stage 1 finish conditions are not satisfied (no gate evidence in perf_log, no `STAGE_STATUS: finished` in commit message).
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- anti-proxy guard: PASS — no proxy patterns detected
+- guard suite: PASS — framework guard OK
+- Engine source files (`forward.py`, `backward.py`, `train_loop.py`, `parameters.py`) contain no shell-outs, no ref imports, no hardcoded metric literals
+- `train_loop.py:1306-1309`: `global_loss` and `mfu_e2e_standard` are computed values from actual computation, not hardcoded
 
 ---

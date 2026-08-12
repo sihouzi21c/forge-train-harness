@@ -620,17 +620,17 @@ def _static_backward(
 
     if cache.mtp_logits is not None and model.mtp is not None:
         # ── MTP Cross-entropy loss backward ────────────────────────────
+        # Scale by ce_w in fp32 (inside cross_entropy_backward), matching
+        # the ref's ``loss = lm_sum + ce_w * mtp_sum; loss.backward()``.
         grad_mtp_logits = cross_entropy_backward(
-            cache.mtp_logits, cache.mtp_labels, cache.mtp_loss_mask
+            cache.mtp_logits, cache.mtp_labels, cache.mtp_loss_mask,
+            scale=mtp_ce_weight,
         )
-        # Scale by MTP loss weight: total = lm_loss + ce_w * mtp_loss
-        grad_mtp_logits = grad_mtp_logits * mtp_ce_weight
 
         # ── MTP LM head backward: logits = mtp_pre_head @ output_weight.T
         # d(mtp_pre_head) = grad_mtp_logits @ output_weight
         # d(output_weight) += grad_mtp_logits.T @ mtp_pre_head
-        # grad_mtp_logits is fp32 (from FP32 CE), output_weight is bf16.
-        # Match the ref's _LinearFn.backward: keep weight in bf16 for the matmul.
+        # grad_mtp_logits is bf16 (from cross_entropy_backward), output_weight is bf16.
         d_mtp_pre_head = torch.matmul(grad_mtp_logits, model.output_weight)
         g2_mtp = grad_mtp_logits.reshape(-1, V)
         mtp_pre = cache.mtp_pre_head.reshape(-1, H)

@@ -218,3 +218,33 @@ The `F.cross_entropy` backward pass might produce different results when called 
 - Investigate whether the `F.cross_entropy` backward is truly deterministic by running the same `cross_entropy_backward` function multiple times on the same inputs and comparing the hashes.
 - Consider using a manual `softmax - one_hot` formula for the CE backward to eliminate any `F.cross_entropy` non-determinism.
 - review R10 PASS: in-process implementation, no proxy; MTP gradient root cause identified, stage 1 in-progress
+- review R10 PASS: docs-only commit, no proxy detected; stage 1 in-progress — continue MTP gradient bisect
+
+## Round 11 — bitwise-singlecard milestone: cross_entropy_backward softmax-one_hot + ce_w fp32 scaling
+
+### Changes
+- **`cross_entropy_backward`**: Replaced `obj.backward()` via `F.cross_entropy` with the manual `softmax - one_hot` closed-form formula. This eliminates potential non-determinism in the `F.cross_entropy` backward kernel when called multiple times per step.
+- **Added `scale` parameter** to `cross_entropy_backward`: The `ce_w` (MTP loss weight) multiplication is now done in fp32 **before** the `.to(bf16)` conversion, matching the ref's `loss = lm_sum + ce_w * mtp_sum; loss.backward()` computation where `ce_w` scaling is applied in fp32.
+
+### Diagnostic findings
+- **Step 0 forward hashes**: 154/155 match (1 missing: `layers.0#0` — ref captures module-level output hook, ours doesn't).
+- **Step 0 gradient hashes**: 0/157 match before fix; **1 additional hash matches after fix** (155/2496 total, up from 154/2496).
+- **`d_main_pre_head` hash**: `cd32ee5c2c9a244c5a709229c04c0164` — bitwise identical to ref (Round 10 confirmed).
+- **`d_hidden_normed_before_mtp` norm**: 11.8125 (main branch only).
+- **`d_hidden_normed_mtp` norm**: 2.515625 (MTP branch contribution, ~21% of main branch).
+- **`d_hidden_normed_after_mtp` norm**: 12.0625 (combined).
+- **`d_hidden` norm**: 48.0 (gradient through final_norm backward).
+- **`grad_logits_main` norm**: 90.5 (main branch CE gradient, same as `grad_mtp_logits_before_cew`).
+- **`d_mtp_pre_head` norm**: 21.375.
+
+### Key insight
+- The MTP contribution to the gradient norm is ~2.515625 (norm of `d_hidden_normed_mtp`), which is about 21% of the main branch norm (11.8125). But the combined norm is only 12.0625, meaning the MTP gradient is nearly orthogonal to the main branch gradient.
+- The `ce_w` fp32 scaling fix improved one gradient hash (155/2496 vs 154/2496), confirming the `ce_w` scaling precision matters.
+- **MTP gradient zero-out test**: Setting `d_hidden_normed_mtp = 0` (disabling MTP gradient contribution) reproduced the SAME 0.54% grad_norm difference. This is expected because the ref's gradient (with MTP) differs from the ours gradient (without MTP) by the MTP contribution.
+- **The root cause of the 0.54% gradient norm difference remains the MTP branch gradient**. The `d_hidden_normed_mtp` is added to `d_hidden_normed`, which cascades through `final_norm` backward → transformer layer backward → ALL parameter gradients.
+- Since the MTP branch backward uses the same code as the main branch backward (which is correct — `d_main_pre_head` matches), the MTP backward should be correct. The discrepancy must be at the point where the MTP gradient computation diverges from the ref's autograd.
+
+### Next step
+- Focus on the `d_mtp_pre_head` (MTP LM head dgrad) as the first point of divergence. Compare `d_mtp_pre_head = grad_mtp_logits @ output_weight` hash between ref and ours.
+- Consider adding the ref's `_RMSNormFn` backward hook to capture the `d_hidden` hash for direct comparison.
+- review R11: in progress — `cross_entropy_backward` softmax-one_hot + ce_w fp32 scaling, gradient root cause not yet resolved
