@@ -391,8 +391,11 @@ def _forward_with_cache(
 
         q_rot = apply_rope(q, rope_freqs)
         k_rot = apply_rope(k, rope_freqs)
-        allow_math = not torch.cuda.is_available()
-        attn, softmax_lse = _gqa_attention(q_rot, k_rot, v, allow_math_fallback=allow_math)
+        # Use math attention fallback to match ref's deterministic stack.
+        # The ref disables flash SDP and mem-efficient SDP, falling back to
+        # the math backend (torch.baddbmm).  Using the flash attention kernel
+        # directly would produce different numerical results.
+        attn, softmax_lse = _gqa_attention(q_rot, k_rot, v, allow_math_fallback=True)
         attn_flat = attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         attn_out = torch.matmul(attn_flat, layer.attention_proj_weight.t())
         if capture_records is not None:
@@ -471,7 +474,7 @@ def _forward_with_cache(
         mtp_q, mtp_k, mtp_v = project_qkv(mtp_normed, model.mtp.layer.qkv_weight)
         mtp_q_rot = apply_rope(mtp_q, rope_freqs)
         mtp_k_rot = apply_rope(mtp_k, rope_freqs)
-        mtp_attn, mtp_softmax_lse = _gqa_attention(mtp_q_rot, mtp_k_rot, mtp_v, allow_math_fallback=allow_math)
+        mtp_attn, mtp_softmax_lse = _gqa_attention(mtp_q_rot, mtp_k_rot, mtp_v, allow_math_fallback=True)
         mtp_attn_flat = mtp_attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         mtp_attn_out = torch.matmul(mtp_attn_flat, model.mtp.layer.attention_proj_weight.t())
         if capture_records is not None:
@@ -592,7 +595,6 @@ def _static_backward(
     B, S = cache.input_ids.shape
     H = C.HIDDEN_SIZE
     V = C.VOCAB_SIZE
-    allow_math = not torch.cuda.is_available()
 
     # ====================================================================
     # MTP BRANCH BACKWARD (if enabled)
@@ -679,7 +681,7 @@ def _static_backward(
         else:
             d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward(
                 d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
-                allow_math_fallback=allow_math,
+                allow_math_fallback=True,
             )
 
         # RoPE backward
@@ -819,7 +821,7 @@ def _static_backward(
         else:
             d_q_rot, d_k_rot, d_v = gqa_attention_backward(
                 d_attn, lc.q_rot, lc.k_rot, lc.v,
-                allow_math_fallback=allow_math,
+                allow_math_fallback=True,
             )
 
         # RoPE backward
@@ -867,10 +869,6 @@ def _compute_grad_norm(
     for buf in fp32_grad_bufs:
         sq_sum += buf.double().pow(2).sum()
     norm = sq_sum.sqrt().float()
-    if rank == 0:
-        top_vals = sorted([buf.abs().max().item() for buf in fp32_grad_bufs], reverse=True)[:5]
-        nonzero = sum((buf != 0).any().item() for buf in fp32_grad_bufs)
-        print(f"[DEBUG] grad_norm={norm.item():.4f}, nonzero_bufs={nonzero}/{len(fp32_grad_bufs)}, top_max_vals={[f'{v:.4f}' for v in top_vals]}", flush=True)
     return norm
 
 
@@ -1216,8 +1214,6 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # The ref computes obj = sum(nll * mask), then backward() computes the gradient
         # of the SUM. reduce_grads then scales by 1/g_lm_n to convert to the gradient
         # of the AVERAGE. Without this scaling, our gradients are lm_n times larger.
-        if rank == 0:
-            print(f"[DEBUG] local_lm_n={local_lm_n.item():.1f}, lm_sum={local_lm_sum.item():.4f}", flush=True)
         norm_factor = 1.0 / local_lm_n.clamp(min=1.0)
         for buf in fp32_grad_bufs:
             buf.mul_(norm_factor)
@@ -1230,7 +1226,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             return  # Not reached (SystemExit raised in _ordered_teardown)
 
         # ── Compute gradient norm ─────────────────────────────────────
-        grad_norm_val = _compute_grad_norm(fp32_grad_bufs, device, rank=rank)
+        grad_norm_val = _compute_grad_norm(fp32_grad_bufs, device)
 
         # ── Clip gradients ────────────────────────────────────────────
         _clip_gradients(fp32_grad_bufs, opt_clip_grad, grad_norm_val)
