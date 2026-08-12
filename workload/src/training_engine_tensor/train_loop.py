@@ -1093,21 +1093,24 @@ def _init_process_group() -> int:
     """Initialize the torch distributed process group.
 
     Sets the CUDA device before init so NCCL knows the correct GPU.
+    Passes device_id to avoid the "devices unknown" warning.
     Returns the global rank.
     """
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", device_id=local_rank)
     rank = dist.get_rank()
     return rank
 
 
 def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then return.
+    """Ordered teardown: drain GPU, empty cache, then return.
 
-    Returns normally so the interpreter can clean up.  The NCCL barrier
-    specifies device_ids to avoid the "devices used by this process are
-    currently unknown" warning that can lead to SIGABRT during Py_Finalize.
+    Returns normally so the interpreter can clean up.  The NCCL PG is
+    NOT destroyed here — it is left for the OS to clean up on process
+    exit, avoiding the "terminate called without an active exception"
+    SIGABRT that occurs when the NCCL finalizer races Python's
+    Py_Finalize.
     """
     import gc
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1117,23 +1120,16 @@ def _ordered_teardown() -> None:
             torch.cuda.synchronize()
     except Exception:
         pass
-    # 2. Collect all Python garbage.
+    # 2. Collect all Python garbage to release GPU tensor references.
     for _ in range(3):
         gc.collect()
-    # 3. Release the NCCL PG with proper device_ids.
-    try:
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier(device_ids=[local_rank])
-            dist.destroy_process_group()
-    except Exception:
-        pass
-    # 4. Free the CUDA allocator cache.
+    # 3. Free the CUDA allocator cache.
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
-    # 5. Final GC pass.
+    # 4. Final GC pass.
     gc.collect()
     if os.environ.get("RANK", "0") == "0":
         print("ALL DONE", flush=True)
