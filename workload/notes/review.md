@@ -111,3 +111,20 @@ None.
 - Engine has been verified as genuine in-process implementation across review rounds 5 and 6 (same finding)
 
 ---
+
+## [stage1] Round 8 — 2026-08-13 00:20:00
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: fb35b53 — Fix: _add_to_grad_bufs O(1) index, final_norm backward, CUBLAS_WORKSPACE_CONFIG
+
+### Key conclusions
+The dev agent fixed the _add_to_grad_bufs linear data_ptr search with an O(1) pre-built index mapping, removed a duplicate rms_norm_backward call for final_norm that was using the wrong input (mlp_out instead of hidden_post_last_layer), and added CUBLAS_WORKSPACE_CONFIG for deterministic cuBLAS behavior. The engine remains a genuine in-process implementation — no subprocess calls to ref/ scripts, no hardcoded synthetic metrics, no renamed proxy variants. The only `from ref.*` imports at `train_loop.py:212,258` are dataloader utilities (HF streaming and Megatron binary), not core training logic. The 0.54% gradient norm diff at step 1 persists across all 157 gradients. No `STAGE_STATUS: finished` in the commit message, no gate evidence in perf_log, and no profile snapshot — stage 1 stays in-progress.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:569-591`: _add_to_grad_bufs refactored to use O(1) dptr_idx mapping instead of linear data_ptr search
+- `train_loop.py:776-782`: final_norm backward now correctly uses hidden_post_last_layer (reconstructed from last layer cache) instead of mlp_out
+- `train_loop.py:1054-1058`: CUBLAS_WORKSPACE_CONFIG added at module entry to match ref's deterministic cuBLAS config

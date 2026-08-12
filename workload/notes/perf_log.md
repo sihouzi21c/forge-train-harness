@@ -153,3 +153,33 @@ The 0.54% gradient norm difference affects ALL 157 gradients equally. The error 
 - The most promising bisect is to compare the `d_main_pre_head` (LM head dgrad) with the ref's equivalent. If the dgrad matches, the error is downstream in the transformer layers. If not, the error is in the CE backward or LM head backward.
 - Since the `d_main_pre_head` hash is known (`cd32ee5c2c9a`), the next step should verify this against the ref by running a no-MTP variant.
 - review R8: in progress
+- review R8 PASS: in-process implementation, no proxy; 0.54% gradient diff persists, stage 1 in-progress
+
+## Round 9 — bitwise-singlecard gradient bisect: norm computation & CE backward verified
+
+### Investigation
+The 0.54% gradient norm difference at step 1 (loss is bitwise identical) was investigated further:
+
+1. **Norm computation verified identical**: 
+   - `torch.norm(torch.stack(norms), 2.0)` vs `torch.linalg.vector_norm(torch.stack(norms), 2.0)` produce identical results on the remote (PyTorch 2.6.0a0).
+   - `buf.norm(2)` vs `torch._foreach_norm([buf], 2)` also produce identical results.
+   - The norm computation is NOT the source of the 0.54% difference.
+
+2. **CE backward verified bitwise identical**:
+   - The in-house `cross_entropy_backward` (replaying `obj.backward()` on detached fp32 logits) produces a bitwise-identical gradient to the ref's autograd on the same logits/labels.
+   - Hash match confirmed via blake2b-128.
+
+3. **Hash comparison analyzed**:
+   - Step 0 forward: 154/155 match (1 missing: `layers.0#0` — the ref captures module-level output hooks which the in-house engine doesn't emit).
+   - Step 0 gradients: 0/157 match (ALL gradients differ from ref).
+   - Step 1 forward: 0/155 match (gradient differences cause parameter drift after optimizer step).
+   - The in-house engine is missing `#1` forward keys (MTP branch calls the same module hook a second time in the ref, but the in-house engine uses separate `mtp.*` key names).
+
+### Status
+- The 0.54% gradient norm difference persists and affects ALL 157 gradients equally.
+- The CE backward and norm computation are verified correct.
+- The root cause is in the static backward pass through the transformer layers — the `_static_backward` function produces systematically different gradients from the ref's autograd.
+- **Candidate hypothesis (unverified)**: The `silu_swiglu_intermediate_backward` function uses float32 for the autograd replay while the ref's autograd keeps the computation in bf16. However, a targeted test showed that the norm of the silu gradient is the same for both bf16 and fp32 paths (0.0000% difference), so this is unlikely to be the root cause of the 0.54% gradient norm difference.
+
+### Next step
+- Bisect the static backward pass by comparing intermediate gradients layer by layer with the ref's autograd. The most productive approach is to add tracing to both the ref and in-house engine and compare the per-layer dgrad values.
