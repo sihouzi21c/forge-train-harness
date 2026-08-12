@@ -867,14 +867,18 @@ def _compute_grad_norm(
 ) -> torch.Tensor:
     """Compute the L2 norm of all gradients (FP32).
 
+    Uses the same computation path as ``torch.nn.utils.clip_grad_norm_``:
+    compute per-tensor L2 norm, then stack and compute the global L2 norm.
+    This ensures bitwise agreement with the ref's ``clip_grad_norm_`` call.
+
     Returns a scalar tensor on the given device.
     """
-    # Use float64 for the sum to avoid overflow
-    sq_sum = torch.zeros((), device=device, dtype=torch.float64)
-    for buf in fp32_grad_bufs:
-        sq_sum += buf.double().pow(2).sum()
-    norm = sq_sum.sqrt().float()
-    return norm
+    # Match the ref's clip_grad_norm_ path: norm(stack([norm(g, 2) for g in grads]), 2)
+    # Using float32 (not float64) to match the ref's reduction dtype.
+    norms = [buf.norm(2).to(device) for buf in fp32_grad_bufs]
+    if not norms:
+        return torch.zeros((), device=device, dtype=torch.float32)
+    return torch.norm(torch.stack(norms), 2.0)
 
 
 def _clip_gradients(
@@ -1141,7 +1145,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     grad_prefix = ""
     if config.hash_capture_level > 0:
         capture_records = {}
-        # The ref's harness_dp adds a step_{step}. prefix before the rank prefix.
+        # NOTE: capture_prefix and grad_prefix are updated per-step below
+        # (the step number changes each iteration).  The initial values are
+        # placeholders; the actual step-specific prefix is set inside the
+        # training loop before the forward/backward calls.
         capture_prefix = f"step_{config.start_step}.rank{rank}.mb0."
         grad_prefix = f"step_{config.start_step}."
 
@@ -1153,6 +1160,14 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
     # ── Training loop ──────────────────────────────────────────────────
     for step in range(config.num_steps):
+        # Update capture prefix per-step to match the ref's harness_dp format
+        # (step_{step}.rank{rank}.mb0. for forward, step_{step}. for gradient).
+        step_prefix = f"step_{config.start_step + step}."
+        step_grad_prefix = f"step_{config.start_step + step}."
+        if config.hash_capture_level > 0:
+            capture_prefix = f"{step_prefix}rank{rank}.mb0."
+            grad_prefix = step_grad_prefix
+
         torch.cuda.synchronize()
         t0 = time.time()
 
@@ -1228,6 +1243,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         norm_factor = 1.0 / local_lm_n.clamp(min=1.0)
         for buf in fp32_grad_bufs:
             buf.mul_(norm_factor)
+
+        # ── Capture gradients for this step (persistent mode) ─────────────
+        # The ref's harness_dp captures gradients after each step (post-scaling).
+        # We must do the same so the hash dump contains per-step gradient records.
+        if config.hash_capture_level > 0 and config.persistent:
+            _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
 
         # ── Capture mode: dump and exit (non-persistent) ────────────────
         if config.hash_capture_level > 0 and not config.persistent:

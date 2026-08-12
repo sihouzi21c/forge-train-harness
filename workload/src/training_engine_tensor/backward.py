@@ -103,9 +103,11 @@ def rms_norm_backward(
         out = _F.rms_norm(xd, shape, wd, eps_val)
         grad_in, grad_weight_ref = torch.autograd.grad(out, (xd, wd), grad_out)
 
-    # wgrad: closed-form (same dtype as grad_out)
+    # wgrad: closed-form, computed in the same dtype as grad_out (bf16)
+    # then converted to fp32 to match the ref's _RMSNormFn.backward
+    # WGRAD_ACCUM_FP32 path: wg = (grad_out * normed).sum(0); _ensure_main_grad(weight).add_(wg.float())
     normed = _F.rms_norm(hidden.detach(), shape, None, eps_val)
-    grad_weight_fp32 = (grad_out * normed).reshape(-1, weight.shape[0]).sum(0)
+    grad_weight_fp32 = (grad_out * normed).reshape(-1, weight.shape[0]).sum(0).float()
 
     return grad_in, grad_weight_fp32
 
@@ -159,8 +161,11 @@ def embedding_backward(
 
     flat_ids = token_ids.reshape(-1)
     flat_grad = grad_out.reshape(-1, H)
-    grad_embedding = torch.zeros(V, H, dtype=flat_grad.dtype, device=grad_out.device)
-    grad_embedding.index_add_(0, flat_ids, flat_grad)
+    # Use float32 for the gradient accumulation to match the ref's
+    # _EmbeddingFn.backward which uses torch.ops.aten.embedding_dense_backward
+    # and converts to fp32.
+    grad_embedding = torch.zeros(V, H, dtype=torch.float32, device=grad_out.device)
+    grad_embedding.index_add_(0, flat_ids, flat_grad.float())
     return grad_embedding
 
 
@@ -257,10 +262,10 @@ def project_qkv_backward(
     # d hidden = grad_projected @ weight (keep weight in original dtype, matching ref)
     grad_hidden = torch.matmul(grad_projected, weight)
 
-    # d weight = grad_projected.T @ hidden (use weight's dtype)
+    # d weight = grad_projected.T @ hidden (use weight's dtype, then fp32)
     g2 = grad_projected.reshape(-1, grad_projected.shape[-1])
     h2 = hidden.reshape(-1, H)
-    grad_weight = torch.matmul(g2.transpose(0, 1), h2)
+    grad_weight = torch.matmul(g2.transpose(0, 1), h2).float()
 
     return grad_hidden, grad_weight
 
@@ -394,16 +399,17 @@ def cross_entropy_backward(
 ) -> torch.Tensor:
     """Backward of cross-entropy loss w.r.t. logits.
 
-    Replays ``F.cross_entropy`` through ``torch.autograd.grad`` to match the
-    ref's autograd backward exactly.  The ref computes::
+    Replays the ref's exact chain::
 
         nll = F.cross_entropy(logits.reshape(-1, V).float(), labels.reshape(-1), reduction="none")
         obj = (nll * mask).sum()
         obj.backward()
 
-    The gradient w.r.t. the bf16 ``logits`` is bf16 (because ``.float()``
-    backward converts the fp32 gradient back to bf16).  This function
-    replicates that chain and returns the gradient in bf16.
+    The ``obj.backward()`` call computes the gradient through the full
+    ``.float()`` → ``F.cross_entropy`` → ``(nll * mask).sum()`` chain,
+    exactly matching the ref's autograd.  The gradient w.r.t. the bf16
+    ``logits`` is bf16 (because ``.float()`` backward converts the fp32
+    gradient back to bf16).
 
     Returns the gradient w.r.t. logits in bf16 (``[B, S, V]``).
     """
@@ -413,15 +419,17 @@ def cross_entropy_backward(
     labels_flat = labels.reshape(-1)
     mask = loss_mask.reshape(-1).float()
 
-    # Replay the ref's chain: logits.float() → F.cross_entropy → (nll *
-    # mask).sum() through autograd so the backward produces the same dtype
-    # and values as the ref's autograd engine.
+    # Replay the ref's chain exactly: logits.float() → F.cross_entropy →
+    # (nll * mask).sum() → backward(), matching the ref's autograd
+    # computation path bit-for-bit.
     with torch.enable_grad():
-        # logits.float() creates a new fp32 tensor; autograd will track the
-        # gradient through this conversion back to the bf16 input.
+        # logits.float() creates a new fp32 tensor; backward() will track
+        # the gradient through .float() conversion back to the bf16 input.
         logits_f32 = logits.detach().float().reshape(-1, V).requires_grad_(True)
         nll = _F.cross_entropy(logits_f32, labels_flat, reduction="none")
-        (grad_logits_f32,) = torch.autograd.grad(nll, (logits_f32,), grad_outputs=mask)
+        obj = (nll * mask).sum()
+        obj.backward()
+        grad_logits_f32 = logits_f32.grad
         # grad_logits_f32 is fp32; convert back to bf16 (matching the ref's
         # .float() backward which converts fp32 → bf16).
         grad_logits = grad_logits_f32.to(logits.dtype)

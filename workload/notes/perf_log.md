@@ -140,3 +140,38 @@ The ~0.5% gradient difference at step 1 is likely from the `cross_entropy_backwa
 - Investigate the static backward gradient difference: compare the `linear_backward` wgrad dtype (returns BF16, added to FP32 buffer) with the ref's `_LinearFn.backward` (computes BF16, `.float()` before adding).
 - The `cross_entropy_backward` function creates a separate autograd graph — verify it matches the ref's `obj.backward()` chain exactly.
 - Re-run the gate after the hash prefix fix to verify hash comparison.
+- review R5 PASS: engine genuine in-process impl, no proxy; stage 1 in-progress (no gate evidence, no profile snapshot)
+
+## Round 6 — bitwise-singlecard milestone: hash capture prefix fix, wgrad dtype alignment, norm computation alignment
+
+### Changes
+- **Hash capture prefix fix**: The `capture_prefix` and `grad_prefix` in persistent mode were using `step_{config.start_step}` (always `step_0`) for all steps, causing the hash dict to be overwritten with the last step's values. Fixed to use `step_{config.start_step + step}` per-step, matching the ref's harness_dp format. Also added per-step `_capture_all_gradients` call in persistent mode so gradients are captured for each step (not just the last one).
+- **cross_entropy_backward**: Changed from `torch.autograd.grad(nll, logits_f32, grad_outputs=mask)` to `(nll * mask).sum().backward()` to match the ref's exact backward path. This should be mathematically equivalent but ensures the exact same autograd path is used.
+- **rms_norm_backward wgrad dtype**: Added `.float()` to the wgrad computation to match the ref's `_RMSNormFn.backward` WGRAD_ACCUM_FP32 path (`wg.float()`).
+- **project_qkv_backward wgrad dtype**: Added `.float()` to the wgrad computation for consistency with `linear_backward`.
+- **embedding_backward**: Changed to use fp32 accumulation (`torch.zeros(V, H, dtype=torch.float32)`) matching the ref's `_EmbeddingFn.backward` which uses `embedding_dense_backward` with fp32 output.
+- **_compute_grad_norm**: Changed from `float64` to `float32` reduction to match the ref's `torch.nn.utils.clip_grad_norm_` path (which uses `torch.norm(p.grad.detach(), 2)` in float32).
+
+### Results
+- **Step 1 loss: BITWISE PASS** (`diff=0.0`, unchanged). Forward pass is fully aligned.
+- **Step 1 grad_norm: diff=0.0011 (0.54% relative)**. The gradient computation STILL differs from the ref's autograd, despite all the fixes.
+- **Hash comparison: 154/2496 equal** (improved from 0/312). The per-step capture prefix fix now correctly captures all 8 steps' forward activations and gradients. Step 0 forward activations: 154/155 match (the single non-matching key is `tok_embeddings#0` which we capture with `mup_emb_scale=12.0` applied, while the ref captures without). Steps 1-7 forward activations: 0/155 match (expected — the gradient diff at step 0 causes the optimizer to produce different parameters, so all subsequent steps diverge). Step 0 gradients: 0/157 match (all different).
+
+### Remaining issue
+The step 0 gradient computation produces a consistent 0.54% relative error compared to the ref's autograd. This is despite:
+- The forward pass being bitwise identical (154/155 forward keys match at step 0)
+- The CE backward matching the ref's `(nll * mask).sum().backward()` path
+- All wgrad computations matching the ref's `.float()` pattern
+- The norm computation matching the ref's `clip_grad_norm_` path
+
+The 0.54% diff is suspiciously consistent (same value across multiple runs) and affects ALL 157 gradients equally, suggesting a systematic scaling difference rather than individual operator rounding errors.
+
+### Candidate hypotheses for next round
+1. **`norm_factor` scaling**: The `1.0 / local_lm_n` scaling might differ between ref and ours. The ref's `g_lm_n` comes from `harness_dp.reduce_loss_scalar` which might apply additional processing. Compare the `lm_n` values directly.
+2. **`main_grad` vs `fp32_grad_bufs` initial state**: The ref's `_ensure_main_grad` creates per-microbatch fresh `main_grad = torch.zeros_like(p, dtype=torch.float32)`. Our `fp32_grad_bufs` are created once outside the loop. For `grad_accum_steps=1` this shouldn't matter, but verify.
+3. **`flash_attn_func` backward non-determinism**: The `gqa_attention_backward` replays the forward inside `torch.enable_grad()`. The replayed forward's internal state (softmax LSE) might differ from the original forward's state, causing a different backward result. This would affect ALL attention layer gradients.
+4. **Bisect the backward pass**: Add debug dump of `dw_output_main` (LM head weight gradient) and compare with ref's hash. If the LM head gradient matches, the error is downstream; if not, the error is in the CE backward or LM head backward.
+
+### Next step
+- The most efficient next step is to bisect the backward pass by comparing the `dw_output_main` (LM head weight gradient) with the ref. If the first gradient is already different, the error is in the CE backward or LM head backward. If it matches, the error is downstream in the transformer layers.
+- review R6: in progress

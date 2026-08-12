@@ -52,6 +52,7 @@ None.
 - `backward.py:1-471`: Static backward for every forward primitive — no autograd, no reference proxy
 - `train_loop.py:1039-1266`: Full training loop with forward pass, static backward, AdamW optimizer, LR schedule, gradient clipping, MFU computation — all in-process
 - `train_loop.py:213,259`: Only ref imports are dataloader utilities, not core training engine logic
+
 ## [stage1] Round 4 — 2026-08-12 19:39:37
 
 - **Verdict**: PASS
