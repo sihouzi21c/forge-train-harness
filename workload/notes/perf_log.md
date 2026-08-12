@@ -183,3 +183,38 @@ The 0.54% gradient norm difference at step 1 (loss is bitwise identical) was inv
 
 ### Next step
 - Bisect the static backward pass by comparing intermediate gradients layer by layer with the ref's autograd. The most productive approach is to add tracing to both the ref and in-house engine and compare the per-layer dgrad values.
+- review R9 PASS: in-process implementation, no proxy; gradient bisect narrows root cause to _static_backward (transformer dgrad), stage 1 in-progress
+
+## Round 10 — gradient bisect: MTP branch identified as root cause of systematic gradient error
+
+### Investigation: MTP vs main branch gradient comparison
+The 0.54% gradient norm difference at step 1 (loss is bitwise identical) was traced to the MTP branch:
+
+1. **`d_main_pre_head` (step 0) BITWISE IDENTICAL**: `hash=53854af38e2011b6e930711f6fa4b761` for both ref and ours. The CE backward and LM head dgrad are correct.
+
+2. **`d_hidden_normed` (step 0) MISMATCHES**: `ref=b5b49e34aa91b594099edf4371ecab4e` vs `ours=f14fb872d8fd2f1a75fb24bc5cc918f2`. Since `d_main_pre_head` matches, the difference must be from the MTP contribution `d_hidden_normed_mtp`.
+
+3. **`d_mtp_b` (step 0) MISMATCHES**: `ref=c77915ec0ad0a23288fc7f83b734e24f` vs `ours=46773377e7aff11ee3c084576465d628`. The gradient of the loss w.r.t. `b` (hidden_input_layernorm output) differs.
+
+4. **`d_mtp_eagle_h` (step 0) MISMATCHES**: `ref=bcc57573a120e75655489309ce0897cb` vs `ours=8467a07b01df5adb823f46e77efb9a77`. The gradient of the loss w.r.t. the MTP transformer layer output differs.
+
+5. **`grad_mtp_logits` (step 0) MISMATCHES**: `ref=d25252bd66fefdda8f12519b4e571eca` vs `ours=502a055b545d55369f3df5af51008760`. The gradient of the MTP loss w.r.t. MTP logits differs even though ALL inputs are identical:
+   - `mtp_logits` hash: `0d4cb820f35e60a64a0007ba99bc98a1` (MATCH)
+   - `mtp_labels` hash: `51b482e162f898cc884dc60b5e3375b3` (MATCH)
+   - `mtp_loss_mask` hash: `a2a4e6bf7be45d08a7ec59490fb5cd76` (MATCH)
+   - `mtp_ce_weight` = 0.3 (same for both)
+
+6. **`cross_entropy_backward` function verified correct** for main loss (d_main_pre_head matches), but produces different results for MTP loss with identical inputs. The `cross_entropy_backward` uses `logits.detach().float().requires_grad_(True)` with `obj.backward()`. Changing to `torch.autograd.grad` without `detach()` did not fix the discrepancy.
+
+### Analysis
+The `grad_mtp_logits` difference is the ROOT CAUSE of the 0.54% gradient norm difference. The MTP branch gradient `d_hidden_normed_mtp` is wrong, which makes `d_hidden_normed` wrong, which cascades through the main branch backward to affect ALL 157 gradients equally.
+
+The `cross_entropy_backward` function is identical for main and MTP branches. The inputs are identical. But the output differs. This suggests a subtle non-determinism in `F.cross_entropy` backward when called through `obj.backward()` on a detached tensor, or a subtle difference in the autograd computation path between the ref's native `loss.backward()` (which computes all gradients in one pass) and the in-house's isolated `cross_entropy_backward` call.
+
+### Candidate hypothesis
+The `F.cross_entropy` backward pass might produce different results when called through `obj.backward()` on a detached tensor vs when the same computation is part of the main `loss.backward()` graph. The `torch.use_deterministic_algorithms(True)` stack might not fully eliminate non-determinism in the cross-entropy backward kernel.
+
+### Next step
+- Investigate whether the `F.cross_entropy` backward is truly deterministic by running the same `cross_entropy_backward` function multiple times on the same inputs and comparing the hashes.
+- Consider using a manual `softmax - one_hot` formula for the CE backward to eliminate any `F.cross_entropy` non-determinism.
+- review R10 PASS: in-process implementation, no proxy; MTP gradient root cause identified, stage 1 in-progress

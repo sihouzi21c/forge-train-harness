@@ -128,3 +128,42 @@ None.
 - `train_loop.py:569-591`: _add_to_grad_bufs refactored to use O(1) dptr_idx mapping instead of linear data_ptr search
 - `train_loop.py:776-782`: final_norm backward now correctly uses hidden_post_last_layer (reconstructed from last layer cache) instead of mlp_out
 - `train_loop.py:1054-1058`: CUBLAS_WORKSPACE_CONFIG added at module entry to match ref's deterministic cuBLAS config
+
+---
+
+## [stage1] Round 10 — 2026-08-13 01:00:00
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: <pending>
+
+### Key conclusions
+The dev agent performed a systematic gradient bisect, adding intermediate gradient captures to both the ref and in-house engine. The bisect traced the 0.54% gradient norm difference to the MTP branch: `grad_mtp_logits` differs at step 0 even though all inputs (mtp_logits, mtp_labels, mtp_loss_mask) are bitwise identical between ref and in-house. The `d_main_pre_head` (main branch LM head dgrad) is bitwise identical. The MTP gradient error cascades through `d_hidden_normed_mtp` → `d_hidden_normed` → `d_hidden` → all 157 weight gradients. The `cross_entropy_backward` function is verified correct for the main loss but produces different results for the MTP loss with the same inputs. The engine remains a genuine in-process implementation — no proxy, no forgery, no hardcoded metrics.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- Step 0 `d_main_pre_head`: MATCH (ref=53854af... ours=53854af...)
+- Step 0 `grad_mtp_logits`: MISMATCH (ref=d25252b... ours=502a055...)
+- Forward activations: 154/155 matching at step 0
+- Gradient hashes: 0/157 matching at step 0 (all differ due to MTP cascade)
+- All intermediate gradient captures verified via `harness_dp.capture` and `_capture_forward`
+
+## [stage1] Round 9 — 2026-08-13 00:50:47
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: ce195f1 — Docs: record Round 9 gradient bisect — norm & CE backward verified, root cause remains in static backward
+
+### Key conclusions
+Docs-only commit recording Round 9 gradient bisect results. The dev agent verified norm computation (torch.norm == torch.linalg.vector_norm, bitwise identical) and CE backward (cross_entropy_backward produces bitwise-identical gradient to ref autograd). The 0.54% gradient norm difference persists across all 157 gradients and is isolated to the _static_backward pass through transformer layers. No engine code was modified in this commit — no proxy/forgery risk introduced. The engine remains a genuine in-process implementation.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- anti-proxy guard: PASS — no proxy patterns detected
+- guard suite: PASS — framework guard OK
+
+---
