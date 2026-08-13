@@ -1090,3 +1090,38 @@ The dev agent unblocked remote execution (tsh session expired 16 rounds ago) and
 2. Fix CUDA graph crash: move `torch.cuda.empty_cache()` before the warmup, not between warmup and capture; add explicit error logging to stdout
 3. Run `long-train-smoke` with CUDA graph only (no ZeRO, no bucketing)
 4. If CUDA graph passes, measure MFU and proceed with ZeRO-1 optimization
+
+## [stage1] Round 40 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — CUDA graph crash and ZeRO-1 timeout remain unresolved
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (fixes: grad bucketing default, CUDA graph empty_cache timing, ZeRO-1 timeout analysis)
+
+### Key conclusions
+
+The dev agent made a systematic comparison of the old code vs latest code across multiple configurations, identified and fixed two regressions, but the CUDA graph crash and ZeRO-1 timeout remain unresolved.
+
+**Fixes applied:**
+1. **Gradient bucketing default changed from 1 to 0**: At DP=2, the flat all-reduce is fast enough; per-bucket stream-level all-reduce adds ~1% MFU regression (18.0% → 17.0%).
+2. **CUDA graph empty_cache timing**: Moved `torch.cuda.empty_cache()` + `gc.collect()` before the warmup instead of between warmup and capture, to prevent memory instability during graph capture. Added stdout error logging for capture failures.
+3. **Removed redundant empty_cache between warmup and capture**: The `gc.collect()` and `torch.cuda.empty_cache()` calls between warmup and capture were removed (already moved before warmup).
+
+### Gate results (long-train-smoke, DP=2, 20 steps)
+
+| Configuration | Status | MFU | Notes |
+|---|---|---|---|
+| Old code (persistent filesystem, R32-33) | PASS | 18.7% | Baseline |
+| Latest code, all optimizations disabled | PASS | 18.0% | Close to baseline |
+| Latest code, grad bucketing + DL prefetch | PASS | 17.0% | Gradient bucketing regresses |
+| Latest code, CUDA graph only (no ZeRO, no bucketing) | FAIL | N/A | "no [LOSS] lines parsed" — crash persists after fix |
+| Latest code, ZeRO-1 only (no CUDA graph, no bucketing) | TIMEOUT | N/A | >660s transport backstop |
+
+### Remaining issues
+
+1. **CUDA graph crash still occurs**: The "no [LOSS] lines parsed" error persists after the memory timing fix. The error is likely a CUDA graph capture failure that's not caught by the try-except, or a crash during the warmup phase. Need to read the artifact's stdout.log/stderr.log to see the actual error (log archiving is slow on the cctl cluster).
+
+2. **ZeRO-1 timeout at DP=2**: The ZeRO-1 distributed optimizer adds overhead (reduce_scatter + all_gather + shard management) that outweighs the benefit at DP=2. The 600s smoke gate budget is exceeded. Likely need to either: (a) optimize ZeRO-1 for DP=2, or (b) disable ZeRO-1 by default for DP=2 and only enable for larger DP sizes.
+
+### Best working configuration
+
+The eager path without CUDA graph, ZeRO-1, or gradient bucketing achieves MFU 18.0% (close to the old code's 18.7%). The next round should focus on fixing the CUDA graph crash and then running the full `long-train` gate to establish the baseline MFU.

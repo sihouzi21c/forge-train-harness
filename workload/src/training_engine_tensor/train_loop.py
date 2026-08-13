@@ -1412,7 +1412,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     enable_zero = (
         config.world_size > 1
         and not deterministic
-        and int(os.environ.get("ENABLE_ZERO_OPTIMIZER", "1"))
+        and int(os.environ.get("ENABLE_ZERO_OPTIMIZER", "0"))  # default 0: DP=2 overhead > benefit; enable for larger DP
     )
     zero_opt: ZeroOptimizer | None = None
     if enable_zero:
@@ -1563,7 +1563,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     _opt_cuda_graph = None
     use_cuda_graph = (
         config.hash_capture_level == 0  # no hash capture during graph capture
-        and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))
+        and int(os.environ.get("ENABLE_CUDA_GRAPH", "0"))  # default 0: CUDA graph capture causes crash (debugging); enable via env
         and not enable_zero  # ZeRO-1 uses a sharded optimizer step, not compatible with the full optimizer graph
     )
 
