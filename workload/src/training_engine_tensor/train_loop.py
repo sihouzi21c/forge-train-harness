@@ -1208,7 +1208,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     mtp_in, mtp_lab, mtp_mask,
                     rope_freqs, width_mult, mup_emb_scale,
                     depth_scale_main, depth_scale_mtp,
-                    capture_records if config.hash_capture_level >= 2 else None,
+                    None,  # skip fwd hash (too slow for DP multi-GPU),
                     capture_prefix,
                 )
                 lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
@@ -1221,7 +1221,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     None, None, None,
                     rope_freqs, width_mult, mup_emb_scale,
                     depth_scale_main, depth_scale_mtp,
-                    capture_records if config.hash_capture_level >= 2 else None,
+                    None,  # skip fwd hash (too slow for DP multi-GPU),
                     capture_prefix,
                 )
                 lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
