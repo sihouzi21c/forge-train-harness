@@ -862,45 +862,7 @@ def _static_backward(
 # ── Optimizer helpers ────────────────────────────────────────────────────────
 
 
-def _compute_grad_norm(
-    fp32_grad_bufs: list[torch.Tensor],
-    fp32_master: list[torch.Tensor],
-    device: torch.device,
-    rank: int = 0,
-    opt_clip_grad: float = 1.0,
-) -> torch.Tensor:
-    """Compute the L2 norm of all gradients (FP32).
-
-    Mirrors the ref's ``clip_grad_norm_`` call
-    (``train_pure_mup_mtp.py:813``) exactly: sets ``.grad`` on the master
-    weights, calls ``clip_grad_norm_`` with the same ``max_norm`` the ref
-    uses, and clears ``.grad`` afterwards.  When the norm is below
-    ``max_norm`` the clip is a no-op (``clip_coef = 1.0``), but using the
-    same ``max_norm`` as the ref ensures the internal norm computation
-    follows the exact same kernel path.
-
-    Returns a scalar tensor on the given device.
-    """
-    from torch.nn.utils import clip_grad_norm_
-    for p, buf in zip(fp32_master, fp32_grad_bufs):
-        p.grad = buf
-    norm = clip_grad_norm_(fp32_master, max_norm=opt_clip_grad, norm_type=2.0)
-    for p in fp32_master:
-        p.grad = None
-    return norm.to(device)
-
-
-def _clip_gradients(
-    fp32_grad_bufs: list[torch.Tensor],
-    max_norm: float,
-    norm: torch.Tensor,
-) -> None:
-    """Scale gradients in-place if the total norm exceeds ``max_norm``."""
-    if max_norm <= 0.0:
-        return
-    clip_coef = max_norm / (norm + 1e-6)
-    if clip_coef < 1.0:
-        torch._foreach_mul_(fp32_grad_bufs, clip_coef)
+# ── Optimizer helpers ────────────────────────────────────────────────────────
 
 
 def _build_optimizer_groups(
@@ -961,7 +923,6 @@ def _build_optimizer_groups(
 def _adamw_step(
     optim_groups: list[dict],
     fp32_master: list[torch.Tensor],
-    fp32_grad_bufs: list[torch.Tensor],
     exp_avgs: dict[int, torch.Tensor],
     exp_avg_sqs: dict[int, torch.Tensor],
     state_steps: dict[int, torch.Tensor],
@@ -971,15 +932,9 @@ def _adamw_step(
 ) -> None:
     """Apply one AdamW step using the fused multi-tensor kernel.
 
-    ``fp32_master`` and ``fp32_grad_bufs`` are parallel lists (same order).
-    ``exp_avgs``, ``exp_avg_sqs``, ``state_steps`` are dicts keyed by
-    ``data_ptr`` of the corresponding fp32 master tensor.
-    """
-    # Build a mapping from fp32_master data_ptr to gradient buffer
-    grad_map: dict[int, torch.Tensor] = {}
-    for p, buf in zip(fp32_master, fp32_grad_bufs):
-        grad_map[p.data_ptr()] = buf
-
+    Reads gradients from ``p.grad`` on each ``fp32_master`` tensor (same
+    as the ref's ``optim.step()`` which reads from ``.grad`` after
+    ``clip_grad_norm_`` sets it)."""
     for group in optim_groups:
         params = group["params"]
         n = len(params)
@@ -988,13 +943,13 @@ def _adamw_step(
         lr = group["lr"]
         wd = group["weight_decay"]
 
-        # Collect gradients, momentum buffers, and step counters for this group
+        # Collect gradients from .grad, momentum buffers, and step counters
         grads: list[torch.Tensor] = []
         eas: list[torch.Tensor] = []
         eass: list[torch.Tensor] = []
         steps: list[torch.Tensor] = []
         for p in params:
-            grads.append(grad_map[p.data_ptr()])
+            grads.append(p.grad)
             eas.append(exp_avgs[p.data_ptr()])
             eass.append(exp_avg_sqs[p.data_ptr()])
             steps.append(state_steps[p.data_ptr()])
@@ -1294,7 +1249,13 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             return  # Not reached (SystemExit raised in _ordered_teardown)
 
         # ── Compute gradient norm (also clips via clip_grad_norm_) ───────
-        grad_norm_val = _compute_grad_norm(fp32_grad_bufs, fp32_master, device, opt_clip_grad=opt_clip_grad)
+        # Set .grad on fp32_master (matching ref's pattern exactly) so that
+        # clip_grad_norm_ reads the same .grad fields the ref does.
+        for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
+            p_fp32.grad = buf
+        grad_norm_val = torch.nn.utils.clip_grad_norm_(
+            fp32_master, max_norm=opt_clip_grad, norm_type=2.0,
+        )
 
         # ── Compute LR for this step ──────────────────────────────────
         # ref uses ``step + 1`` (1-indexed) for the LR schedule
@@ -1308,7 +1269,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         for g, mult in zip(optim_groups, lr_mult_per_group):
             g["lr"] = current_lr * mult
         _adamw_step(
-            optim_groups, fp32_master, fp32_grad_bufs,
+            optim_groups, fp32_master,
             exp_avgs, exp_avg_sqs, opt_state_steps,
             beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
         )
