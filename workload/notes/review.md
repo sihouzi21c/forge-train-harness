@@ -289,3 +289,42 @@ None.
 - anti-proxy guard: PASS (0 violations); no gate configs, `remote.toml`, or run-shape keys modified
 
 ---
+
+## [stage1] Round 15 — 2026-08-13 11:26:49
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 42420c1 — Docs: record Round 14 findings — multi-GPU 1-ULP gradient diff root cause
+
+### Key conclusions
+This is a docs-only commit updating `workload/notes/perf_log.md` with Round 14 findings. The dev agent identified that the static backward produces a 1-ULP gradient difference vs the ref's autograd backward in multi-GPU mode, causing the `multistep` (DP=2) gate to diverge from step 4 onwards (3/8 loss match). No engine source code was modified in this round. The engine remains a genuine in-process implementation — no proxy, forgery, hardcoded metrics, or shell-outs. The anti-proxy guard passes. Stage 1 finish conditions are not met: no `STAGE_STATUS: finished` in the commit message, and no gate evidence for the four required suites (long-train, resume-gate-20, resume-startup-90, perf-bitwise).
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `git diff HEAD~1 HEAD --name-only` yields only `workload/notes/perf_log.md` — zero code files touched
+- anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)
+- Engine has been verified as genuine in-process implementation across all prior review rounds (1–14) with the same finding
+
+---
+
+## [stage1] Round 16 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit) — Fix: add preallreduce hash capture, bisect multi-GPU gradient divergence to shared params
+
+### Key conclusions
+The dev agent added `preallreduce` hash capture to the in-house engine (matching the ref's `harness_dp.reduce_grads` pattern) and bisected the `multistep` (DP=2) gradient divergence. The `preallreduce` capture captures gradients BEFORE the all-reduce and scaling, allowing separation of the gradient computation error from the all-reduce error. The bisect reveals that only the shared parameters (tok_embeddings, output_weight) have wrong gradients at step 0 — all other parameters (MTP-specific and main-specific) are correct. The `dptr_idx` mapping is verified correct. The engine remains a genuine in-process implementation — no proxy, forgery, hardcoded metrics, or shell-outs. The anti-proxy guard passes. Stage 1 finish conditions are not met: no gate evidence for the four required suites.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:1319-1335`: `_capture_all_gradients` now supports `suffix` parameter for `preallreduce`/`postallreduce`
+- `train_loop.py:1227-1229, 1240-1242`: `preallreduce` capture before all-reduce + scaling (multi-GPU and single-GPU)
+- `workload/notes/perf_log.md`: Round 16 findings documented — preallreduce hash bisect, shared-param gradient divergence
+- anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)
+- Engine is a genuine in-process implementation (no subprocess calls to ref/ scripts, no hardcoded synthetic metrics, no renamed proxy variants)
+- Stage 1 finish conditions not satisfied: no `STAGE_STATUS: finished` in commit message, no harness-written gate evidence for the four required suites (long-train, resume-gate-20, resume-startup-90, perf-bitwise)

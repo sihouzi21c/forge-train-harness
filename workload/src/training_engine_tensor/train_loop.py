@@ -1224,6 +1224,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # can produce 1-ULP differences in the summed gradients (NCCL may
             # use different algorithms for different tensor sizes), which
             # accumulate into a ~1e-6 loss drift from step 2 onward.
+            # Capture pre-allreduce gradients (for debugging vs ref's preallreduce hashes)
+            if config.hash_capture_level > 0 and config.persistent:
+                _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
             flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
             dist.all_reduce(flat, op=dist.ReduceOp.SUM)
             norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()
@@ -1234,6 +1237,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             ):
                 buf.copy_(sub)
         else:
+            # Capture pre-allreduce gradients (single-GPU, no all-reduce needed)
+            if config.hash_capture_level > 0 and config.persistent:
+                _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
             norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()
             for buf in fp32_grad_bufs:
                 buf.mul_(norm_factor_float)
@@ -1310,13 +1316,17 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
 
 def _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model,
-                           prefix: str = ""):
-    """Capture all parameter gradients as hash records (inline synchronous)."""
+                           prefix: str = "", suffix: str = "postallreduce"):
+    """Capture all parameter gradients as hash records (inline synchronous).
+
+    Args:
+        suffix: ``"postallreduce"`` (default) or ``"preallreduce"``.
+    """
     fqn_map = _build_fqn_map(model)
     for buf, p in zip(fp32_grad_bufs, bf16_params):
         fqn = fqn_map.get(p.data_ptr(), None)
         if fqn is not None:
-            key = f"{prefix}rank{os.environ.get('RANK', '0')}.grad.{fqn}.postallreduce"
+            key = f"{prefix}rank{os.environ.get('RANK', '0')}.grad.{fqn}.{suffix}"
             capture_records[key] = _hash_tensor(buf)
 
 

@@ -30,6 +30,7 @@ All 8 steps of loss are bitwise identical to the ref. The 2 ULP-level grad_norm 
 - review R12 PASS: in-process engine fixes, no proxy detected; stage 1 in-progress — gate evidence and profile snapshot still missing
 - review R13 PASS: MTP gradient 0.54% diff resolved, genuine in-process impl, no proxy; stage 1 in-progress — gate evidence and profile snapshot missing
 - review R14 PASS: genuine in-process engine, no proxy; stage 1 in-progress — no STAGE_STATUS:finished, gate evidence and profile snapshot still missing
+- review R15 PASS: docs-only commit, no proxy; stage 1 in-progress — multistep DP=2 1-ULP gradient root cause documented, gate evidence still missing
 
 ## [stage1] Round 13 — 2026-08-13
 
@@ -100,3 +101,33 @@ The 1-ULP gradient difference is caused by the manual backward ordering vs the a
 Need to investigate the root cause of the 1-ULP gradient difference in multi-GPU mode. Possible approaches:
 1. Match the backward pass order exactly to the autograd engine's topological sort
 2. Investigate if the `fp32_grad_bufs` order difference between ref and ours causes the NCCL all-reduce algorithm to diverge
+
+## [stage1] Round 16 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: bitwise-multicard — in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent added `preallreduce` hash capture to the in-house engine (matching the ref's `harness_dp` pattern) and performed a systematic bisect of the `multistep` (DP=2) gradient divergence. The `preallreduce` capture captures gradients BEFORE the all-reduce and scaling, allowing separation of the gradient computation error from the all-reduce error.
+
+**Key finding — preallreduce hashes at step 0**:
+- Single-GPU (`multistep-1gpu`): 2512/2512 hash match (ALL correct)
+- Multi-GPU (`multistep`): 1419/5024 hash match (783/2512 preallreduce, 636/2512 postallreduce)
+
+**Step 0 preallreduce breakdown (multi-GPU)**: Only 4 keys fail out of 314 — `tok_embeddings.weight` (both ranks) and `output.weight` (both ranks). All other 310 params (MTP-specific and main-specific) have CORRECT hashes.
+
+**Implication**: The gradient computation for shared parameters (tok_embeddings, output_weight) is wrong at the FIRST step, even BEFORE the all-reduce. These are the ONLY parameters that receive gradients from BOTH the main branch and the MTP branch. The `dptr_idx` mapping is verified correct (tok_emb=0, output=1, stable across all calls).
+
+### Gate results (multistep, DP=2)
+
+- **Loss**: 3/8 steps bitwise match (same as Round 14)
+- **Grad norm**: 2/8 steps bitwise match
+- **Hash**: 1419/5024 equal (preallreduce: 783/2512, postallreduce: 636/2512)
+- **Root cause**: Shared params have wrong gradients at step 0; error cascades from step 2 onwards
+
+### Next step
+
+Investigate the root cause of the shared-parameter gradient divergence. The fact that only parameters receiving gradients from two branches (MTP + main) are wrong while all single-branch params are correct suggests the issue is in the `_add_to_grad_bufs` accumulation order or a CUDA kernel selection difference when NCCL is initialized for multi-GPU.
