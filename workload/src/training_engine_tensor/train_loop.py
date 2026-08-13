@@ -152,7 +152,7 @@ def _hash_batch_cpu(items: list[tuple[str, torch.Tensor]]) -> list[tuple[str, di
         shape = list(t.shape)
         dtype = str(t.dtype).removeprefix("torch.")
         results.append(
-            (key, pool.submit(_hash_cpu_blake2b, cpu_t, shape, dtype).result())
+            (key, pool._pool.submit(_hash_cpu_blake2b, cpu_t, shape, dtype).result())
         )
     return results
 
