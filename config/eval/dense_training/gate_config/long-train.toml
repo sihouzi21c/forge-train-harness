@@ -34,3 +34,4 @@ deterministic              = false            # → DETERMINISTIC=0
 micro_batch_size_override  = 10               # 覆盖 [shared] 的 4(ours 侧)
 cublas_workspace_config          = "@unset"   # 覆盖全局 [env] → 这侧不 export
 nvte_allow_nondeterministic_algo = "@unset"
+cuda_device_max_connections      = "@unset"   # 覆盖全局 [env] → 允许 async H2D + 梯度分桶跨流并行

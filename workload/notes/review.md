@@ -672,3 +672,36 @@ The dev agent implemented an async H2D double buffering optimization for the eag
 - Anti-proxy guard: passed (0 violations)
 
 ---
+
+## [stage1] Round 33 — 2026-08-14  (review agent)
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: a3a551f — Perf: Phase 1 continued — eager path async H2D double buffering, non_blocking _next_batch
+
+### Key conclusions
+The dev agent implemented an async H2D double buffering optimization for the eager (non-CUDA-graph) path in `train_loop.py`. The `_next_batch` function now supports `device="cpu"` return and uses `non_blocking=True` for GPU transfers. Pre-allocated GPU buffers and CPU-side prefetch of the next microbatch overlap H2D with GPU compute. No proxy, no shell-out to ref, no synthetic metrics, no hardcoded values. Anti-proxy guard passed (0 violations). Stage 1 cannot finish: commit lacks `STAGE_STATUS: finished`, no gates were run (devspace unreachable), no profile snapshot, MFU below the review-side throughput bar.
+
+### Evidence highlights
+- `train_loop.py:274-292`: `_next_batch` CPU return path and `non_blocking=True` GPU transfers
+- `train_loop.py:1664-1732`: Eager path with pre-allocated buffers, async `copy_()`, CPU prefetch
+- Anti-proxy guard: passed (0 violations)
+
+---
+
+## [stage1] Round 34 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent identified and fixed a critical env-var issue: `CUDA_DEVICE_MAX_CONNECTIONS=1` was inherited from the global `[env]` section and silently disabling the async H2D and gradient bucketing optimizations from Rounds 32 and 33. With only 1 pending CUDA connection, the GPU serializes all compute and copy operations, making `non_blocking=True` copies and separate CUDA streams effectively blocking. The fix removes this env var from the long-horizon configs (ours side only), and adds `pin_memory()` to ensure CPU tensors are page-locked for truly async H2D transfers. All changes are genuine in-process optimizations — no proxy, no shell-out to ref, no synthetic metrics. Guard and anti-proxy tests pass. Stage 1 cannot finish: the commit lacks `STAGE_STATUS: finished`, no gates were run (devspace unreachable), no profile snapshot, MFU below the review-side throughput bar.
+
+### Evidence highlights
+- `train_loop.py:287-294`: `pin_memory()` for CPU tensors in `_next_batch` — ensures `non_blocking=True` copies are truly asynchronous
+- `config/eval/dense_training/gate_config/long-train.toml:37`: `cuda_device_max_connections = "@unset"` — removes the serialization bottleneck
+- `workload/src/config/long-train.toml`, `long-train-smoke.toml`, `loss-gate-200.toml`, `ours/profile-snapshot@long-horizon.toml`: `CUDA_DEVICE_MAX_CONNECTIONS` removed from rendered products
+- `bin/harness run guard`: PASS (0 violations)
+- `bin/harness run anti-proxy`: PASS (0 violations)

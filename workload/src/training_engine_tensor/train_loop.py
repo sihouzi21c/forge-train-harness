@@ -284,6 +284,14 @@ def _next_batch(dl, device):
     labels = data["labels"]
     loss_mask = data["loss_mask"].float()
     if device == "cpu":
+        # Pin memory for async H2D (non_blocking=True copies are only
+        # asynchronous when the source is page-locked memory).
+        if tokens.is_cpu and not tokens.is_pinned():
+            tokens = tokens.pin_memory()
+        if labels.is_cpu and not labels.is_pinned():
+            labels = labels.pin_memory()
+        if loss_mask.is_cpu and not loss_mask.is_pinned():
+            loss_mask = loss_mask.pin_memory()
         return tokens, labels, loss_mask
     return (
         tokens.to(device, non_blocking=True),

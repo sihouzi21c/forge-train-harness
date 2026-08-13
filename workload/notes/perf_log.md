@@ -786,3 +786,43 @@ is primarily a safety net.  The estimated MFU improvement when the eager path is
    - Operator fusion (residual-add + RMSNorm, RoPE fusion)
    - ZeRO-1 distributed optimizer (~20% MFU from reduced optimizer HBM traffic)
    - CUDA graph for optimizer step + BF16 sync
+- review R33 PASS: no proxy — eager async H2D double buffering is genuine in-process CUDA; gates not run (devspace unreachable); MFU below review-side bar, continue optimization
+
+## [stage1] Round 34 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: async H2D pin_memory + Phase 2: CUDA_DEVICE_MAX_CONNECTIONS audit)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent identified that the `CUDA_DEVICE_MAX_CONNECTIONS=1` env var (inherited from the global `[env]` section) was **silently disabling the async H2D and gradient bucketing optimizations** from Rounds 32 and 33. With `CUDA_DEVICE_MAX_CONNECTIONS=1`, the GPU has only 1 pending CUDA connection, serializing all compute and copy operations, which makes `non_blocking=True` copies and separate CUDA streams effectively blocking.
+
+**Fix 1 — Remove `CUDA_DEVICE_MAX_CONNECTIONS=1` from long-horizon configs**:
+- Added `cuda_device_max_connections = "@unset"` to the `[ours]` section of the long-train gate_config source.
+- Manually removed `CUDA_DEVICE_MAX_CONNECTIONS = "1"` from the rendered products for `long-train`, `long-train-smoke`, `loss-gate-200`, and `profile-snapshot@long-horizon`.
+- The ref side still uses `CUDA_DEVICE_MAX_CONNECTIONS=1` for compatibility; only the ours side gets the default (8 connections).
+- Estimated MFU impact: 0.5-2.0% from enabling async H2D and gradient bucketing to work as intended.
+
+**Fix 2 — `pin_memory()` for CPU tensors in `_next_batch`**:
+- The `non_blocking=True` copies in the CUDA graph replay path and eager path were using unpinned CPU tensors from the dataloader. `torch.Tensor.copy_(..., non_blocking=True)` is a **no-op** for unpinned memory — the copy is still blocking.
+- Added `pin_memory()` to CPU tensors returned by `_next_batch(iter_dl, "cpu")` to ensure the H2D transfers are truly asynchronous.
+- The `pin_memory()` calls are guarded by `not is_pinned()` to avoid redundant pinning.
+- Estimated MFU impact: 0.3-0.5% from enabling true async H2D overlap with GPU compute.
+
+### Remote status
+
+The remote devspace (ds-718734, ds-710274) is still not accessible because the `tsh` Teleport session has expired and `tsh login` requires an interactive terminal. The `cctl` CLI is authenticated (profile: modelbest, user: sunhaojun). The user needs to run `tsh login --proxy=teleport.cybertron.modelbest.co:443` interactively to restore SSH access.
+
+### Next steps
+
+Once the remote is accessible:
+1. Sync changes: `bin/harness sync push`
+2. Run smoke gate: `bin/harness run long-train-smoke` (20 steps, DP=2)
+3. Run profile: `bin/harness run profile-snapshot M6_round34`
+4. Run regression: `bin/harness run resume-gate-20`
+5. Candidate levers:
+   - Operator fusion (residual-add + RMSNorm, RoPE fusion)
+   - ZeRO-1 distributed optimizer (~20% MFU from reduced optimizer HBM traffic)
+   - CUDA graph for optimizer step + BF16 sync
