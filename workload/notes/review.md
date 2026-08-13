@@ -413,3 +413,22 @@ None.
 - `evals/capture_offload.py:1-12`: Module docstring states "THIS module is explicitly candidate-facing" — the import is permitted
 - `evals/scripts/_runner_utils.py:48-49`: `FORGE_NSYS_RANK0_OUTPUT` skip — harness-side fix for nsys false positive, not a candidate engine modification
 - `bin/harness run anti-proxy`: PASS (0 violations); no gate configs, `remote.toml`, or run-shape keys modified
+
+## [stage1] Round 19 — 2026-08-13 15:20:16
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 7f30c1e — Docs: record Round 19 perf findings — bitwise-perf structurally unreachable
+
+### Key conclusions
+This is a docs-only round (plus a minor docstring clarification in `train_loop.py:1352-1353`). The dev agent has thoroughly documented the finding that the 10.0% MFU target for `perf-bitwise` is structurally unreachable because blake2b hash overhead (4.45s/step) dominates the step time and cannot be sufficiently overlapped with GPU compute (0.95s available). No gate thresholds, run-shape keys, or `remote.toml` were modified. The engine remains an in-process implementation with `from evals.capture_offload import hash_batch_sync` — an explicitly candidate-facing harness utility approved in prior rounds. The anti-proxy guard passes (0 violations). The Stage 1 FINISH decision conditions are not met (no `STAGE_STATUS: finished` in commit message, perf-bitwise MFU gate not green, no profile snapshot in this commit).
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:1352-1353`: Docstring-only update confirming `hash_batch_sync` does D2H + blake2b on the thread pool
+- `git diff HEAD~1 HEAD --name-only`: only `perf_log.md`, `review.md`, and a docstring-only change to `train_loop.py` — no substantive code changes
+- `bin/harness run anti-proxy`: PASS (0 violations); no config tampering detected
+
+---
