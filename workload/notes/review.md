@@ -433,6 +433,27 @@ None.
 
 ---
 
+## [stage1] Round 21 — 2026-08-13 17:38:52
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 60154f2 — Feat: implement checkpoint save/load for resume milestone — resume-gate-20 and wsd-sft-70 PASS
+
+### Key conclusions
+The dev agent implemented checkpoint save/load (`save_checkpoint` / `load_checkpoint` in `train_loop.py:1040-1210`) and WSD-SFT 3-phase switching (`[PHASE]` banner at `train_loop.py:1330-1345`, `_advance_dataloader` at `train_loop.py:1215-1240`). Both resume gate (`resume-gate-20`, bitwise lossless round-trip) and WSD-SFT gate (`wsd-sft-70`, 3-phase self-comparison + structural assertions) pass. The engine is genuinely implementing checkpoint save/load in-process — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. The anti-proxy guard passes (0 violations). No gate thresholds, run-shape keys, or `remote.toml` were modified. However, Stage 1 FINISH is not declared: `STAGE_STATUS: finished` is absent from the commit message, the latest perf_log section does not show `long-train` PASS / `resume-startup-90` PASS / `perf-bitwise` PASS, and the profile snapshot requirement is unmet (diff modifies `train_loop.py` but no new `profile/M*_round*/summary.md` is present in the commit).
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:1040-1210`: `save_checkpoint` / `load_checkpoint` — self-contained `torch.save`/`torch.load`, no `ref/` path, no subprocess
+- `bin/harness run anti-proxy`: PASS (0 violations); no gate configs, run-shape keys, or `remote.toml` modified
+- `git diff HEAD~..HEAD --name-only`: no `workload/notes/profile/` — profile snapshot absent despite `train_loop.py` and `parameters.py` changes
+
+---
+
+---
+
 ## [stage1] Round 19 — 2026-08-13 15:20:16
 
 - **Verdict**: PASS

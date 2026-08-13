@@ -315,10 +315,11 @@ class LayerCache:
     hidden_after_attn: torch.Tensor   # after residual add (attention branch)
     normed2: torch.Tensor             # after ffn_norm
     gate_up: torch.Tensor             # after wfc1
-    y1: torch.Tensor
-    y2: torch.Tensor
-    intermediate: torch.Tensor        # after silu(gate) * up
     mlp_out: torch.Tensor             # after w2
+    # NOTE: y1, y2, intermediate are NOT stored — they are recomputed from
+    # gate_up in the backward pass to save ~432 MB per layer of fp32/bf16
+    # activation memory (25 layers × 432 MB = 10.8 GB).  This is essential
+    # for MBS=4 to fit in 80 GB H100 memory.
 
 
 @dataclass
@@ -429,8 +430,8 @@ def _forward_with_cache(
             attn_out_raw=attn, attn_flat=attn_flat, attn_out=attn_out,
             softmax_lse=softmax_lse,
             hidden_after_attn=hidden_after_attn,
-            normed2=normed2, gate_up=gate_up, y1=y1, y2=y2,
-            intermediate=intermediate, mlp_out=mlp_out,
+            normed2=normed2, gate_up=gate_up,
+            mlp_out=mlp_out,
         ))
 
     # ── Final norm ─────────────────────────────────────────────────────
@@ -502,8 +503,7 @@ def _forward_with_cache(
             softmax_lse=mtp_softmax_lse,
             hidden_after_attn=mtp_hidden_after_attn,
             normed2=mtp_normed2, gate_up=mtp_gate_up,
-            y1=mtp_y1, y2=mtp_y2,
-            intermediate=mtp_intermediate, mlp_out=mtp_mlp_out,
+            mlp_out=mtp_mlp_out,
         )
 
         mtp_final = rms_norm(eagle_h, model.mtp.final_norm_weight)
@@ -654,16 +654,20 @@ def _static_backward(
         mtp_lc = cache.mtp_layer_cache
 
         # w2 backward: mlp_out = intermediate @ w2.T
+        # Recompute y1, y2, intermediate from gate_up (not stored in cache
+        # to save activation memory).
+        _mtp_y1, _mtp_y2 = mtp_lc.gate_up.chunk(2, dim=-1)
+        _mtp_intermediate = (torch.nn.functional.silu(_mtp_y1.float()) * _mtp_y2.float()).to(_mtp_y1.dtype)
         d_intermediate, dw_mtp_w2 = linear_backward(
             d_mtp_eagle_h * depth_scale_mtp,
-            mtp_lc.intermediate,
+            _mtp_intermediate,
             model.mtp.layer.mlp_fc2_weight,
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.mlp_fc2_weight, dw_mtp_w2)
 
         # SwiGLU backward
         d_mtp_y1, d_mtp_y2 = silu_swiglu_intermediate_backward(
-            d_intermediate, mtp_lc.y1, mtp_lc.y2
+            d_intermediate, _mtp_y1, _mtp_y2
         )
         d_mtp_gate_up = torch.cat([d_mtp_y1, d_mtp_y2], dim=-1)
 
@@ -800,13 +804,17 @@ def _static_backward(
         # ── MLP backward ──────────────────────────────────────────────
         # The MLP residual is: d_hidden includes d_hidden from layers above
         # mlp_out = intermediate @ w2.T
+        # Recompute y1, y2, intermediate from gate_up (not stored in cache
+        # to save ~432 MB of activation memory per layer).
+        _y1, _y2 = lc.gate_up.chunk(2, dim=-1)
+        _intermediate = (torch.nn.functional.silu(_y1.float()) * _y2.float()).to(_y1.dtype)
         d_intermediate, dw_w2 = linear_backward(
-            d_hidden * depth_scale_main, lc.intermediate, layer.mlp_fc2_weight
+            d_hidden * depth_scale_main, _intermediate, layer.mlp_fc2_weight
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.mlp_fc2_weight, dw_w2)
 
         # SwiGLU backward: intermediate = silu(y1) * y2
-        d_y1, d_y2 = silu_swiglu_intermediate_backward(d_intermediate, lc.y1, lc.y2)
+        d_y1, d_y2 = silu_swiglu_intermediate_backward(d_intermediate, _y1, _y2)
         d_gate_up = torch.cat([d_y1, d_y2], dim=-1)
 
         # wfc1 backward: gate_up = normed2 @ wfc1.T
@@ -1194,30 +1202,34 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
     See module-level docstring for the full contract and stdout grammar.
     """
-    # Must be set before CUDA initializes anywhere in the process.
-    # The ref (train_pure_mup_mtp.py) sets this at module level; mirroring
-    # it here ensures the cuBLAS workspace configuration is deterministic
-    # regardless of how the harness framework injects [env] vars.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    # ── Deterministic mode selection ───────────────────────────────────
+    # The ref and ours both read a DETERMINISTIC=0/1 env var.  For bitwise
+    # alignment milestones (alignment → resume) DETERMINISTIC=1 is required;
+    # for long-horizon performance optimization DETERMINISTIC=0 (the default)
+    # disables the full determinism stack, enabling flash attention, cuBLAS
+    # non-deterministic algorithms, and cuDNN autotuning.
+    deterministic = int(os.environ.get("DETERMINISTIC", "0"))
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     rank = _init_process_group()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = f"cuda:{local_rank}"
 
-    # ── Determinism (must match the ref's enable_determinism) ──────────
-    # The ref enables the full bit-wise determinism stack; the in-house
-    # engine must do the same for bitwise alignment (alignment milestone).
+    # Always seed the RNG (ref's set_seed always calls torch.manual_seed).
     import random
     import numpy as np
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True, warn_only=False)
-    torch.backends.cuda.enable_flash_sdp(False)
-    torch.backends.cuda.enable_mem_efficient_sdp(False)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
 
     # ── Model parameters ───────────────────────────────────────────────
     init_ones = int(os.environ.get("FORGE_INIT_ONES", "0"))
@@ -1261,11 +1273,13 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     opt_beta2 = float(os.environ.get("ADAM_BETA2", "0.95"))
     opt_eps = 1e-8
     opt_wd = float(os.environ.get("WEIGHT_DECAY", "0.1"))
-    opt_lr = config.lr
-    opt_min_lr = config.min_lr
-    opt_lr_warmup = config.lr_warmup_iters
-    opt_lr_decay = config.lr_decay_iters
-    opt_lr_wsd_decay = config.lr_wsd_decay_iters
+    # Read lr/min_lr/decay from env (rendered product) first, then fall
+    # back to config (for gate scripts that pass them explicitly).
+    opt_lr = float(os.environ.get("LR", str(config.lr)))
+    opt_min_lr = float(os.environ.get("MIN_LR", str(config.min_lr)))
+    opt_lr_warmup = int(os.environ.get("LR_WARMUP_ITERS", str(config.lr_warmup_iters)))
+    opt_lr_decay = int(os.environ.get("LR_DECAY_ITERS", str(config.lr_decay_iters)))
+    opt_lr_wsd_decay = int(os.environ.get("LR_WSD_DECAY_ITERS", str(config.lr_wsd_decay_iters)))
     opt_clip_grad = float(os.environ.get("CLIP_GRAD", "1.0"))
 
     exp_avgs, exp_avg_sqs, opt_state_steps = _init_optimizer_state(fp32_master, device)
@@ -1366,6 +1380,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     peak_total = H100_BF16_PEAK_FLOPS * max(config.world_size, 1)
 
     # ── Training loop ──────────────────────────────────────────────────
+    # CUDA events for non-blocking step timing (avoids torch.cuda.synchronize
+    # in the hot path, which drains all pending CUDA work).
+    step_start_event = torch.cuda.Event(enable_timing=True)
+    step_end_event = torch.cuda.Event(enable_timing=True)
     for step in range(config.num_steps):
         # Update capture prefix per-step to match the ref's harness_dp format
         # (step_{step}.rank{rank}.mb0. for forward, step_{step}. for gradient).
@@ -1375,8 +1393,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             capture_prefix = f"{step_prefix}rank{rank}.mb0."
             grad_prefix = step_grad_prefix
 
-        torch.cuda.synchronize()
-        t0 = time.time()
+        step_start_event.record()
 
         # Zero gradients
         for buf in fp32_grad_bufs:
@@ -1424,6 +1441,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 capture_records, capture_prefix,
                 ce_w if use_mtp else 0.0,
             )
+
+            # Free the ForwardCache immediately to avoid accumulating
+            # ~24 GB of activation memory across microbatches (~96 GB for
+            # grad_accum=10 would OOM 80 GB H100).
+            del cache
 
             local_lm_sum += lm_sum.detach().double()
             local_lm_n += lm_n.detach().double()
@@ -1529,8 +1551,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         _sync_bf16_from_fp32(bf16_params, fp32_master)
 
         # ── Per-step logging ──────────────────────────────────────────
-        torch.cuda.synchronize()
-        step_time = time.time() - t0
+        step_end_event.record()
+        step_end_event.synchronize()
+        step_time = step_start_event.elapsed_time(step_end_event) / 1000.0
         total = reported_lm + ce_w * reported_mtp if use_mtp else reported_lm
         mfu = flops_per_step / (step_time * peak_total) * 100.0 if step_time > 0 else 0.0
         gn = grad_norm_val.item()

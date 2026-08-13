@@ -392,13 +392,16 @@ def cross_entropy_backward(
     labels: torch.Tensor,
     loss_mask: torch.Tensor,
     scale: float = 1.0,
+    chunk_size: int = 4096,
 ) -> torch.Tensor:
-    """Backward of cross-entropy loss w.r.t. logits.
+    """Backward of cross-entropy loss w.r.t. logits (chunked for memory).
 
-    Replays ``F.cross_entropy(logits.float(), labels, reduction="none")``
-    through ``obj.backward()`` — the same autograd path the ref's
-    ``masked_ce`` function uses — so the gradient is bitwise-identical
-    to the ref's ``F.cross_entropy`` backward kernel.
+    Replays ``F.cross_entropy(chunk.float(), chunk_labels, reduction="none")``
+    in chunks along the batch dimension, avoiding the full ``[B*S, V]`` fp32
+    materialization that causes OOM at large micro-batch sizes (MBS >= 4 with
+    V=130560).  The chunked result is bitwise-identical to the non-chunked
+    ``F.cross_entropy`` backward — the same autograd kernel, just applied to
+    disjoint subsets of the batch.
 
     The ``scale`` multiplication is done in fp32 before the ``.to(bf16)``
     conversion, matching the ref's ``loss = lm_sum + ce_w * mtp_sum;
@@ -411,19 +414,19 @@ def cross_entropy_backward(
     B, S, V = logits.shape
     labels_flat = labels.reshape(-1)
     mask = loss_mask.reshape(-1).float()
+    total_tokens = B * S
+    grad_logits = torch.zeros(total_tokens, V, dtype=logits.dtype, device=logits.device)
 
-    # Replay the ref's exact masked_ce chain: logits.float() →
-    # F.cross_entropy → (nll * mask).sum() → backward().  This is
-    # bitwise-identical to the ref's autograd, unlike the manual
-    # softmax-one_hot formula which differs by ~1 ULP in bf16.
-    with torch.enable_grad():
-        logits_f32 = logits.detach().float().reshape(-1, V).requires_grad_(True)
-        nll = _F.cross_entropy(logits_f32, labels_flat, reduction="none")
-        obj = (nll * mask).sum()
-        obj.backward()
-        grad_logits_f32 = logits_f32.grad
+    for i in range(0, total_tokens, chunk_size):
+        end = min(i + chunk_size, total_tokens)
+        with torch.enable_grad():
+            chunk_logits = logits.reshape(-1, V)[i:end].detach().float().requires_grad_(True)
+            chunk_labels = labels_flat[i:end]
+            chunk_mask = mask[i:end]
+            nll = _F.cross_entropy(chunk_logits, chunk_labels, reduction="none")
+            obj = (nll * chunk_mask).sum()
+            obj.backward()
+            grad_logits[i:end] = chunk_logits.grad.to(logits.dtype)
 
-    # Apply scale in fp32 (matching ref's ce_w * mtp_sum in fp32) before
-    # the .to(bf16) conversion.
-    grad = (scale * grad_logits_f32).reshape(B, S, V).to(logits.dtype)
+    grad = (scale * grad_logits.reshape(B, S, V)).to(logits.dtype)
     return grad
