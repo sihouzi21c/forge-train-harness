@@ -64,3 +64,39 @@ These changes are expected to enable the `multistep` (DP=2) gate to pass. The si
 ### Next step
 
 Sync to remote devspace and run `bin/harness run multistep` to verify multi-GPU bitwise alignment.
+
+## [stage1] Round 14 — 2026-08-13
+
+- **Verdict**: INCOMPLETE
+- **Stage status**: in-progress
+- **Milestone**: bitwise-multicard — in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent made several attempts to pass the `multistep` (DP=2, hash_capture_level=2) gate:
+
+1. **OffloadHasher deadlock**: The `evals.capture_offload.OffloadHasher` uses a pinned staging ring + CUDA copy stream that deadlocks under `CUDA_DEVICE_MAX_CONNECTIONS=1` in multi-GPU DP. Both ranks sleep on futex with 0% GPU utilization after step 2.
+
+2. **_SimpleHashPool deadlock**: A custom thread pool that does synchronous D2H on the main thread and offloads blake2b to a pool also deadlocks. The `t.cpu()` creates large CPU tensors (2GB for logits), causing D-state (uninterruptible sleep) on kernel brk and cascading into a futex deadlock.
+
+3. **Inline _hash_tensor deadlock**: The inline `_hash_tensor` (chunk-based D2H + blake2b on the main thread) also deadlocks for hash_capture_level >= 2. The D2H copies and blake2b computation on the same thread as the training loop cause memory pressure and futex contention.
+
+4. **Skip forward activation hash**: Skipping the forward activation hash (only capturing gradient hashes) allows the gate to run without deadlock, producing 8/8 steps of loss values.
+
+### Gate results (multistep, DP=2)
+
+- **Loss**: 3/8 steps bitwise match (steps 1-3 match, steps 4-8 diverge)
+- **Grad norm**: 2/8 steps bitwise match
+- **Hash**: 636/2512 equal (gradient hashes only, no forward activations)
+- **Root cause**: The static backward produces a 1-ULP difference in the gradients compared to the ref's autograd backward in multi-GPU mode. This small difference accumulates over optimizer steps, causing the loss to diverge from step 4 onwards. The single-GPU (`multistep-1gpu`) gate passes with 8/8 loss match, confirming the issue is specific to multi-GPU.
+
+### Hypothesis
+
+The 1-ULP gradient difference is caused by the manual backward ordering vs the autograd engine's topological sort. In single-GPU mode, the all-reduce is not involved, so the gradients are bitwise identical. In multi-GPU mode, the all-reduce sums the (already differing) gradients from both ranks, and the sum is then scaled by norm_factor. The 1-ULP difference is within fp32 machine epsilon.
+
+### Next step
+
+Need to investigate the root cause of the 1-ULP gradient difference in multi-GPU mode. Possible approaches:
+1. Match the backward pass order exactly to the autograd engine's topological sort
+2. Investigate if the `fp32_grad_bufs` order difference between ref and ours causes the NCCL all-reduce algorithm to diverge
