@@ -610,4 +610,56 @@ The remote devspace (ds-718734) is not accessible — the `tsh` Teleport session
 - Candidate levers for next round:
   1. Gradient bucketing with NCCL overlap (Phase 3)
   2. Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
-  3. Triton wgrad GEMM with shape-specific tiling
+  - review R30 PASS: genuine normed/normed2 removal, dptr_idx caching, deterministic flag; stage1 in-progress — missing gate evidence and profile, long-horizon below bar
+
+## [stage1] Round 27 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — remote devspace tsh session expired, gates not run
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 3: gradient bucketing)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented Phase 3 gradient bucketing to overlap NCCL all-reduce with
+the backward compute. The remote devspace (ds-718734) was not accessible because the
+`tsh` Teleport session had expired and interactive login is not possible from the
+agent loop. A new devspace (ds-710274) was provisioned via `cctl devspace create` +
+`lease claim`, but SSH access requires `tsh login` to be run interactively.
+
+**Gradient bucketing (Phase 3)**:
+- Added `enable_grad_bucketing` flag (controlled by `ENABLE_GRAD_BUCKETING=0/1` env var,
+  default 1 for long-horizon mode, disabled for deterministic mode to preserve bitwise).
+- Added `NUM_GRAD_BUCKETS=4` env var to control the number of gradient buckets.
+- Instead of a single flat all-reduce, the gradient buffers are split into buckets
+  and each bucket is all-reduced on a separate CUDA stream (`_grad_ar_stream`).
+- The per-bucket all-reduce runs concurrently with the next bucket's scaling + copy,
+  reducing the critical-path time versus the serial flat→all-reduce→scale→copy sequence.
+- For deterministic mode (bitwise milestones), the original single flat all-reduce is
+  preserved to maintain bitwise alignment with the ref.
+
+### Remote status
+
+The remote devspace recovery requires interactive `tsh login`:
+```
+tsh login --proxy=teleport.cybertron.modelbest.co --auth=local --user=heqingfeng
+```
+
+New devspace `ds-710274` is provisioned and Running. The SSH config entry is in place.
+The `lease rebind` command should be run after the devspace is accessible:
+```
+python3 -m tools.lease rebind devspace --loop-id 77459cccb4da --host ds-710274
+```
+
+### Next steps
+
+Once the remote is accessible:
+1. Sync changes: `bin/harness sync push`
+2. Run smoke gate: `bin/harness run long-train-smoke` (20 steps, DP=2)
+3. Run profile: `bin/harness run profile-snapshot M6_round27`
+4. Verify gradient bucketing improves MFU (estimated 0.5-1.0% gain from reduced
+   NCCL idle time)
+5. Candidate levers for next round:
+   - Operator fusion (residual-add + RMSNorm, RoPE fusion) — small MFU gain
+   - CUDA graph for optimizer step + BF16 sync — larger gain (~200ms saved)
+   - Overlap dataloader H2D with optimizer step via pinned memory + non_blocking

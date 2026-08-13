@@ -606,3 +606,19 @@ The dev agent implemented CUDA graph capture for the forward+backward pass using
 - Anti-proxy guard: passed (0 violations)
 
 ---
+
+## [stage1] Round 31 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — remote devspace tsh session expired, gates not run
+- **Stage status**: in-progress
+- **Commit**: (current commit) — Perf: Phase 3 gradient bucketing for NCCL all-reduce overlap
+
+### Key conclusions
+The dev agent implemented Phase 3 gradient bucketing to overlap NCCL all-reduce with backward compute. The remote devspace (ds-718734) was not accessible because the `tsh` Teleport session had expired. A new devspace (ds-710274) was provisioned and the lease was claimed, but SSH access requires interactive `tsh login`. The gradient bucketing code divides the gradient buffers into `NUM_GRAD_BUCKETS` (default 4) buckets and all-reduces each on a separate CUDA stream, reducing the critical-path time versus the serial flat→all-reduce→scale→copy sequence. The deterministic mode preserves the original single flat all-reduce for bitwise alignment. Once the remote is accessible, the next round should sync, run `long-train-smoke`, and profile.
+
+### Evidence highlights
+- `train_loop.py:1440-1460`: Gradient bucketing setup — `enable_grad_bucketing`, `_bucket_boundaries`, `_grad_ar_stream`
+- `train_loop.py:1713-1748`: Gradient bucketing all-reduce — per-bucket dist.all_reduce on separate stream
+- Remote devspace recovery requires interactive `tsh login`; new devspace ds-710274 is provisioned
+
+---

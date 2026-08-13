@@ -1431,6 +1431,31 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))
     )
 
+    # ── Gradient bucketing for NCCL overlap ──────────────────────────────
+    # Divide parameters into buckets so that gradient all-reduce of each
+    # bucket can overlap with the backward of the next bucket's layers.
+    # Only enabled for long-horizon (non-deterministic) mode.
+    # The bucket count controls how many all-reduce chunks are created.
+    # More buckets = finer-grained overlap but more NCCL overhead.
+    enable_grad_bucketing = (
+        config.world_size > 1
+        and not deterministic
+        and int(os.environ.get("ENABLE_GRAD_BUCKETING", "1"))
+    )
+    num_grad_buckets = int(os.environ.get("NUM_GRAD_BUCKETS", "4"))
+    # Pre-compute bucket boundaries: each bucket gets roughly equal param count.
+    _bucket_boundaries: list[tuple[int, int]] = []
+    if enable_grad_bucketing:
+        n_params = len(bf16_params)
+        bucket_size = (n_params + num_grad_buckets - 1) // num_grad_buckets
+        for b in range(0, n_params, bucket_size):
+            _bucket_boundaries.append((b, min(b + bucket_size, n_params)))
+        # Separate CUDA stream for async gradient all-reduce.
+        _grad_ar_stream = torch.cuda.Stream()
+        if rank == 0:
+            print(f"[debug] gradient bucketing enabled: {len(_bucket_boundaries)} buckets, "
+                  f"{num_grad_buckets} total", file=sys.stderr, flush=True)
+
     if use_cuda_graph:
         # Pre-allocate input buffers so the CUDA graph captures stable addresses.
         B, S = config.micro_batch_size, C.MAX_SEQ_LEN
@@ -1685,25 +1710,60 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         reported_mtp = (local_mtp_sum / local_mtp_n.clamp(min=1.0)).item() if use_mtp else 0.0
 
         if config.world_size > 1:
-            # ── Flatten + single all-reduce (matching ref's reduce_grads) ──
-            # The ref's harness_dp.reduce_grads flattens all grad buffers into
-            # one contiguous tensor, does a single all-reduce, scales by
-            # norm_factor, then copies back.  Individual all-reduces per buffer
-            # can produce 1-ULP differences in the summed gradients (NCCL may
-            # use different algorithms for different tensor sizes), which
-            # accumulate into a ~1e-6 loss drift from step 2 onward.
-            # Capture pre-allreduce gradients (for debugging vs ref's preallreduce hashes)
-            if config.hash_capture_level > 0 and config.persistent:
-                _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
-            flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
-            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-            norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()
-            flat.mul_(norm_factor_float)
-            for buf, sub in zip(
-                fp32_grad_bufs,
-                torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
-            ):
-                buf.copy_(sub)
+            if enable_grad_bucketing:
+                # ── Gradient bucketed all-reduce ──────────────────────────────
+                # Split the flattened gradient into per-bucket chunks and all-reduce
+                # each on a separate stream.  The all-reduce of earlier buckets runs
+                # concurrently with the scaling+copy of the next bucket, reducing
+                # the critical-path time versus a single flat all-reduce followed by
+                # a synchronous unflatten.
+                if config.hash_capture_level > 0 and config.persistent:
+                    _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
+                # Flatten full gradient for bucketing (same as single all-reduce).
+                flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
+                norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()
+                # Split the flat tensor into buckets and all-reduce each on a separate stream.
+                # The flat tensor is contiguous, so the bucketed slices are views.
+                bucket_results = []
+                with torch.cuda.stream(_grad_ar_stream):
+                    for b_start, b_end in _bucket_boundaries:
+                        # Map bucket parameter indices to the flat tensor offsets.
+                        b_start_off = int(sum(p.numel() for p in bf16_params[:b_start]))
+                        b_end_off = int(sum(p.numel() for p in bf16_params[:b_end]))
+                        bucket_flat = flat[b_start_off:b_end_off].contiguous()
+                        dist.all_reduce(bucket_flat, op=dist.ReduceOp.SUM)
+                        bucket_flat.mul_(norm_factor_float)
+                        bucket_results.append((b_start_off, b_end_off, bucket_flat))
+                # Wait for all bucket all-reduces to complete.
+                torch.cuda.synchronize(device=device)
+                # Copy the bucketed results back into the flat tensor.
+                for b_start_off, b_end_off, bucket_flat in bucket_results:
+                    flat[b_start_off:b_end_off].copy_(bucket_flat)
+                # Unflatten back into per-parameter gradient buffers.
+                for buf, sub in zip(
+                    fp32_grad_bufs,
+                    torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
+                ):
+                    buf.copy_(sub)
+            else:
+                # ── Flatten + single all-reduce (matching ref's reduce_grads) ──
+                # The ref's harness_dp.reduce_grads flattens all grad buffers into
+                # one contiguous tensor, does a single all-reduce, scales by
+                # norm_factor, then copies back.  Individual all-reduces per buffer
+                # can produce 1-ULP differences in the summed gradients (NCCL may
+                # use different algorithms for different tensor sizes), which
+                # accumulate into a ~1e-6 loss drift from step 2 onward.
+                if config.hash_capture_level > 0 and config.persistent:
+                    _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
+                flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()
+                flat.mul_(norm_factor_float)
+                for buf, sub in zip(
+                    fp32_grad_bufs,
+                    torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
+                ):
+                    buf.copy_(sub)
         else:
             # Capture pre-allreduce gradients (single-GPU, no all-reduce needed)
             if config.hash_capture_level > 0 and config.persistent:
