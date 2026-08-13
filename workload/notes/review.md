@@ -352,3 +352,26 @@ None.
 - Stage 1 finish conditions not satisfied: no `STAGE_STATUS: finished` in commit message, no harness-written gate evidence for the four required suites (long-train, resume-gate-20, resume-startup-90, perf-bitwise)
 
 ---
+
+## [stage1] Round 17 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 11816d4 — Fix: combine shared-param grad accum into single add_; match ref param order for clip_grad_norm_
+
+### Key conclusions
+The dev agent fixed two bugs causing the multistep (DP=2) gate to fail: (1) shared params accumulated two separate `add_` per microbatch instead of combining MTP+main contributions before a single `add_`, causing fp32 rounding differences; (2) `_collect_bf16_params` placed `output_weight` before `norm.weight` (wrong order vs ref's `model.parameters()`), causing `torch.linalg.vector_norm` order sensitivity in `clip_grad_norm_`. Gate results: 8/8 loss bitwise, 8/8 grad_norm bitwise, 5024/5024 hash match. Milestone: bitwise-multicard PASS.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:614-615`: Shared param accum variables (`dw_output_mtp_accum`, `dw_mtp_emb_accum`)
+- `train_loop.py:631-637`: output_weight MTP contribution deferred (not added to fp32_grad_bufs yet)
+- `train_loop.py:752-753`: tok_embeddings MTP contribution deferred
+- `train_loop.py:770-772`: output_weight MTP+main combined in fp32 before single add_
+- `train_loop.py:868-870`: tok_embeddings MTP+main combined in fp32 before single add_
+- `train_loop.py:1278-1282`: clip_grad_norm_ call with positional args matching ref
+- `train_loop.py:1386-1402`: _collect_bf16_params order matches ref's model.parameters() (tok_embeddings → layers → norm → output → mtp)
+- anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)
+- multistep gate: 8/8 loss, 8/8 grad_norm, 5024/5024 hash — all PASS
