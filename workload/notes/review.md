@@ -723,3 +723,22 @@ The dev agent identified that `CUDA_DEVICE_MAX_CONNECTIONS=1` (inherited from gl
 - `bin/harness run anti-proxy`: PASS (0 violations)
 
 ---
+
+## [stage1] Round 35 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: background dataloader prefetch)
+- **Commit**: 4be7e6a — Perf: Phase 1 — background dataloader prefetch (_BackgroundPrefetcher)
+
+### Key conclusions
+
+The dev agent implemented Phase 1 background dataloader prefetch via `_BackgroundPrefetcher`, a daemon-thread prefetcher with a bounded deque that hides the periodic shard refill latency of the external dataloader. The implementation is a genuine in-process optimization — no proxy, no shell-out to ref, no synthetic metrics, no hardcoded values. All changes are restricted to `train_loop.py`. Anti-proxy guard passed (0 violations). The remote devspace remains unreachable due to expired `tsh` session (no interactive terminal available for `tsh login`). Stage 1 cannot finish: no `STAGE_STATUS: finished` in commit, no gates run (devspace unreachable), no profile snapshot, MFU below the review-side throughput bar.
+
+### Evidence highlights
+
+- `train_loop.py:270-322`: `_BackgroundPrefetcher` class — daemon-thread prefetcher with bounded deque, `start()`/`stop()`/`get()` API
+- `train_loop.py:1435-1449`: Prefetcher started AFTER resume-skip to avoid iterator race; controlled by `ENABLE_DL_PREFETCH=1` env var
+- `train_loop.py:2015-2017`: Prefetcher stopped during teardown
+- `bin/harness run guard`: PASS (0 violations)
+- `bin/harness run anti-proxy`: PASS (0 violations)
