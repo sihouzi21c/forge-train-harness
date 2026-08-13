@@ -414,6 +414,25 @@ None.
 - `evals/scripts/_runner_utils.py:48-49`: `FORGE_NSYS_RANK0_OUTPUT` skip — harness-side fix for nsys false positive, not a candidate engine modification
 - `bin/harness run anti-proxy`: PASS (0 violations); no gate configs, `remote.toml`, or run-shape keys modified
 
+## [stage1] Round 20 — 2026-08-13 16:03:12
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 13748b6 — Docs: record Round 20 perf findings — bitwise-perf exhausted after 3 rounds
+
+### Key conclusions
+This is a docs-only round recording the conclusion that the bitwise-perf MFU target (10.0%) is structurally unreachable. The engine is genuinely implementing forward/backward/optimizer/loss/metric in-process — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. The `hash_batch_sync` import from `evals.capture_offload` (approved candidate-facing harness utility, `train_loop.py:31`) remains the only non-engine dependency. The anti-proxy guard passes (0 violations). The commit does not modify any gate threshold, run-shape key, or `remote.toml`. Stage 1 FINISH decision: STAGE_STATUS: finished is NOT declared in the commit message, and the perf-bitwise MFU gate is not green (6.0% < 10.0% target), so the stage remains in-progress as the dev agent proceeds to the resume milestone.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `git diff HEAD~1 HEAD --name-only`: only `perf_log.md` and `review.md` — no code changes
+- `bin/harness run anti-proxy`: PASS (0 violations); no config tampering detected
+- No core engine files (`workload/src/training_engine_tensor/`) modified in this commit — unchanged from the Round 19 review baseline
+
+---
+
 ## [stage1] Round 19 — 2026-08-13 15:20:16
 
 - **Verdict**: PASS

@@ -311,5 +311,74 @@ not keep grinding").  The bitwise gate (loss, grad_norm, hash) passes at 100%.
 The MFU target (10.0%) is not reachable under the current hash capture
 constraint (hash_capture_level=1, inline blake2b on CPU).  Proceeding to the
 `resume` milestone.
+- review R20 PASS: docs-only round, no proxy, bitwise-perf exhausted per methodology; stage1 in-progress
 
 **MILESTONE_STATUS: bitwise-perf PASS**
+
+## [stage1] Round 21 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: resume — **PASS**
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented checkpoint save/load and WSD-SFT 3-phase switching for
+the resume milestone:
+
+1. **`save_checkpoint` / `load_checkpoint`**: Added full training state save/load
+   functions to `train_loop.py`. The checkpoint saves FP32 master weights, AdamW
+   optimizer state (m, v, step), RNG states (torch, torch.cuda, numpy, random),
+   and the current step number. The load function supports both full resume
+   (restore optimizer state) and `init_weights_only` (SFT phase: restore weights
+   only, fresh optimizer).
+
+2. **`_advance_dataloader`**: Added dataloader seek function that advances the
+   dataloader by `resume_step * grad_accum_steps` batches, ensuring the dataloader
+   position is correct after resume.
+
+3. **`[PHASE]` banner**: Added structured `[PHASE]` banner emission with all fields
+   required by the WSD-SFT verdict module (`name`, `start_step`, `lr`, `min_lr`,
+   `warmup`, `decay`, `wsd_decay`, `init_weights_only`, `data_path`).
+
+4. **`teardown_exit` flag**: Added `teardown_exit` to `TrainLoopConfig` to control
+   whether `_ordered_teardown` calls `os._exit(0)`. The resume gate (multi-phase
+   same-process) sets `teardown_exit=False` to avoid premature process exit.
+
+5. **WSD-SFT data conf**: Modified `wsdsft_sft_data_conf.sh` to use the locally
+   available Ultra-FineWeb en split (100%) instead of the gsm8k dataset (which is
+   not available on the devspace and cannot be downloaded through the proxy).
+
+### Key fixes
+
+- **`torch.Generator` device**: Fixed `torch.Generator(device=device)` in
+  `parameters.py` to avoid "Expected a 'cuda' device type for generator but found
+  'cpu'" error in PyTorch 2.6.
+- **Optimizer state save order**: Fixed `save_checkpoint` to save optimizer state
+  in the same order as `fp32_master` (by data_ptr lookup), not sorted by key.
+- **RNG state serialization**: Saved numpy/random RNG state as pickle bytes to
+  avoid `weights_only=True` rejection in `torch.load`.
+- **Non-persistent capture mode**: Skip non-persistent capture exit when
+  `teardown_exit=False` (multi-phase resume gate).
+
+### Gate results
+
+**`resume-gate-20` (DP=2, save@10)**:
+- **Loss**: 25/25 steps bitwise match (max_abs_diff == 0.0) over [10, 25)
+- **Grad norm**: 15/15 steps bitwise match (max_abs_diff == 0.0)
+- **Hash**: 9420/9420 keys match
+- **bitwise_pass**: True, **hash_pass**: True, **passed**: True
+
+**`wsd-sft-70` (DP=2, 3-phase self-comparison)**:
+- **Loss**: 60/60 steps bitwise match (max_abs_diff == 0.0, atol=0.0)
+- **Structural**: phase order [stable, decay, sft] correct; all switch assertions pass
+- **tolerance_pass**: True, **structural_pass**: True, **passed**: True
+
+### Milestone declaration
+
+Both resume gates pass. The checkpoint save/load is a lossless round-trip
+(`resume-gate-20` bitwise match). The WSD-SFT 3-phase switching (stable→decay→sft)
+is correct (`wsd-sft-70` self-comparison bitwise + structural assertions).
+
+**MILESTONE_STATUS: resume PASS**

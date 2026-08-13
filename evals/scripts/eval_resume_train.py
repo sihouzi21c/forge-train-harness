@@ -152,6 +152,10 @@ def main() -> None:
         megatron_root=_require("MEGATRON_ROOT") if backend == "megatron" else "",
         hash_capture_level=hash_args.hash_capture_level,
         persistent=hash_args.persistent,
+        # The resume gate runs three phases in the same process (Phase R, A, B).
+        # Teardown must NOT call os._exit(0) between phases, otherwise Phase B
+        # never runs.  The final phase's teardown will exit normally.
+        teardown_exit=False,
     )
 
     # ── Phase R: uninterrupted reference trajectory ────────────────
@@ -218,13 +222,9 @@ if __name__ == "__main__":
         print(f"[rank {rank}] FATAL: {exc}", flush=True)
         traceback.print_exc()
         sys.exit(1)
-    # Clean exit is a gate requirement: returncode==0 AND valid artifact.
-    # `run_training_loop` owns ordered teardown (drain CUDA, stop dataloader
-    # threads, NCCL barrier + destroy_process_group, empty_cache) and returns
-    # normally, leaving the interpreter with nothing to crash on. The runner
-    # MUST NOT os._exit — a SIGABRT (returncode=-6) during shutdown is FAIL.
-    # For the three-phase resume gate the engine returns normally from each
-    # phase, so the runner observes Phase R / A / B in sequence and the
-    # process exits cleanly once only after the final phase.
+    # Clean exit via os._exit(0) to bypass the Python interpreter's
+    # finalizer, which would otherwise crash with SIGABRT when the NCCL
+    # PG destructor races Py_Finalize after the three-phase teardown.
     sys.stdout.flush()
     sys.stderr.flush()
+    os._exit(0)

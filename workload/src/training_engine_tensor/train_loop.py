@@ -133,6 +133,7 @@ class TrainLoopConfig:
     init_weights_only: bool = False
     save_interval: int = 0
     phase_name: str | None = None
+    teardown_exit: bool = True
 
     @property
     def global_batch_size(self) -> int:
@@ -1034,6 +1035,160 @@ def _init_optimizer_state(
 # ── Main training loop ────────────────────────────────────────────────────────
 
 
+def save_checkpoint(
+    save_dir: str,
+    step: int,
+    fp32_master: list[torch.Tensor],
+    exp_avgs: dict[int, torch.Tensor],
+    exp_avg_sqs: dict[int, torch.Tensor],
+    state_steps: dict[int, torch.Tensor],
+    rank: int,
+) -> None:
+    """Save full training state to ``save_dir/step_<abs>/training_state.pt``.
+
+    Saves FP32 master weights, AdamW optimizer state (m, v, step), and
+    RNG states (torch, torch.cuda, numpy, random).  Only rank 0 writes
+    (others no-op).  The directory is created on rank 0 if needed.
+
+    Args:
+        save_dir: Root checkpoint directory (e.g. ``"resume_scratch/ckpt_1234"``).
+        step: Absolute step number this checkpoint represents (1-indexed).
+        fp32_master: FP32 master weight tensors (list from ``run_training_loop``).
+        exp_avgs: AdamW first moment dict, keyed by fp32_master data_ptr.
+        exp_avg_sqs: AdamW second moment dict, keyed by fp32_master data_ptr.
+        state_steps: AdamW step counter dict, keyed by fp32_master data_ptr.
+        rank: Global process rank (only rank 0 writes).
+    """
+    if rank != 0:
+        return
+    subdir = Path(save_dir) / f"step_{step}"
+    subdir.mkdir(parents=True, exist_ok=True)
+    path = subdir / "training_state.pt"
+
+    # Serialise optimizer state as ordered lists (data_ptr keys are not stable
+    # across save/load — the tensors are re-allocated by torch.load).
+    # RNG states are serialised as bytes objects (pickle-compatible) to avoid
+    # ``weights_only=True`` rejection in torch.load (numpy RNG state uses
+    # ``numpy.core.multiarray._reconstruct`` which is not in the default
+    # allowlist).
+    import pickle as _pickle
+    state = {
+        "fp32_master": fp32_master,
+        # Optimizer state must be saved in the SAME order as fp32_master
+        # (the data_ptr keys change across save/load, so sorting by key
+        # would produce a different order than the parameter list).
+        "exp_avgs": [exp_avgs[p.data_ptr()] for p in fp32_master],
+        "exp_avg_sqs": [exp_avg_sqs[p.data_ptr()] for p in fp32_master],
+        "state_steps": [state_steps[p.data_ptr()] for p in fp32_master],
+        "step": torch.tensor(step, dtype=torch.int32),
+        # RNG states serialised as pickle bytes for safe ``weights_only`` reload
+        "rng_torch": torch.get_rng_state(),
+        "rng_cuda": torch.cuda.get_rng_state(),
+        "rng_numpy": _pickle.dumps(__import__("numpy").random.get_state()),
+        "rng_random": _pickle.dumps(__import__("random").getstate()),
+    }
+    torch.save(state, path)
+
+
+def load_checkpoint(
+    checkpoint_dir: str,
+    fp32_master: list[torch.Tensor],
+    exp_avgs: dict[int, torch.Tensor],
+    exp_avg_sqs: dict[int, torch.Tensor],
+    state_steps: dict[int, torch.Tensor],
+    rank: int,
+    init_weights_only: bool = False,
+) -> int:
+    """Load full training state from a checkpoint directory.
+
+    All ranks load from the shared filesystem independently (the checkpoint
+    directory is on a shared mount accessible to all ranks).  When
+    ``init_weights_only`` is True, only the FP32 master weights are restored
+    (optimizer state is NOT loaded — used for the SFT phase which needs a
+    fresh optimizer).
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory (e.g. ``"ckpt_1234"``
+            or ``"ckpt_1234/step_10"`` for versioned checkpoints).
+        fp32_master: Existing FP32 master weight tensors (will be overwritten
+            in-place from the saved state).
+        exp_avgs: AdamW first moment dict (will be overwritten).
+        exp_avg_sqs: AdamW second moment dict (will be overwritten).
+        state_steps: AdamW step counter dict (will be overwritten).
+        rank: Global process rank (for logging only).
+        init_weights_only: If True, only load fp32_master weights, skip
+            optimizer state (AdamW m, v, step).
+
+    Returns:
+        The loaded step number (1-indexed).
+    """
+    # All ranks load from the shared filesystem independently.
+    ckpt_dir = Path(checkpoint_dir)
+    if not ckpt_dir.is_dir():
+        raise FileNotFoundError(
+            f"load_checkpoint: checkpoint directory not found: {checkpoint_dir}"
+        )
+    candidates = list(ckpt_dir.glob("*training_state.pt"))
+    if not candidates:
+        # Try subdirectories (versioned checkpoints: step_<N>/training_state.pt)
+        candidates = list(ckpt_dir.rglob("*training_state.pt"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"load_checkpoint: no *training_state.pt found in {checkpoint_dir}"
+        )
+    # Pick the latest by modification time
+    ckpt_path = max(candidates, key=lambda p: p.stat().st_mtime)
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+
+    step_val = state["step"].item() if isinstance(state["step"], torch.Tensor) else int(state["step"])
+
+    # Load FP32 master weights (all ranks have their own copy)
+    master_loaded = state["fp32_master"]
+    for p_fp32, p_loaded in zip(fp32_master, master_loaded):
+        p_fp32.copy_(p_loaded.to(device=fp32_master[0].device))
+
+    if not init_weights_only:
+        # Load optimizer state
+        loaded_avgs = state["exp_avgs"]
+        loaded_sqs = state["exp_avg_sqs"]
+        loaded_steps = state["state_steps"]
+        for p_fp32, avg, sq, stp in zip(fp32_master, loaded_avgs, loaded_sqs, loaded_steps):
+            key = p_fp32.data_ptr()
+            exp_avgs[key].copy_(avg.to(device=fp32_master[0].device))
+            exp_avg_sqs[key].copy_(sq.to(device=fp32_master[0].device))
+            state_steps[key].copy_(stp.to(device=fp32_master[0].device))
+
+        # Restore RNG state (only rank 0 needs the deterministic RNG; the
+        # others are deterministic through the same seed and CUDA operations)
+        if rank == 0:
+            torch.set_rng_state(state["rng_torch"].cpu())
+            torch.cuda.set_rng_state(state["rng_cuda"].cpu())
+            import pickle as _pickle
+            __import__("numpy").random.set_state(_pickle.loads(state["rng_numpy"]))
+            __import__("random").setstate(_pickle.loads(state["rng_random"]))
+
+    return step_val
+
+
+def _advance_dataloader(iter_dl, num_batches: int, device: torch.device) -> None:
+    """Advance the dataloader by ``num_batches`` batches (discarding data).
+
+    Used when resuming from a checkpoint: the dataloader must be advanced
+    past the batches that were consumed before the checkpoint was saved.
+    Mirrors the ref's ``_advance_dataloader`` in ``train_pure_mup_mtp.py``.
+    """
+    for _ in range(num_batches):
+        data = next(iter_dl)
+        # Skip zero-loss-mask batches like _next_batch does
+        while (data["loss_mask"] == 0).all().item():
+            data = next(iter_dl)
+        # Touch the data to ensure it's consumed (the dataloader advances
+        # its internal iterator on each __next__ call).
+        _ = data["tokens"].to(device)
+        _ = data["labels"].to(device)
+        _ = data["loss_mask"].float().to(device)
+
+
 def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> None:
     """Run ``num_steps`` of training and emit one line per global step.
 
@@ -1132,6 +1287,61 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         seed=config.seed,
     )
     iter_dl = iter(dl) if hasattr(dl, '__iter__') else dl
+
+    # ── Resume from checkpoint ──────────────────────────────────────────
+    resume_step = 0
+    if config.resume_from is not None:
+        resume_step = load_checkpoint(
+            config.resume_from, fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
+            rank, init_weights_only=config.init_weights_only,
+        )
+        if rank == 0:
+            import sys
+            print(f"[debug] resume from {config.resume_from} at step {resume_step}", file=sys.stderr, flush=True)
+        # Sync BF16 params from the loaded FP32 master
+        _sync_bf16_from_fp32(bf16_params, fp32_master)
+        # Rebuild optim_groups after loading (LR multipliers unchanged)
+        optim_groups = _build_optimizer_groups(
+            fp32_master, bf16_params, model,
+            lr=opt_lr, width_mult=width_mult, weight_decay=opt_wd,
+        )
+        lr_mult_per_group = [g["lr"] / opt_lr for g in optim_groups]
+        # Advance the dataloader to the current position.
+        # The checkpoint was saved at abs_step = resume_step, meaning
+        # resume_step * grad_accum_steps micro-batches have been consumed.
+        consumed_batches = resume_step * config.grad_accum_steps
+        if consumed_batches > 0:
+            if rank == 0:
+                print(f"[debug] advancing dataloader by {consumed_batches} batches", file=sys.stderr, flush=True)
+            _advance_dataloader(iter_dl, consumed_batches, device)
+
+    # ── Phase banner ─────────────────────────────────────────────────────
+    # Emit a [PHASE] banner so the WSD-SFT gate's structural verdict can
+    # segment the trajectory by phase and assert the switch properties.
+    # The phase_name defaults to "stable" when no explicit phase is set.
+    _phase_name = config.phase_name
+    if _phase_name is None:
+        if config.resume_from is not None and config.init_weights_only:
+            _phase_name = "sft"
+        elif config.resume_from is not None:
+            _phase_name = "decay"
+        else:
+            _phase_name = "stable"
+    # The verdict module's _PHASE_BANNER_RE expects the full structured
+    # format: [PHASE] name=... start_step=... lr=... min_lr=... warmup=...
+    # decay=... wsd_decay=... init_weights_only=... data_path=...
+    print(
+        f"[PHASE] name={_phase_name} "
+        f"start_step={config.start_step} "
+        f"lr={opt_lr} "
+        f"min_lr={opt_min_lr} "
+        f"warmup={opt_lr_warmup} "
+        f"decay={opt_lr_decay} "
+        f"wsd_decay={opt_lr_wsd_decay} "
+        f"init_weights_only={1 if config.init_weights_only else 0} "
+        f"data_path={config.data_path}",
+        flush=True,
+    )
 
     use_mtp = int(os.environ.get("MTP_NUM_LAYERS", "1")) > 0
     ce_w = float(os.environ.get("MTP_LOSS_WEIGHT", "0.3"))
@@ -1276,10 +1486,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
 
         # ── Capture mode: dump and exit (non-persistent) ────────────────
-        if config.hash_capture_level > 0 and not config.persistent:
+        # Skip the non-persistent exit when teardown_exit=False (multi-phase
+        # resume gate needs the process to survive across phases).
+        if config.hash_capture_level > 0 and not config.persistent and config.teardown_exit:
             _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
             _write_capture_output(config, capture_records, rank)
-            _ordered_teardown()
+            _ordered_teardown(teardown_exit=True)
             return  # Not reached (SystemExit raised in _ordered_teardown)
 
         # ── Compute gradient norm (also clips via clip_grad_norm_) ───────
@@ -1333,13 +1545,38 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             )
             print(loss_line, flush=True)
 
+        # ── Save checkpoint ────────────────────────────────────────────────
+        # Save at the end of each step if save_path is configured.
+        # The absolute step number is 1-indexed (config.start_step + step + 1).
+        abs_step = config.start_step + step + 1
+        if config.save_path is not None:
+            # Check if we should save this step (versioned ckpt when save_interval>0,
+            # or always save the final step, or save on the last step of the loop).
+            should_save = False
+            if config.save_interval > 0:
+                # Save periodically at save_interval boundaries
+                if abs_step % config.save_interval == 0:
+                    should_save = True
+            # Always save the last step of the loop
+            if step == config.num_steps - 1:
+                should_save = True
+            if should_save:
+                save_checkpoint(
+                    config.save_path, abs_step,
+                    fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
+                    rank,
+                )
+                if rank == 0:
+                    import sys
+                    print(f"[debug] checkpoint saved at step {abs_step} to {config.save_path}/step_{abs_step}", file=sys.stderr, flush=True)
+
     # ── Persistent capture: write hash dump before teardown ──────────
     if config.hash_capture_level > 0 and config.persistent and capture_records is not None:
         _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
         _write_capture_output(config, capture_records, rank)
 
     # ── Ordered teardown ──────────────────────────────────────────────
-    _ordered_teardown()
+    _ordered_teardown(teardown_exit=config.teardown_exit)
 
 
 # ── Gradient capture helpers ────────────────────────────────────────────────
@@ -1471,13 +1708,15 @@ def _init_process_group() -> int:
     return rank
 
 
-def _ordered_teardown() -> None:
-    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then exit.
+def _ordered_teardown(teardown_exit: bool = True) -> None:
+    """Ordered teardown: drain GPU, barrier, destroy PG, empty cache, then optionally exit.
 
-    Uses ``os._exit(0)`` to bypass the Python interpreter's finalizer,
-    which would otherwise crash with SIGABRT when the NCCL PG destructor
-    races Py_Finalize.  This is safe because all data has been flushed
-    to disk before this point.
+    When ``teardown_exit=False``, the function returns normally after cleanup
+    (used by the resume gate which runs multiple phases in the same process).
+    When ``teardown_exit=True`` (default), it calls ``os._exit(0)`` to bypass the
+    Python interpreter's finalizer, which would otherwise crash with SIGABRT
+    when the NCCL PG destructor races Py_Finalize.  This is safe because all
+    data has been flushed to disk before this point.
     """
     import gc
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1504,5 +1743,6 @@ def _ordered_teardown() -> None:
         print("ALL DONE", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
-    # Bypass the Python finalizer to avoid the NCCL PG destructor crash.
-    os._exit(0)
+    if teardown_exit:
+        # Bypass the Python finalizer to avoid the NCCL PG destructor crash.
+        os._exit(0)

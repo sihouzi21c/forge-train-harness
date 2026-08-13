@@ -193,7 +193,7 @@ def load_weights_from_checkpoint(
         # ref: matrix weights (qkv, fc1, eagle_fc) → N(0, init_std/sqrt(width_mult))
         #      embedding / output_layer / wo / w2 → N(0, init_std)
         #      1-D / norm weight → 1.0 if init_ones else 0.97
-        _rng = torch.Generator().manual_seed(seed)
+        _rng = torch.Generator(device=device).manual_seed(seed)
         width_mult = HIDDEN_SIZE / mup_base_hidden_size
         scaled_std = init_std / math.sqrt(width_mult)
         all_params = []
