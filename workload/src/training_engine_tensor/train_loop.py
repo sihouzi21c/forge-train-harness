@@ -1342,7 +1342,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     depth_scale_main, depth_scale_mtp,
                     capture_records if config.hash_capture_level >= 2 else None,
                     capture_prefix,
-                    pool=pool,
+                    pool=hash_pool,
                 )
                 lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
                 mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, mtp_lab, mtp_mask)
@@ -1356,7 +1356,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     depth_scale_main, depth_scale_mtp,
                     capture_records if config.hash_capture_level >= 2 else None,
                     capture_prefix,
-                    pool=pool,
+                    pool=hash_pool,
                 )
                 lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
 
