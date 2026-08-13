@@ -826,3 +826,44 @@ Once the remote is accessible:
    - Operator fusion (residual-add + RMSNorm, RoPE fusion)
    - ZeRO-1 distributed optimizer (~20% MFU from reduced optimizer HBM traffic)
    - CUDA graph for optimizer step + BF16 sync
+- review R34 PASS: genuine in-process CUDA optimization, no proxy; MFU below review-side bar, continue optimization
+
+## [stage1] Round 35 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: background dataloader prefetch)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented Phase 1 background dataloader prefetch via `_BackgroundPrefetcher`, a daemon-thread prefetcher with a bounded deque that hides the periodic shard refill latency of the external dataloader. The remote devspace remains unreachable (tsh session expired, requires interactive login), so no GPU gates were run.
+
+**Background dataloader prefetch (`_BackgroundPrefetcher`)**:
+- Spawns a daemon thread that continuously calls `next(dl)` on the dataloader and stores the result in a bounded `deque` (max_size=2).
+- The main thread reads from the deque via `prefetcher.get()`, which never blocks on the dataloader's shard refill (which can take seconds on the first call or during phase transitions).
+- Controlled by `ENABLE_DL_PREFETCH=1` env var (default 1 for long-horizon).
+- Started AFTER the `_advance_dataloader` resume-skip to avoid a race on the shared iterator.
+- Stopped during teardown to avoid a dangling thread.
+
+### Remote status
+
+The remote devspace (ds-710274, ds-718734) is still not accessible because the `tsh` Teleport session has expired and `tsh login` requires an interactive terminal. The user needs to run `tsh login --proxy=teleport.cybertron.modelbest.co:443` interactively to restore SSH access.
+
+Attempted remedies (all failed):
+- `tsh login --auth=local` — requires a terminal for password input
+- `tsh login --auth=feilian` — requires a browser for SSO flow
+- `cctl devspace create --expose-port 22` — new devspace 719369 is Queued but never transitions to Running (likely quota exhaustion from 5+ leaked devspaces)
+- `cctl job create` — batch job 719388 is also Queued
+
+### Next steps
+
+Once the remote is accessible:
+1. Sync changes: `bin/harness sync push`
+2. Run smoke gate: `bin/harness run long-train-smoke` (20 steps, DP=2) — this is the FIRST time all Phase 3 optimizations (gradient bucketing + async H2D + CUDA_DEVICE_MAX_CONNECTIONS=1 + pin_memory) will be tested together
+3. Run profile: `bin/harness run profile-snapshot M6_round35`
+4. Run regression: `bin/harness run resume-gate-20`
+5. Candidate levers:
+   - Operator fusion (residual-add + RMSNorm, RoPE fusion) — small MFU gain
+   - ZeRO-1 distributed optimizer (~20% MFU from reduced optimizer HBM traffic)
+   - CUDA graph for optimizer step + BF16 sync

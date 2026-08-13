@@ -21,7 +21,9 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -262,6 +264,63 @@ def _pairwise(items):
     for i in range(0, len(items), 2):
         if i + 1 < len(items):
             yield float(items[i]), items[i + 1]
+
+
+class _BackgroundPrefetcher:
+    """Background-thread dataloader prefetcher with a bounded queue.
+
+    Calls ``_next_batch(dl, "cpu")`` on a daemon background thread and stores
+    the results in a bounded ``deque``.  The main thread calls ``get()`` to
+    retrieve the next batch without blocking on the dataloader's shard refill
+    (which can take seconds on the first call).  The queue depth is controlled
+    by ``max_size`` (default 2 — one currently in use, one prefetched).
+
+    The background thread is started by ``start()`` and must be stopped by
+    ``stop()`` during teardown to avoid a dangling thread.
+
+    This is orthogonal to the async H2D double buffering: this prefetcher
+    hides the CPU-side dataloader latency, while the H2D double buffering
+    (``non_blocking=True`` copies) hides the GPU-side H2D transfer latency.
+    """
+
+    def __init__(self, dl, max_size: int = 2):
+        self._dl = dl
+        self._queue: deque = deque()
+        self._max_size = max_size
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="dl-prefetcher")
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._running = False
+            self._not_empty.notify_all()
+
+    def get(self):
+        """Get the next batch.  Blocks until one is available."""
+        with self._not_empty:
+            while len(self._queue) == 0:
+                self._not_empty.wait()
+            return self._queue.popleft()
+
+    def _run(self):
+        while True:
+            batch = _next_batch(self._dl, "cpu")
+            with self._lock:
+                if not self._running:
+                    return
+                # Block if the queue is full — the main thread must consume
+                # before we can prefetch more.
+                while len(self._queue) >= self._max_size:
+                    self._not_empty.wait(0.1)
+                    if not self._running:
+                        return
+                self._queue.append(batch)
+                self._not_empty.notify()
 
 
 def _next_batch(dl, device):
@@ -1371,6 +1430,21 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 print(f"[debug] advancing dataloader by {consumed_batches} batches", file=sys.stderr, flush=True)
             _advance_dataloader(iter_dl, consumed_batches, device)
 
+    # ── Background dataloader prefetcher (started AFTER resume-skip) ────
+    # Hides periodic shard refill latency by running next(dl) on a daemon
+    # thread.  Must be started after _advance_dataloader (which reads from
+    # iter_dl directly) to avoid a race on the shared iterator.
+    dl_prefetcher: _BackgroundPrefetcher | None = None
+    if int(os.environ.get("ENABLE_DL_PREFETCH", "1")):
+        dl_prefetcher = _BackgroundPrefetcher(iter_dl, max_size=2)
+        dl_prefetcher.start()
+        if rank == 0:
+            print("[debug] dataloader prefetcher started", file=sys.stderr, flush=True)
+
+    # Helper: use the prefetcher if available, otherwise fall back to _next_batch.
+    _get_batch_cpu = (dl_prefetcher.get if dl_prefetcher
+                      else lambda: _next_batch(iter_dl, "cpu"))
+
     # ── Phase banner ─────────────────────────────────────────────────────
     # Emit a [PHASE] banner so the WSD-SFT gate's structural verdict can
     # segment the trajectory by phase and assert the switch properties.
@@ -1488,7 +1562,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # Warmup: run one microbatch to trigger CUDA autotuning and allocate
         # all intermediate tensors (so the graph capture has stable addresses).
         # Use CPU tensors with non_blocking H2D to match the async hot path.
-        warmup_ids, warmup_lab, warmup_mask = _next_batch(iter_dl, "cpu")
+        warmup_ids, warmup_lab, warmup_mask = _get_batch_cpu()
         # The data is already on CPU, so no sync needed before the H2D copy.
         input_ids_buf.copy_(warmup_ids, non_blocking=True)
         labels_buf.copy_(warmup_lab, non_blocking=True)
@@ -1639,7 +1713,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # during the current microbatch's graph replay, so the H2D transfer
             # overlaps with GPU compute instead of blocking the CPU.
             # Pre-fetch the first microbatch as CPU tensors, then start H2D.
-            _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
+            _prefetch_ids, _prefetch_lab, _prefetch_mask = _get_batch_cpu()
             for _mb in range(config.grad_accum_steps):
                 # Start H2D for this microbatch (async, non-blocking for CPU).
                 input_ids_buf.copy_(_prefetch_ids, non_blocking=True)
@@ -1660,7 +1734,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # copy_(..., non_blocking=True) will start the H2D that overlaps
                 # with the current graph replay's tail on the GPU.
                 if _mb < config.grad_accum_steps - 1:
-                    _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
+                    _prefetch_ids, _prefetch_lab, _prefetch_mask = _get_batch_cpu()
 
                 # Read the updated loss values from the captured tensor addresses.
                 local_lm_sum += _cached_lm_sum.detach().double()
@@ -1679,7 +1753,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 _eager_mtp_in = torch.empty(B, S, dtype=torch.long, device=device)
                 _eager_mtp_lab = torch.empty(B, S, dtype=torch.long, device=device)
                 _eager_mtp_mask = torch.empty(B, S, dtype=torch.float32, device=device)
-            _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
+            _prefetch_ids, _prefetch_lab, _prefetch_mask = _get_batch_cpu()
             for _mb in range(config.grad_accum_steps):
                 # Start H2D for this microbatch (async, non-blocking for CPU).
                 _eager_ids.copy_(_prefetch_ids, non_blocking=True)
@@ -1737,7 +1811,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # copy_(..., non_blocking=True) will start the H2D that overlaps
                 # with the current backward's tail on the GPU.
                 if _mb < config.grad_accum_steps - 1:
-                    _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
+                    _prefetch_ids, _prefetch_lab, _prefetch_mask = _get_batch_cpu()
 
             # ── Post-accumulation: all-reduce ──────────────────────────────
         # NOTE: no torch.cuda.synchronize() needed here — the backward pass
@@ -1935,6 +2009,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     if config.hash_capture_level > 0 and config.persistent and capture_records is not None:
         _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
         _write_capture_output(config, capture_records, rank)
+
+    # ── Stop the dataloader prefetcher ────────────────────────────────
+    if dl_prefetcher is not None:
+        dl_prefetcher.stop()
 
     # ── Ordered teardown ──────────────────────────────────────────────
     _ordered_teardown(teardown_exit=config.teardown_exit)

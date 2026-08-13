@@ -705,3 +705,21 @@ The dev agent identified and fixed a critical env-var issue: `CUDA_DEVICE_MAX_CO
 - `workload/src/config/long-train.toml`, `long-train-smoke.toml`, `loss-gate-200.toml`, `ours/profile-snapshot@long-horizon.toml`: `CUDA_DEVICE_MAX_CONNECTIONS` removed from rendered products
 - `bin/harness run guard`: PASS (0 violations)
 - `bin/harness run anti-proxy`: PASS (0 violations)
+
+---
+
+## [stage1] Round 34 — 2026-08-14  (review agent)
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 2a597dc — Fix: CUDA_DEVICE_MAX_CONNECTIONS=1 silently disables async H2D + gradient bucketing
+
+### Key conclusions
+The dev agent identified that `CUDA_DEVICE_MAX_CONNECTIONS=1` (inherited from global `[env]`) was silently serializing all CUDA operations, making the async H2D double buffering and gradient bucketing from Rounds 32-33 effectively blocking. The fix removes this env var from the ours-side long-horizon configs and adds `pin_memory()` to CPU tensors in `_next_batch` so `non_blocking=True` copies are truly asynchronous. All changes are genuine in-process CUDA optimizations — no proxy, no shell-out to ref, no synthetic metrics, no hardcoded values. Anti-proxy guard passed (0 violations). Stage 1 cannot finish: no `STAGE_STATUS: finished` in commit, no gates run (devspace unreachable), no profile snapshot, MFU below the review-side throughput bar.
+
+### Evidence highlights
+- `train_loop.py:287-294`: `pin_memory()` for CPU tensors ensures `non_blocking=True` copies are truly async
+- `config/eval/dense_training/gate_config/long-train.toml:37`: `cuda_device_max_connections = "@unset"` — removes the serialization bottleneck
+- `bin/harness run anti-proxy`: PASS (0 violations)
+
+---
