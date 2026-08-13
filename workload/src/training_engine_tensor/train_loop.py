@@ -1194,6 +1194,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             local_lm_n += lm_n.detach().double()
 
             # ── Post-accumulation: all-reduce ──────────────────────────────
+        # Synchronize before all-reduce to ensure all backward CUDA ops are
+        # complete, avoiding any NCCL race with the default stream.
+        torch.cuda.synchronize()
         if config.world_size > 1:
             if use_mtp:
                 # Match the ref's reduce_loss_scalar: concatenate all scalars
