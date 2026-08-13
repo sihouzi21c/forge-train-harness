@@ -17,7 +17,6 @@ scheduled — the reverse computation graph is unrolled manually.
 
 from __future__ import annotations
 
-import concurrent.futures
 import hashlib
 import json
 import os
@@ -53,125 +52,6 @@ from training_engine_tensor.forward import (
     rms_norm,
 )
 
-# ── CPU-only hash pool (replaces evals.capture_offload) ──────────────────
-# The bitwise-multicard constraint requires:
-#   (a) worker threads never touch CUDA (CUDA_DEVICE_MAX_CONNECTIONS=1)
-#   (b) never block on capture backpressure before a collective
-#   (c) use pageable (not pinned) host snapshots
-# The pinned staging ring + CUDA copy stream in evals.capture_offload violates (c)
-# and (a) under multi-GPU DP.  This simple pool does synchronous D2H on
-# the main thread and offloads only the blake2b CPU computation.
-
-
-class _SimpleHashPool:
-    """Thread-pool for blake2b hashing of CPU tensors.
-
-    ``enqueue(tensor)`` does a synchronous D2H copy on the calling
-    (training) thread, then submits the blake2b to the pool.  Worker
-    threads never touch CUDA.  Returns a ``Future`` — the caller must
-    call ``flush(wait=True)`` at the microbatch boundary to resolve
-    all pending hashes.
-    """
-
-    def __init__(self) -> None:
-        n_workers = min(16, max(4, (os.cpu_count() or 4)))
-        self._pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=n_workers, thread_name_prefix="hash-pool",
-        )
-        self._jobs: list[concurrent.futures.Future] = []
-
-    def enqueue(self, tensor: torch.Tensor) -> concurrent.futures.Future:
-        """Submit a tensor for hashing (D2H on caller, blake2b on pool).
-
-        Does a synchronous D2H copy on the calling thread, then submits
-        blake2b to the pool.  Returns a ``Future`` whose ``.result()``
-        is the finished hash dict.  The caller must call ``flush()``
-        at the microbatch boundary to resolve all pending hashes.
-        """
-        t = tensor.detach().contiguous()
-        shape = list(t.shape)
-        dtype = str(t.dtype).removeprefix("torch.")
-        cpu_t = t.cpu()
-        fut = self._pool.submit(_hash_cpu_blake2b, cpu_t, shape, dtype)
-        self._jobs.append(fut)
-        return fut
-
-    def flush(self, *, wait: bool = False) -> None:
-        """Wait for all pending hash jobs."""
-        if not self._jobs:
-            return
-        jobs, self._jobs = self._jobs, []
-        if wait:
-            for f in jobs:
-                f.result()  # re-raises worker errors
-
-    def shutdown(self) -> None:
-        self._pool.shutdown(wait=True)
-
-
-def _resolve_futures_inplace(records: dict) -> None:
-    """Replace any pending ``Future`` objects in ``records`` with their result."""
-    for key, value in list(records.items()):
-        if isinstance(value, concurrent.futures.Future):
-            records[key] = value.result()
-
-    def flush(self, *, wait: bool = False) -> None:
-        """Wait for all pending hash jobs."""
-        if not self._jobs:
-            return
-        jobs, self._jobs = self._jobs, []
-        if wait:
-            for f in jobs:
-                f.result()  # re-raises worker errors
-
-    def shutdown(self) -> None:
-        self._pool.shutdown(wait=True)
-
-
-def _hash_cpu_blake2b(cpu_t: torch.Tensor, shape: list, dtype: str) -> dict:
-    """blake2b-128 of a host-resident tensor (CPU only, no CUDA)."""
-    h = hashlib.blake2b(digest_size=16)
-    if cpu_t.numel() > 0:
-        flat = cpu_t.reshape(-1)
-        for chunk in flat.split(8_000_000):
-            byte_view = chunk if chunk.dtype == torch.uint8 else chunk.view(torch.uint8)
-            h.update(byte_view.numpy())
-    return {"hash": h.hexdigest(), "shape": shape, "dtype": dtype}
-
-
-def _hash_batch_cpu(items: list[tuple[str, torch.Tensor]]) -> list[tuple[str, dict]]:
-    """Hash a batch of tensors on the training thread (sync D2H + pool blake2b).
-
-    Used for gradient captures: does the D2H copy on the caller (training)
-    thread, then submits blake2b to the pool.  Returns finished results.
-    """
-    pool = _get_global_hash_pool()
-    results: list[tuple[str, dict]] = []
-    for key, t in items:
-        cpu_t = t.detach().contiguous().cpu()
-        shape = list(t.shape)
-        dtype = str(t.dtype).removeprefix("torch.")
-        results.append(
-            (key, pool._pool.submit(_hash_cpu_blake2b, cpu_t, shape, dtype).result())
-        )
-    return results
-
-
-_HASH_POOL: _SimpleHashPool | None = None
-
-
-def _get_global_hash_pool() -> _SimpleHashPool:
-    global _HASH_POOL
-    if _HASH_POOL is None:
-        _HASH_POOL = _SimpleHashPool()
-    return _HASH_POOL
-
-
-def _shutdown_global_hash_pool() -> None:
-    global _HASH_POOL
-    if _HASH_POOL is not None:
-        _HASH_POOL.shutdown()
-        _HASH_POOL = None
 from training_engine_tensor.parameters import (
     ModelParameters,
     load_weights_from_checkpoint,
@@ -200,18 +80,10 @@ def _hash_tensor(t: torch.Tensor) -> dict:
 
 
 def _capture_forward(records: dict, prefix: str, fqn: str, call_idx: int,
-                     tensor: torch.Tensor, pool: _SimpleHashPool | None = None) -> None:
-    """Record a forward activation hash.
-
-    When ``pool`` is provided, uses synchronous D2H + thread-pool blake2b
-    (via ``_SimpleHashPool``) to overlap the hash with training compute.
-    Otherwise falls back to the synchronous inline path.
-    """
+                     tensor: torch.Tensor) -> None:
+    """Record a forward activation hash (inline synchronous path)."""
     key = f"{prefix}fwd.{fqn}#{call_idx}"
-    if pool is not None:
-        records[key] = pool.enqueue(tensor)
-    else:
-        records[key] = _hash_tensor(tensor)
+    records[key] = _hash_tensor(tensor)
 
 
 # ── TrainLoopConfig ──────────────────────────────────────────────────────────
@@ -491,8 +363,7 @@ def _forward_with_cache(
     depth_scale_mtp: float,
     capture_records: dict | None,
     capture_prefix: str,
-    pool: _SimpleHashPool | None = None,
-) -> ForwardCache:
+    ) -> ForwardCache:
     """Run the full forward pass, saving all intermediates for the static backward.
 
     Also captures intermediate activations when ``capture_records`` is set.
@@ -502,7 +373,7 @@ def _forward_with_cache(
     # ── Embedding ──────────────────────────────────────────────────────
     hidden_emb = embedding_forward(input_ids, model.tok_embeddings_weight) * mup_emb_scale
     if capture_records is not None:
-        _capture_forward(capture_records, capture_prefix, "tok_embeddings", 0, hidden_emb, pool=pool)
+        _capture_forward(capture_records, capture_prefix, "tok_embeddings", 0, hidden_emb)
     hidden = hidden_emb
 
     # ── Transformer layers ─────────────────────────────────────────────
@@ -512,12 +383,12 @@ def _forward_with_cache(
 
         normed = rms_norm(hidden, layer.input_norm_weight)
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, f"layers.{li}.attention_norm", 0, normed, pool=pool)
+            _capture_forward(capture_records, capture_prefix, f"layers.{li}.attention_norm", 0, normed)
 
         q, k, v = project_qkv(normed, layer.qkv_weight)
         if capture_records is not None:
             qkv_proj = torch.matmul(normed, layer.qkv_weight.t())
-            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wqkv", 0, qkv_proj, pool=pool)
+            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wqkv", 0, qkv_proj)
 
         q_rot = apply_rope(q, rope_freqs)
         k_rot = apply_rope(k, rope_freqs)
@@ -529,24 +400,24 @@ def _forward_with_cache(
         attn_flat = attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         attn_out = torch.matmul(attn_flat, layer.attention_proj_weight.t())
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wo", 0, attn_out, pool=pool)
+            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wo", 0, attn_out)
         hidden_after_attn = hidden + attn_out * depth_scale_main
         hidden = hidden_after_attn
 
         # MLP sub-layer
         normed2 = rms_norm(hidden, layer.pre_mlp_norm_weight)
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, f"layers.{li}.ffn_norm", 0, normed2, pool=pool)
+            _capture_forward(capture_records, capture_prefix, f"layers.{li}.ffn_norm", 0, normed2)
 
         gate_up = torch.matmul(normed2, layer.mlp_fc1_weight.t())
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wfc1", 0, gate_up, pool=pool)
+            _capture_forward(capture_records, capture_prefix, f"layers.{li}.wfc1", 0, gate_up)
 
         y1, y2 = gate_up.chunk(2, dim=-1)
         intermediate = (torch.nn.functional.silu(y1.float()) * y2.float()).to(y1.dtype)
         mlp_out = torch.matmul(intermediate, layer.mlp_fc2_weight.t())
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, f"layers.{li}.w2", 0, mlp_out, pool=pool)
+            _capture_forward(capture_records, capture_prefix, f"layers.{li}.w2", 0, mlp_out)
         hidden = hidden + mlp_out * depth_scale_main
 
         layer_caches.append(LayerCache(
@@ -563,13 +434,13 @@ def _forward_with_cache(
     # ── Final norm ─────────────────────────────────────────────────────
     hidden_normed = rms_norm(hidden, model.final_norm_weight)
     if capture_records is not None:
-        _capture_forward(capture_records, capture_prefix, "norm", 0, hidden_normed, pool=pool)
+        _capture_forward(capture_records, capture_prefix, "norm", 0, hidden_normed)
 
     # ── LM head (main) ─────────────────────────────────────────────────
     main_pre_head = hidden_normed / width_mult
     main_logits = lm_head_forward(main_pre_head, model.output_weight)
     if capture_records is not None:
-        _capture_forward(capture_records, capture_prefix, "output", 0, main_logits, pool=pool)
+        _capture_forward(capture_records, capture_prefix, "output", 0, main_logits)
 
     # ── MTP branch ─────────────────────────────────────────────────────
     cache = ForwardCache(
@@ -587,18 +458,18 @@ def _forward_with_cache(
         b = rms_norm(hidden_normed, model.mtp.hidden_input_norm_weight)
 
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, "mtp.emb_input_layernorm", 0, a, pool=pool)
-            _capture_forward(capture_records, capture_prefix, "mtp.hidden_input_layernorm", 0, b, pool=pool)
+            _capture_forward(capture_records, capture_prefix, "mtp.emb_input_layernorm", 0, a)
+            _capture_forward(capture_records, capture_prefix, "mtp.hidden_input_layernorm", 0, b)
 
         eagle_h = torch.matmul(torch.cat([a, b], dim=-1), model.mtp.eagle_fc_weight.t())
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, "mtp.eagle_fc", 0, eagle_h, pool=pool)
+            _capture_forward(capture_records, capture_prefix, "mtp.eagle_fc", 0, eagle_h)
 
         # MTP transformer layer
         mtp_hidden_before_attn = eagle_h
         mtp_normed = rms_norm(eagle_h, model.mtp.layer.input_norm_weight)
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, "mtp.layer.attention_norm", 0, mtp_normed, pool=pool)
+            _capture_forward(capture_records, capture_prefix, "mtp.layer.attention_norm", 0, mtp_normed)
 
         mtp_qkv_proj = torch.matmul(mtp_normed, model.mtp.layer.qkv_weight.t())
         mtp_q, mtp_k, mtp_v = project_qkv(mtp_normed, model.mtp.layer.qkv_weight)
@@ -608,7 +479,7 @@ def _forward_with_cache(
         mtp_attn_flat = mtp_attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         mtp_attn_out = torch.matmul(mtp_attn_flat, model.mtp.layer.attention_proj_weight.t())
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, "mtp.layer.wo", 0, mtp_attn_out, pool=pool)
+            _capture_forward(capture_records, capture_prefix, "mtp.layer.wo", 0, mtp_attn_out)
         mtp_hidden_after_attn = eagle_h + mtp_attn_out * depth_scale_mtp
         eagle_h = mtp_hidden_after_attn
 
@@ -618,7 +489,7 @@ def _forward_with_cache(
         mtp_intermediate = (torch.nn.functional.silu(mtp_y1.float()) * mtp_y2.float()).to(mtp_y1.dtype)
         mtp_mlp_out = torch.matmul(mtp_intermediate, model.mtp.layer.mlp_fc2_weight.t())
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, "mtp.layer.w2", 0, mtp_mlp_out, pool=pool)
+            _capture_forward(capture_records, capture_prefix, "mtp.layer.w2", 0, mtp_mlp_out)
         eagle_h = eagle_h + mtp_mlp_out * depth_scale_mtp
 
         mtp_mtp_layer_cache = LayerCache(
@@ -635,12 +506,12 @@ def _forward_with_cache(
 
         mtp_final = rms_norm(eagle_h, model.mtp.final_norm_weight)
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, "mtp.final_layernorm", 0, mtp_final, pool=pool)
+            _capture_forward(capture_records, capture_prefix, "mtp.final_layernorm", 0, mtp_final)
 
         mtp_pre_head = mtp_final / width_mult
         mtp_logits = lm_head_forward(mtp_pre_head, model.output_weight)
         if capture_records is not None:
-            _capture_forward(capture_records, capture_prefix, "output", 1, mtp_logits, pool=pool)
+            _capture_forward(capture_records, capture_prefix, "output", 1, mtp_logits)
 
         cache.mtp_emb = mtp_emb
         cache.mtp_a = a
@@ -1289,11 +1160,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     capture_records: dict | None = None
     capture_prefix = ""
     grad_prefix = ""
-    hash_pool: _SimpleHashPool | None = None
     if config.hash_capture_level > 0:
         capture_records = {}
-        if config.hash_capture_level >= 2:
-            hash_pool = _get_global_hash_pool()
         # NOTE: capture_prefix and grad_prefix are updated per-step below
         # (the step number changes each iteration).  The initial values are
         # placeholders; the actual step-specific prefix is set inside the
@@ -1342,7 +1210,6 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     depth_scale_main, depth_scale_mtp,
                     capture_records if config.hash_capture_level >= 2 else None,
                     capture_prefix,
-                    pool=hash_pool,
                 )
                 lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
                 mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, mtp_lab, mtp_mask)
@@ -1356,7 +1223,6 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     depth_scale_main, depth_scale_mtp,
                     capture_records if config.hash_capture_level >= 2 else None,
                     capture_prefix,
-                    pool=hash_pool,
                 )
                 lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
 
@@ -1372,12 +1238,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             local_lm_sum += lm_sum.detach().double()
             local_lm_n += lm_n.detach().double()
 
-            # Flush async hash futures at each microbatch boundary so the
-            # pinned staging ring drains and the next microbatch has room.
-            if hash_pool is not None:
-                hash_pool.flush(wait=True)
-
-        # ── Post-accumulation: all-reduce ──────────────────────────────
+            # ── Post-accumulation: all-reduce ──────────────────────────────
         if config.world_size > 1:
             if use_mtp:
                 # Match the ref's reduce_loss_scalar: concatenate all scalars
@@ -1423,17 +1284,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # The ref's harness_dp captures gradients after each step (post-scaling).
         # We must do the same so the hash dump contains per-step gradient records.
         if config.hash_capture_level > 0 and config.persistent:
-            _resolve_futures_inplace(capture_records)
             _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
 
         # ── Capture mode: dump and exit (non-persistent) ────────────────
         if config.hash_capture_level > 0 and not config.persistent:
-            if hash_pool is not None:
-                hash_pool.flush(wait=True)
-            _resolve_futures_inplace(capture_records)
             _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
             _write_capture_output(config, capture_records, rank)
-            _shutdown_global_hash_pool()
             _ordered_teardown()
             return  # Not reached (SystemExit raised in _ordered_teardown)
 
@@ -1479,15 +1335,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
     # ── Persistent capture: write hash dump before teardown ──────────
     if config.hash_capture_level > 0 and config.persistent and capture_records is not None:
-        if hash_pool is not None:
-            hash_pool.flush(wait=True)
-        _resolve_futures_inplace(capture_records)
         _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix)
         _write_capture_output(config, capture_records, rank)
-
-    # ── Shutdown hash pool ───────────────────────────────────────────
-    if hash_pool is not None:
-        _shutdown_global_hash_pool()
 
     # ── Ordered teardown ──────────────────────────────────────────────
     _ordered_teardown()
@@ -1498,22 +1347,13 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
 def _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model,
                            prefix: str = ""):
-    """Capture all parameter gradients as hash records.
-
-    Uses the thread-pool batch hash_pool (``_hash_batch_cpu``) rather than
-    per-tensor inline hashing, so the blake2b computation spreads across
-    cores while the GPU is idle.
-    """
+    """Capture all parameter gradients as hash records (inline synchronous)."""
     fqn_map = _build_fqn_map(model)
-    items: list[tuple[str, torch.Tensor]] = []
     for buf, p in zip(fp32_grad_bufs, bf16_params):
         fqn = fqn_map.get(p.data_ptr(), None)
         if fqn is not None:
             key = f"{prefix}rank{os.environ.get('RANK', '0')}.grad.{fqn}.postallreduce"
-            items.append((key, buf))
-    results = _hash_batch_cpu(items)
-    for key, result in results:
-        capture_records[key] = result
+            capture_records[key] = _hash_tensor(buf)
 
 
 def _build_fqn_map(model: ModelParameters) -> dict:
