@@ -1576,7 +1576,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     enable_grad_bucketing = (
         config.world_size > 1
         and not deterministic
-        and int(os.environ.get("ENABLE_GRAD_BUCKETING", "1"))
+        and int(os.environ.get("ENABLE_GRAD_BUCKETING", "0"))  # default 0: DP=2 all-reduce is fast enough; bucketing adds overhead
     )
     # Disable gradient bucketing when ZeRO-1 is active (they overlap in
     # purpose — ZeRO-1's reduce_scatter is already a form of gradient
@@ -1599,6 +1599,14 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                   f"{num_grad_buckets} total", file=sys.stderr, flush=True)
 
     if use_cuda_graph:
+        # Evict CUDA allocator cache before warmup to avoid memory instability
+        # between warmup and graph capture.  Doing this *after* warmup (between
+        # del _fw_cache and capture) can cause captured tensor addresses to shift.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
         # Pre-allocate input buffers so the CUDA graph captures stable addresses.
         B, S = config.micro_batch_size, C.MAX_SEQ_LEN
         input_ids_buf = torch.empty(B, S, dtype=torch.long, device=device)
@@ -1661,12 +1669,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # The warmup forward+backward allocates ~24 GB of activation memory
         # in the ForwardCache.  The CUDA graph capture needs additional
         # memory for the captured operations, so we must free the cache first.
+        # (empty_cache/gc.collect already done before warmup.)
         del _fw_cache
-        # Also evict any cached CUDA allocator memory from the warmup.
-        # The empty_cache() is safe here because the warmup is a one-time
-        # setup step, not on the hot path.
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
         # Zero the grad bufs after warmup (the warmup accumulated gradients).
         torch._foreach_zero_(fp32_grad_bufs)
@@ -1675,8 +1679,6 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # The graph records the forward+backward CUDA operations.  During replay,
         # the same tensor addresses are used, so the cache and lm_* tensors from
         # the capture phase are updated in place.
-        import gc
-        gc.collect()
         try:
             cuda_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(cuda_graph):
@@ -1803,11 +1805,14 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 if rank == 0:
                     print(f"[debug] Optimizer CUDA graph capture failed: {e}",
                           file=sys.stderr, flush=True)
+                    print(f"[debug] Optimizer CUDA graph capture failed: {e}", flush=True)
                 _opt_cuda_graph = None
 
         except Exception as e:
             if rank == 0:
-                print(f"[debug] CUDA graph capture failed, falling back to eager: {e}", file=sys.stderr, flush=True)
+                print(f"[debug] CUDA graph capture failed, falling back to eager: {e}",
+                      file=sys.stderr, flush=True)
+                print(f"[debug] CUDA graph capture failed, falling back to eager: {e}", flush=True)
             cuda_graph = None
             use_cuda_graph = False
 

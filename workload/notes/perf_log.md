@@ -1045,3 +1045,48 @@ The dev agent unblocked the remote execution path that had been stalled for 16 r
 2. Run `resume-gate-20` regression to verify ZeRO-1 doesn't break save/load round-trip.
 3. Run `long-train` (200 steps) to establish the new MFU baseline.
 4. Continue optimization: operator fusion (residual-add + RMSNorm), overlap improvements, CUDA graph for optimizer step.
+- review R39 PASS: documentation-only commit, no proxy detected, remote unblocked via cctl BATCH
+
+## [stage1] Round 40 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — remote execution via cctl BATCH job working, smoke gate passes with old code (MFU 18.7%), but latest code has regressions
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (diagnostics: gradient bucketing + CUDA graph regression)
+
+### Key conclusions
+
+The dev agent unblocked remote execution (tsh session expired 16 rounds ago) and ran a systematic comparison of the old code vs latest code:
+
+**Remote execution approach**:
+- Made the `sihouzi21c/forge-train-harness` GitHub repo public (was private after R39)
+- Used `cctl job create` with `--code-type git --git-path "https://github.com/sihouzi21c/forge-train-harness.git" --git-ref "harness"`
+- The persistent filesystem at `/user/sunhaojun/.forge_train/77459cccb4da/` has the old code (R32-33) from the last sync push
+- The `bin/harness sync push` approach requires SSH which requires `tsh` (still expired)
+
+### Gate results (long-train-smoke, DP=2, 20 steps)
+
+| Configuration | Status | MFU | Ref time | Notes |
+|---|---|---|---|---|
+| Old code (persistent filesystem, R32-33) | PASS | 18.7% | 179s | Baseline |
+| Latest code, all optimizations disabled | PASS | 18.0% | 234s | Close to baseline |
+| Latest code, grad bucketing + DL prefetch (no CUDA graph, no ZeRO) | PASS | 17.0% | 243s | Gradient bucketing regresses by ~1% |
+| Latest code, CUDA graph only (no ZeRO, no bucketing) | FAIL | N/A | N/A | "no [LOSS] lines parsed" — CUDA graph crash |
+| Latest code, all optimizations | TIMEOUT | N/A | N/A | >660s transport backstop |
+
+### Identified regressions
+
+1. **Gradient bucketing causes ~1% MFU regression at DP=2**: The per-bucket stream-level all-reduce adds overhead (stream sync, multiple NCCL calls) that outweighs the benefit at DP=2 where the flat all-reduce is already very fast.
+
+2. **CUDA graph path crashes**: Both the forward+backward CUDA graph and the optimizer CUDA graph capture cause "no [LOSS] lines parsed" error. The crash occurs during capture or replay, likely due to:
+   - `pin_memory()` changes in `_next_batch` creating pinned memory allocations that interfere with CUDA graph capture
+   - `torch.cuda.empty_cache()` between warmup and capture causing memory instability
+   - Optimizer CUDA graph save/restore (~6 GB) causing memory pressure
+
+3. **ZeRO-1 + CUDA graph timeout**: The combined warmup + capture overhead for both CUDA graphs (forward+backward + optimizer) plus the ZeRO-1 communication overhead causes the total run time to exceed the 600s smoke gate budget.
+
+### Next steps
+
+1. Fix gradient bucketing regression: default to ENABLE_GRAD_BUCKETING=0 for DP=2
+2. Fix CUDA graph crash: move `torch.cuda.empty_cache()` before the warmup, not between warmup and capture; add explicit error logging to stdout
+3. Run `long-train-smoke` with CUDA graph only (no ZeRO, no bucketing)
+4. If CUDA graph passes, measure MFU and proceed with ZeRO-1 optimization
