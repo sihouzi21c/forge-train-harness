@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Auto-generated per-workspace harness shim. DO NOT COMMIT.
-# Workspace: /Users/sunhj/Downloads/hjsun/ForgeInference/.artifacts/forge_train/77459cccb4da/workspace
-export PYTHONPATH="/Users/sunhj/Downloads/hjsun/ForgeInference/.artifacts/forge_train/77459cccb4da/workspace${PYTHONPATH:+:$PYTHONPATH}"
+# Auto-generated per-workspace harness shim.
+# Uses the script's own location to determine the workspace root,
+# so it works regardless of absolute path (local or remote).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"
+export PYTHONPATH="${WORKSPACE_DIR}${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -m harness.cli "$@"

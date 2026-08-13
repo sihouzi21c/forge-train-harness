@@ -801,3 +801,19 @@ The dev agent implemented a genuine ZeRO-1 distributed optimizer in `workload/sr
 - `train_loop.py:63-73` — imports from `training_engine_tensor.zero_optimizer`, not from `ref/`
 
 ---
+
+## [stage1] Round 38 — 2026-08-14 03:49:01
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: ae5e717 — Fix: add cuda_device_max_connections=@unset to long-train-smoke and loss-gate-200 gate_configs; fix profile-snapshot@long-horizon
+
+### Key conclusions
+The dev agent fixed `cuda_device_max_connections = "@unset"` in the `long-train-smoke` and `loss-gate-200` gate_config source files (SSOT), and removed `CUDA_DEVICE_MAX_CONNECTIONS = "1"` from the rendered `profile-snapshot@long-horizon.toml` — these were missed in the Round 34 fix and would have silently disabled async H2D and gradient bucketing. No engine source code was modified. No proxy, no forged metrics, no reference imports: the changes are confined to config TOML files and notes. The commit does not declare `STAGE_STATUS: finished`. Stage 1 remains in-progress.
+
+### Evidence highlights
+- `config/eval/dense_training/gate_config/long-train-smoke.toml:25` — added `cuda_device_max_connections = "@unset"` to `[ours]` section
+- `config/eval/dense_training/gate_config/loss-gate-200.toml:24` — same fix for the auxiliary loss-only gate
+- `workload/src/config/profile-snapshot@long-horizon.toml:50` — removed `CUDA_DEVICE_MAX_CONNECTIONS = "1"` from `[env]`
+
+---

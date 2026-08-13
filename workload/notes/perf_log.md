@@ -958,6 +958,7 @@ The remote devspace is still not accessible via SSH (`tsh` session expired, requ
    - Operator fusion (residual-add + RMSNorm, RoPE fusion)
    - Overlap improvements (gradient bucketing + ZeRO-1 combined)
 - review R37 PASS: no proxy, genuine ZeRO-1 implementation, stage 1 in-progress
+- review R38 PASS: config fix for CUDA_DEVICE_MAX_CONNECTIONS gate_configs, no proxy
 
 ## [stage1] Round 38 — 2026-08-14
 
