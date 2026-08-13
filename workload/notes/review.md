@@ -225,3 +225,67 @@ None.
 - `train_loop.py:744-751`: MTP embedding backward uses `grad_mtp_emb * mup_emb_scale` (correct `rms_norm_backward` output)
 - `train_loop.py:871-890`: `_compute_grad_norm` uses `clip_grad_norm_` (same as ref)
 - anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)
+
+## [stage1] Review Round 12 — 2026-08-13 05:53:24
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 00c6354 — Fix: resolve MTP gradient 0.54% diff — cross_entropy autograd, embedding_dense_backward, embedding grad chain
+
+### Key conclusions
+The dev agent fixed three bugs that caused the systematic 0.54% gradient-norm difference: cross_entropy_backward switched from manual softmax-one_hot to F.cross_entropy autograd (same as ref's masked_ce), embedding_backward switched from index_add_ to embedding_dense_backward (same as ref's _EmbeddingFn), and the MTP embedding gradient now correctly captures the rms_norm_backward grad_in instead of the raw d_mtp_a. The engine remains a genuine in-process implementation — no subprocess calls to ref/ scripts, no hardcoded synthetic metrics, no renamed proxy variants. The only `from ref.reference.*` imports at `train_loop.py:212,258` are dataloader utilities (HF streaming and Megatron binary), not core training logic. Stage 1 finish conditions are not satisfied: no `STAGE_STATUS: finished` in commit message, no harness-written gate evidence in perf_log.md for the four required suites, and no profile snapshot for this perf-touching round.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `backward.py:390-429`: cross_entropy_backward uses F.cross_entropy autograd with fp32 scale — same as ref's masked_ce chain
+- `backward.py:142-164`: embedding_backward uses torch.ops.aten.embedding_dense_backward — same as ref's _EmbeddingFn
+- `train_loop.py:735-751`: MTP embedding backward correctly captures rms_norm_backward[0] grad_in instead of raw d_mtp_a
+- `train_loop.py:871-896`: _compute_grad_norm uses clip_grad_norm_ with matching max_norm for bitwise-aligned norm
+- anti-proxy guard: PASS (0 violations); no gate configs or remote.toml modified
+
+---
+
+## [stage1] Round 13 — 2026-08-13 05:52:19
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 00c6354 — Fix: resolve MTP gradient 0.54% diff — cross_entropy autograd, embedding_dense_backward, embedding grad chain
+
+### Key conclusions
+The dev agent resolved the systematic 0.54% gradient-norm difference by fixing three bugs: (1) `cross_entropy_backward` reverted from manual `softmax-one_hot` to `F.cross_entropy` autograd (`backward.py:390-429`), matching the ref's `masked_ce` backward path; (2) `embedding_backward` switched from `index_add_` to `torch.ops.aten.embedding_dense_backward` (`backward.py:142-164`); (3) MTP embedding gradient now correctly captures `rms_norm_backward` grad_in (`train_loop.py:744-761`). The engine remains a genuine in-process implementation — no proxy, no forgery, no hardcoded metrics. Gate results show 8/8 loss bitwise match, 2488/2496 hash match. Stage 1 finish conditions are not met: no `STAGE_STATUS: finished` in commit message, no gate evidence in perf_log (`long-train`, `resume-gate-20`, `resume-startup-90`, `perf-bitwise`), and profile snapshot missing for this perf-touching round.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `backward.py:390-429`: `cross_entropy_backward` uses `F.cross_entropy` autograd with fp32 scale — same as ref's `masked_ce` chain
+- `backward.py:142-164`: `embedding_backward` uses `torch.ops.aten.embedding_dense_backward` — same as ref's `_EmbeddingFn`
+- `train_loop.py:744-761`: MTP embedding backward correctly captures `rms_norm_backward[0]` grad_in instead of raw `d_mtp_a`
+- `train_loop.py:883-908`: `_compute_grad_norm` uses `clip_grad_norm_` with matching `max_norm` for bitwise-aligned norm
+- anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations); no gate configs or `remote.toml` modified
+- milestone: `bitwise-multicard` (active), no `long-horizon` milestone checks triggered
+
+---
+
+## [stage1] Round 14 — 2026-08-13 05:52:19
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 00c6354 — Fix: resolve MTP gradient 0.54% diff — cross_entropy autograd, embedding_dense_backward, embedding grad chain
+
+### Key conclusions
+The commit under review is the same as rounds 12/13 (00c6354) — no new code changes. The engine is a genuine in-process implementation: `backward.py:142-164` uses `torch.ops.aten.embedding_dense_backward` (same op as ref's `_EmbeddingFn`), `backward.py:390-429` replays `F.cross_entropy` through autograd (same as ref's `masked_ce`), and `train_loop.py:744-761` correctly captures `rms_norm_backward` grad_in for the MTP embedding gradient chain. Anti-proxy guard: PASS (0 violations). No gate configs, run-shape keys, or `remote.toml` were modified. Stage 1 finish conditions remain unmet: no `STAGE_STATUS: finished` in commit message, no harness-written gate evidence for `long-train`/`resume-gate-20`/`resume-startup-90`/`perf-bitwise`, and no profile snapshot for this perf-touching round. Milestone `bitwise-multicard` is active; no `long-horizon` check triggered.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `backward.py:142-164`: `embedding_backward` uses `torch.ops.aten.embedding_dense_backward` — same as ref's `_EmbeddingFn`
+- `backward.py:390-429`: `cross_entropy_backward` uses `F.cross_entropy` autograd with fp32 scale — same as ref's `masked_ce` chain
+- `train_loop.py:744-761`: MTP embedding backward correctly captures `rms_norm_backward[0]` grad_in instead of raw `d_mtp_a`
+- `train_loop.py:883-908`: `_compute_grad_norm` uses `clip_grad_norm_` with matching `max_norm` — same as ref
+- anti-proxy guard: PASS (0 violations); no gate configs, `remote.toml`, or run-shape keys modified
+
+---

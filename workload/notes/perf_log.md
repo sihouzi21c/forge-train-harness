@@ -27,3 +27,40 @@ The dev agent resolved the systematic 0.54% gradient-norm difference by fixing t
 All 8 steps of loss are bitwise identical to the ref. The 2 ULP-level grad_norm differences are sub-ULP and do not affect training correctness. The `tok_embeddings#0` hash mismatch is a known capture-point difference (ref captures `F.embedding` output without `mup_emb_scale`; ours captures with `mup_emb_scale`).
 
 **MILESTONE_STATUS: bitwise-singlecard PASS**
+- review R12 PASS: in-process engine fixes, no proxy detected; stage 1 in-progress — gate evidence and profile snapshot still missing
+- review R13 PASS: MTP gradient 0.54% diff resolved, genuine in-process impl, no proxy; stage 1 in-progress — gate evidence and profile snapshot missing
+- review R14 PASS: genuine in-process engine, no proxy; stage 1 in-progress — no STAGE_STATUS:finished, gate evidence and profile snapshot still missing
+
+## [stage1] Round 13 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: bitwise-multicard — in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent added three structural changes needed for multi-GPU DP alignment (DP=2, WORLD_SIZE=2, MBS=2, GBS=40, grad_accum=10, hash_capture_level=2):
+
+1. **Gradient all-reduce: flatten + single all-reduce (matching ref's `reduce_grads`)**:
+   - The ref's `harness_dp.reduce_grads` flattens all grad buffers into one contiguous tensor, does a single all-reduce, scales by `norm_factor = 1/token_count`, then copies back.
+   - Individual per-buffer all-reduces can produce 1-ULP differences in the summed gradients because NCCL may use different algorithms for different tensor sizes. These accumulate into ~1e-6 loss drift from step 2 onward.
+   - Fixed by using `torch._utils._flatten_dense_tensors` + single `dist.all_reduce` + `torch._utils._unflatten_dense_tensors`.
+
+2. **Loss scalar all-reduce: concat + single all-reduce (matching ref's `reduce_loss_scalar`)**:
+   - Concatenate `lm_sum`, `lm_n`, `mtp_sum`, `mtp_n` into one tensor for a single all-reduce, matching the ref's pattern.
+
+3. **Async hash capture (OffloadHasher) for hash_capture_level >= 2**:
+   - The `multistep` gate runs at `hash_capture_level=2`: every module's fwd tensors are blake2b-hashed per microbatch (~tens of GB per step at grad_accum=10).
+   - Naive inline `.cpu()` + single-core blake2b serialises the training thread (~5-10× the budget).
+   - Added `OffloadHasher` that uses async D2H + thread-pool blake2b to overlap hash computation with training compute.
+   - Replaced per-tensor inline hashing in `_capture_all_gradients` with thread-pool batch hasher (`hash_batch_sync`).
+   - Per-microbatch `hasher.flush(wait=True)` drains the pinned staging ring so the next microbatch has room.
+
+### Hypothesis
+
+These changes are expected to enable the `multistep` (DP=2) gate to pass. The single-rank `multistep-1gpu` path is preserved (the all-reduce changes are no-ops for world_size=1). The async hash capture avoids the timeout that would occur with inline hashing at hash_capture_level=2.
+
+### Next step
+
+Sync to remote devspace and run `bin/harness run multistep` to verify multi-GPU bitwise alignment.
