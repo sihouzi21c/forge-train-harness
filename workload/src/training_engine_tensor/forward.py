@@ -137,7 +137,7 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     authoritative path for bitwise alignment.
 
     Returns ``(output, None)`` — the ``softmax_lse`` is always ``None``
-    because ``flash_attn_func`` does not expose it through this wrapper.
+    because this version of ``flash_attn_func`` does not expose it.
     Gradients are computed via ``torch.autograd.grad`` in the matching
     backward function.
 

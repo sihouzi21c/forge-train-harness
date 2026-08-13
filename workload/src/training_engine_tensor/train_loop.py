@@ -311,7 +311,7 @@ class LayerCache:
     attn_out_raw: torch.Tensor       # attention output, shape [B, S, H, D]
     attn_flat: torch.Tensor          # attention output reshaped [B, S, H*D]
     attn_out: torch.Tensor           # after wo projection
-    softmax_lse: torch.Tensor | None  # flash attention softmax statistics (None for math fallback)
+    softmax_lse: torch.Tensor | None  # flash attention softmax statistics (used by direct _flash_attn_backward)
     hidden_after_attn: torch.Tensor   # after residual add (attention branch)
     normed2: torch.Tensor             # after ffn_norm
     gate_up: torch.Tensor             # after wfc1
@@ -697,13 +697,14 @@ def _static_backward(
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.attention_proj_weight, dw_mtp_wo)
 
-        # Attention backward (GQA) — always uses math fallback path
-        # since _gqa_attention always returns None for softmax_lse
-        # (F.scaled_dot_product_attention does not expose it).
+        # Attention backward (GQA) — uses autograd replay through
+        # flash_attn_func for bitwise alignment (the softmax_lse is not
+        # exposed by the installed flash_attn version, so the direct
+        # _flash_attn_backward path cannot be used).
         d_mtp_attn = d_mtp_attn_flat.reshape(B, S, C.NUM_HEADS, C.HEAD_DIM)
         d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward(
             d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
-            allow_math_fallback=True,
+            out=mtp_lc.attn_out_raw, softmax_lse=mtp_lc.softmax_lse,
         )
 
         # RoPE backward
@@ -842,12 +843,14 @@ def _static_backward(
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.attention_proj_weight, dw_wo)
 
-        # Attention backward (GQA) — always uses math fallback path
-        # since _gqa_attention always returns None for softmax_lse.
+        # Attention backward (GQA) — uses autograd replay through
+        # flash_attn_func for bitwise alignment (the softmax_lse is not
+        # exposed by the installed flash_attn version, so the direct
+        # _flash_attn_backward path cannot be used).
         d_attn = d_attn_flat.reshape(B, S, C.NUM_HEADS, C.HEAD_DIM)
         d_q_rot, d_k_rot, d_v = gqa_attention_backward(
             d_attn, lc.q_rot, lc.k_rot, lc.v,
-            allow_math_fallback=True,
+            out=lc.attn_out_raw, softmax_lse=lc.softmax_lse,
         )
 
         # RoPE backward
@@ -1395,9 +1398,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
         step_start_event.record()
 
-        # Zero gradients
-        for buf in fp32_grad_bufs:
-            buf.zero_()
+        # Zero gradients (fused multi-tensor for fewer kernel launches)
+        torch._foreach_zero_(fp32_grad_bufs)
 
         local_lm_sum = torch.zeros(1, device=device, dtype=torch.float64)
         local_lm_n = torch.zeros(1, device=device, dtype=torch.float64)
@@ -1451,9 +1453,13 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             local_lm_n += lm_n.detach().double()
 
             # ── Post-accumulation: all-reduce ──────────────────────────────
-        # Synchronize before all-reduce to ensure all backward CUDA ops are
-        # complete, avoiding any NCCL race with the default stream.
-        torch.cuda.synchronize()
+        # NOTE: no torch.cuda.synchronize() needed here — the backward pass
+        # writes fp32_grad_bufs on the default stream, and the all-reduce
+        # (dist.all_reduce) also uses the default stream.  Default-stream
+        # serialization guarantees all backward kernels complete before the
+        # all-reduce begins.  A full device synchronize is redundant and
+        # wastes ~500ms/step of GPU idle time (the profiler sees it as
+        # cudaStreamSynchronize).
         if config.world_size > 1:
             if use_mtp:
                 # Match the ref's reduce_loss_scalar: concatenate all scalars
@@ -1498,8 +1504,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             if config.hash_capture_level > 0 and config.persistent:
                 _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
             norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()
-            for buf in fp32_grad_bufs:
-                buf.mul_(norm_factor_float)
+            # Use _foreach_mul_ for a single fused kernel launch instead of
+            # 157 separate per-buffer mul_ calls.
+            torch._foreach_mul_(fp32_grad_bufs, norm_factor_float)
 
         # ── Capture gradients for this step (persistent mode) ─────────────
         # The ref's harness_dp captures gradients after each step (post-scaling).

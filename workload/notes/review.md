@@ -472,3 +472,22 @@ None.
 - `bin/harness run anti-proxy`: PASS (0 violations); no config tampering detected
 
 ---
+
+## [stage1] Round 22 — 2026-08-13 19:25:47
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 2428f90 — Perf: long-horizon Phase 0+1 — det-off, SwiGLU recompute, CUDA events, LR fix
+
+### Key conclusions
+The dev agent entered the long-horizon milestone with Phase 0 (deterministic mode conditionalization) and Phase 1 (SwiGLU backward recompute saving ~10.8 GB, CUDA event-based step timing, explicit cache eviction across microbatches, chunked cross-entropy backward, and LR fix reading from rendered product env). All changes are genuine in-process optimizations — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. Anti-proxy guard passes (0 violations). Stage 1 FINISH is not declared: `STAGE_STATUS: finished` is absent from the commit message, the latest perf_log section does not show `long-train` PASS / `resume-startup-90` PASS / `perf-bitwise` PASS, and the profile snapshot is absent despite this commit modifying `backward.py` and `train_loop.py`. The long-horizon throughput check (no qualifying runs yet) is not a review failure per policy.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:1448`: `del cache` after each microbatch backward — genuine memory management
+- `backward.py:420-429`: chunked `cross_entropy_backward` — pure F.cross_entropy autograd, no proxy
+- `train_loop.py:1211-1232`: deterministic mode conditionalized behind `DETERMINISTIC=0/1` env var — genuine control flow
+
+---

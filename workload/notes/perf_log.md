@@ -370,3 +370,71 @@ The dev agent entered the long-horizon milestone and executed Phase 0 (det-off f
   1. RMSNorm+residual-add fusion (eliminates fp32 rms_norm intermediates)
   2. Fused cross-entropy (chunked CE already done, but the forward logits still materialize `[B*S, V]` bf16)
   3. Replace cuBLAS wgrad with Triton kernel (eliminates `.float()` upcast tax)
+- review R22 PASS: genuine in-process engine optimizations, no proxy; stage1 in-progress — missing gate evidence and profile snapshot
+
+## [stage1] Round 23 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: closed-form backward)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented Phase 2 optimization by replacing the autograd-replay backward
+passes with closed-form backward formulas for RMSNorm and SiLU:
+
+1. **Closed-form RMSNorm backward** — Replaced the `torch.autograd.grad` replay through
+   `F.rms_norm` with a direct closed-form formula:
+   ```
+   r = rsqrt(mean(x^2) + eps); normed = x * r
+   d_normed = grad_out * weight
+   d_hidden = r * (d_normed - normed * mean(d_normed * normed, dim=-1, keepdim=True))
+   ```
+   The wgrad formula is unchanged (still `sum(grad_out * normed, dim=0).float()`).
+   This eliminates 52× autograd replay per step (2 RMSNorm × 26 layers), each creating
+   ~3 intermediate tensors and triggering autograd engine overhead.
+
+2. **Closed-form SiLU SwiGLU backward** — Replaced the `torch.autograd.grad` replay
+   through `F.silu(gate) * up` with a direct closed-form formula:
+   ```
+   sig = sigmoid(gate); silu = gate * sig
+   d_silu = sig * (1 + gate * (1 - sig))
+   d_gate = grad_out * up * d_silu; d_up = grad_out * silu
+   ```
+   This eliminates 26× autograd replay per step (1 SwiGLU × 26 layers).
+
+3. **Optimization infra** — Added `_foreach_zero_` and `_foreach_mul_` for
+   gradient zeroing and scaling (reduces 157 separate kernel launches to 1).
+   Removed redundant `torch.cuda.synchronize()` before all-reduce (the default
+   stream serialization guarantees backward completion).
+
+### Profile results (long-horizon_round25 vs round24)
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Step time (ms) | 7254 | 7167 | **-87ms** |
+| GPU kernel time (ms) | 6106 | 4909 | **-1197ms** |
+| Kernel launches | 498926 | 389799 | **-109127** |
+| MFU (standard) | 18.13% | 18.35% | **+0.22%** |
+| cudaLaunchKernel (ms) | 4287 | 3868 | **-419ms** |
+
+The closed-form backward eliminated the autograd engine's kernel-launch overhead
+and intermediate tensor creation. The GPU kernel time dropped by 1197ms/step,
+but the GPU idle increased by 1110ms (from NCCL all-reduce sync), so the net
+step time improvement is 87ms.
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: `loss_rel 0.000% < 2.50%` PASS;
+  `signed_rel -0.0000%` (essentially zero drift); MFU **18.5%** (up from 18.3%).
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **long-train (200 steps, DP=2)**: `loss_rel 0.086% < 2.50%` PASS;
+  `signed_rel +0.0855%` (no drift warning); MFU **18.5%** (up from 18.3% in Round 22).
+  `pointwise_mean_rel=0.086%`, `max_rel_diff=0.16%`, well within the 2.5% threshold.
+
+### Next steps
+
+- Phase 2 continued: fuse residual-add + RMSNorm, Triton wgrad GEMM
+- Phase 3: overlap communication / compute
+- Phase 4: CUDA graph capture (largest single lever at ~3868ms cudaLaunchKernel overhead)
