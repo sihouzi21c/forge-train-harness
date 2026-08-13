@@ -50,8 +50,7 @@ def linear_backward(
 
     Returns:
         ``(grad_in, grad_weight)`` where ``grad_in`` has the same shape
-        as ``x`` (same dtype) and ``grad_weight`` is in the weight's dtype
-        (bf16, matching the ref's ``_LinearFn`` wgrad computation).
+        as ``x`` (same dtype) and ``grad_weight`` is fp32.
     """
     if grad_out.shape[-1] != weight.shape[0]:
         raise ValueError(
@@ -63,9 +62,7 @@ def linear_backward(
     # match the ref's _LinearFn.backward (which uses ctx.weight as-is).
     grad_in = torch.matmul(grad_out, weight)
 
-    # dW = grad_out.T @ x (reshaped to 2D) — compute in weight's dtype
-    # then convert to fp32 (matching the ref's _LinearFn.backward which does
-    # wg = torch.matmul(g2.T, x2); _ensure_main_grad(weight).add_(wg.float())).
+    # dW = grad_out.T @ x (reshaped to 2D) — compute in fp32 accumulation.
     n = weight.shape[0]
     k = weight.shape[1]
     g2 = grad_out.reshape(-1, n)

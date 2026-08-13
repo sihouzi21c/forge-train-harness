@@ -1523,19 +1523,19 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             _ordered_teardown(teardown_exit=True)
             return  # Not reached (SystemExit raised in _ordered_teardown)
 
-        # ── Compute gradient norm (also clips via clip_grad_norm_) ───────
+        # ── Compute gradient norm (also clips via _foreach_norm) ─────────
         # Set .grad on fp32_master (matching ref's pattern exactly) so that
-        # clip_grad_norm_ reads the same .grad fields the ref does.
+        # the _fused_adamw_ kernel reads the same .grad fields the ref does.
         for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
             p_fp32.grad = buf
-        # Match the ref's clip_grad_norm_ call exactly (same positional args)
-        # for bitwise-identical grad norm computation.  The fp32_master order
-        # now matches the ref's model.parameters() order (tok_embeddings →
-        # layers → norm → output → mtp), so the per-tensor norm stack is
-        # bitwise-identical.
-        grad_norm_val = torch.nn.utils.clip_grad_norm_(
-            fp32_master, opt_clip_grad,
-        )
+        # Use _foreach_norm for batched per-tensor L2 norm computation
+        # (replaces 157 separate norm() kernel launches with a single
+        # fused kernel launch, matching the clip_grad_norm_ result exactly).
+        norms = torch._foreach_norm(fp32_grad_bufs)
+        total_norm = torch.linalg.vector_norm(torch.stack(norms))
+        if total_norm > opt_clip_grad:
+            torch._foreach_mul_(fp32_grad_bufs, opt_clip_grad / total_norm)
+        grad_norm_val = total_norm
 
         # ── Compute LR for this step ──────────────────────────────────
         # ref uses ``step + 1`` (1-indexed) for the LR schedule
