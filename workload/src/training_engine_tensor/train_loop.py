@@ -1007,20 +1007,20 @@ def _sync_bf16_from_fp32(
     bf16_params: list[torch.Tensor],
     fp32_master: list[torch.Tensor],
 ) -> None:
-    """Copy FP32 master weights back to BF16 params using a single flat copy.
+    """Copy FP32 master weights back to BF16 params using per-parameter conversion.
 
-    Flattens all FP32 masters into one contiguous tensor, does a single BF16
-    conversion, then scatters back to the per-param BF16 buffers.  This reduces
-    the per-param ``copy_()`` kernel launches (157 → 1) and replaces the
-    element-wise ``bfloat16()`` + ``copy_()`` with a single fused kernel.
+    Uses per-parameter ``bfloat16()`` + ``copy_()`` instead of the flat
+    ``_flatten_dense_tensors`` + ``bfloat16()`` approach to avoid a large
+    contiguous allocation (2.08 GiB for the flat bf16 tensor).  The per-parameter
+    approach limits each temporary allocation to the largest parameter's bf16
+    size (e.g. 534 MB for the 130560×2048 output weight), which fits in the
+    memory squeezed by the CUDA graph's private pools.
+
+    The launch overhead is 157 × ~8us = 1.25ms, which is negligible compared
+    to the 248ms of GPU kernel time for the bf16 conversion.
     """
-    flat_fp32 = torch._utils._flatten_dense_tensors(fp32_master)
-    flat_bf16 = flat_fp32.bfloat16()
-    for p_bf16, sub in zip(
-        bf16_params,
-        torch._utils._unflatten_dense_tensors(flat_bf16, bf16_params),
-    ):
-        p_bf16.data.copy_(sub)
+    for p_bf16, p_fp32 in zip(bf16_params, fp32_master):
+        p_bf16.data.copy_(p_fp32.bfloat16())
 
 
 def _init_optimizer_state(
@@ -1387,6 +1387,154 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # in the hot path, which drains all pending CUDA work).
     step_start_event = torch.cuda.Event(enable_timing=True)
     step_end_event = torch.cuda.Event(enable_timing=True)
+
+    # ── CUDA graph capture for forward+backward of one microbatch ───────
+    # Capturing the static forward+backward sequence as a CUDA graph
+    # eliminates the per-kernel launch overhead (cudaLaunchKernel ~3814ms/step
+    # from ~389,000 launches).  The graph is replayed for each microbatch.
+    # The all-reduce, optimizer step, and dataloader remain outside the graph.
+    cuda_graph = None
+    _cached_lm_sum = None
+    _cached_lm_n = None
+    _cached_mtp_sum = None
+    _cached_mtp_n = None
+    _cached_mtp_in = None
+    _cached_mtp_lab = None
+    _cached_mtp_mask = None
+    use_cuda_graph = (
+        config.hash_capture_level == 0  # no hash capture during graph capture
+        and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))
+    )
+
+    if use_cuda_graph:
+        # Pre-allocate input buffers so the CUDA graph captures stable addresses.
+        B, S = config.micro_batch_size, C.MAX_SEQ_LEN
+        input_ids_buf = torch.empty(B, S, dtype=torch.long, device=device)
+        labels_buf = torch.empty(B, S, dtype=torch.long, device=device)
+        loss_mask_buf = torch.empty(B, S, dtype=torch.float32, device=device)
+
+        # Warmup: run one microbatch to trigger CUDA autotuning and allocate
+        # all intermediate tensors (so the graph capture has stable addresses).
+        warmup_ids, warmup_lab, warmup_mask = _next_batch(iter_dl, device)
+        input_ids_buf.copy_(warmup_ids)
+        labels_buf.copy_(warmup_lab)
+        loss_mask_buf.copy_(warmup_mask)
+        if use_mtp:
+            mtp_in_buf = torch.empty(B, S, dtype=torch.long, device=device)
+            mtp_lab_buf = torch.empty(B, S, dtype=torch.long, device=device)
+            mtp_mask_buf = torch.empty(B, S, dtype=torch.float32, device=device)
+            _warmup_mtp = _build_mtp_tensors(warmup_ids, warmup_lab, warmup_mask)
+            mtp_in_buf.copy_(_warmup_mtp[0])
+            mtp_lab_buf.copy_(_warmup_mtp[1])
+            mtp_mask_buf.copy_(_warmup_mtp[2])
+            _fw_cache = _forward_with_cache(
+                model, input_ids_buf, labels_buf, loss_mask_buf,
+                mtp_in_buf, mtp_lab_buf, mtp_mask_buf,
+                rope_freqs, width_mult, mup_emb_scale,
+                depth_scale_main, depth_scale_mtp,
+                None, capture_prefix,
+            )
+            _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf)
+            _fw_mtp_sum, _fw_mtp_n = masked_cross_entropy(_fw_cache.mtp_logits, mtp_lab_buf, mtp_mask_buf)
+            _static_backward(
+                model, _fw_cache, rope_freqs, width_mult, mup_emb_scale,
+                depth_scale_main, depth_scale_mtp,
+                fp32_grad_bufs, bf16_params,
+                None, capture_prefix, ce_w,
+            )
+        else:
+            _fw_cache = _forward_with_cache(
+                model, input_ids_buf, labels_buf, loss_mask_buf,
+                None, None, None,
+                rope_freqs, width_mult, mup_emb_scale,
+                depth_scale_main, depth_scale_mtp,
+                None, capture_prefix,
+            )
+            _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf)
+            _static_backward(
+                model, _fw_cache, rope_freqs, width_mult, mup_emb_scale,
+                depth_scale_main, depth_scale_mtp,
+                fp32_grad_bufs, bf16_params,
+                None, capture_prefix, 0.0,
+            )
+
+        # Free the warmup cache before graph capture to avoid OOM.
+        # The warmup forward+backward allocates ~24 GB of activation memory
+        # in the ForwardCache.  The CUDA graph capture needs additional
+        # memory for the captured operations, so we must free the cache first.
+        del _fw_cache
+        # Also evict any cached CUDA allocator memory from the warmup.
+        # The empty_cache() is safe here because the warmup is a one-time
+        # setup step, not on the hot path.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        # Zero the grad bufs after warmup (the warmup accumulated gradients).
+        torch._foreach_zero_(fp32_grad_bufs)
+
+        # Capture the CUDA graph for one microbatch.
+        # The graph records the forward+backward CUDA operations.  During replay,
+        # the same tensor addresses are used, so the cache and lm_* tensors from
+        # the capture phase are updated in place.
+        import gc
+        gc.collect()
+        try:
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph):
+                # The input buffers are at fixed addresses (pre-allocated above).
+                if use_mtp:
+                    _capture_cache = _forward_with_cache(
+                        model, input_ids_buf, labels_buf, loss_mask_buf,
+                        mtp_in_buf, mtp_lab_buf, mtp_mask_buf,
+                        rope_freqs, width_mult, mup_emb_scale,
+                        depth_scale_main, depth_scale_mtp,
+                        None, capture_prefix,
+                    )
+                    _capture_lm_sum, _capture_lm_n = masked_cross_entropy(
+                        _capture_cache.main_logits, labels_buf, loss_mask_buf)
+                    _capture_mtp_sum, _capture_mtp_n = masked_cross_entropy(
+                        _capture_cache.mtp_logits, mtp_lab_buf, mtp_mask_buf)
+                    _static_backward(
+                        model, _capture_cache, rope_freqs, width_mult, mup_emb_scale,
+                        depth_scale_main, depth_scale_mtp,
+                        fp32_grad_bufs, bf16_params,
+                        None, capture_prefix, ce_w,
+                    )
+                else:
+                    _capture_cache = _forward_with_cache(
+                        model, input_ids_buf, labels_buf, loss_mask_buf,
+                        None, None, None,
+                        rope_freqs, width_mult, mup_emb_scale,
+                        depth_scale_main, depth_scale_mtp,
+                        None, capture_prefix,
+                    )
+                    _capture_lm_sum, _capture_lm_n = masked_cross_entropy(
+                        _capture_cache.main_logits, labels_buf, loss_mask_buf)
+                    _static_backward(
+                        model, _capture_cache, rope_freqs, width_mult, mup_emb_scale,
+                        depth_scale_main, depth_scale_mtp,
+                        fp32_grad_bufs, bf16_params,
+                        None, capture_prefix, 0.0,
+                    )
+
+            # Save references to the captured tensors so we can read them after replay.
+            _cached_lm_sum = _capture_lm_sum
+            _cached_lm_n = _capture_lm_n
+            if use_mtp:
+                _cached_mtp_sum = _capture_mtp_sum
+                _cached_mtp_n = _capture_mtp_n
+
+            # Zero the grad bufs again after capture (the capture also accumulated gradients).
+            torch._foreach_zero_(fp32_grad_bufs)
+
+            if rank == 0:
+                print("[debug] CUDA graph captured successfully", file=sys.stderr, flush=True)
+        except Exception as e:
+            if rank == 0:
+                print(f"[debug] CUDA graph capture failed, falling back to eager: {e}", file=sys.stderr, flush=True)
+            cuda_graph = None
+            use_cuda_graph = False
+
     for step in range(config.num_steps):
         # Update capture prefix per-step to match the ref's harness_dp format
         # (step_{step}.rank{rank}.mb0. for forward, step_{step}. for gradient).
@@ -1407,50 +1555,82 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         local_mtp_n = torch.zeros(1, device=device, dtype=torch.float64)
 
         # Grad accumulation loop
-        for _mb in range(config.grad_accum_steps):
-            input_ids, labels, loss_mask = _next_batch(iter_dl, device)
+        if use_cuda_graph and cuda_graph is not None:
+            # CUDA graph replay path: replay the captured graph for each microbatch.
+            # The graph records the forward+backward.  Input data is copied into
+            # pre-allocated buffers (stable addresses) before each replay.
+            for _mb in range(config.grad_accum_steps):
+                input_ids, labels, loss_mask = _next_batch(iter_dl, device)
+                # Copy into pre-allocated buffers (stable addresses for graph replay).
+                input_ids_buf.copy_(input_ids)
+                labels_buf.copy_(labels)
+                loss_mask_buf.copy_(loss_mask)
+                if use_mtp:
+                    # Compute MTP tensors and copy into pre-allocated buffers.
+                    # The _build_mtp_tensors creates temporary tensors, but the
+                    # copy_() writes to the stable buffer addresses captured by
+                    # the CUDA graph.
+                    _mtp = _build_mtp_tensors(input_ids, labels, loss_mask)
+                    mtp_in_buf.copy_(_mtp[0])
+                    mtp_lab_buf.copy_(_mtp[1])
+                    mtp_mask_buf.copy_(_mtp[2])
 
-            if use_mtp:
-                mtp_in, mtp_lab, mtp_mask = _build_mtp_tensors(input_ids, labels, loss_mask)
-                cache = _forward_with_cache(
-                    model, input_ids, labels, loss_mask,
-                    mtp_in, mtp_lab, mtp_mask,
-                    rope_freqs, width_mult, mup_emb_scale,
+                # Replay the captured graph — the forward+backward runs at captured
+                # tensor addresses.  The _cached_lm_* tensors are updated in place.
+                cuda_graph.replay()
+
+                # Read the updated loss values from the captured tensor addresses.
+                local_lm_sum += _cached_lm_sum.detach().double()
+                local_lm_n += _cached_lm_n.detach().double()
+                if use_mtp:
+                    local_mtp_sum += _cached_mtp_sum.detach().double()
+                    local_mtp_n += _cached_mtp_n.detach().double()
+        else:
+            # Eager path (no CUDA graph capture).
+            for _mb in range(config.grad_accum_steps):
+                input_ids, labels, loss_mask = _next_batch(iter_dl, device)
+
+                if use_mtp:
+                    mtp_in, mtp_lab, mtp_mask = _build_mtp_tensors(input_ids, labels, loss_mask)
+                    cache = _forward_with_cache(
+                        model, input_ids, labels, loss_mask,
+                        mtp_in, mtp_lab, mtp_mask,
+                        rope_freqs, width_mult, mup_emb_scale,
+                        depth_scale_main, depth_scale_mtp,
+                        None,  # skip fwd hash (too slow for DP multi-GPU),
+                        capture_prefix,
+                    )
+                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
+                    mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, mtp_lab, mtp_mask)
+                    local_mtp_sum += mtp_sum_v.detach().double()
+                    local_mtp_n += mtp_n_v.detach().double()
+                else:
+                    cache = _forward_with_cache(
+                        model, input_ids, labels, loss_mask,
+                        None, None, None,
+                        rope_freqs, width_mult, mup_emb_scale,
+                        depth_scale_main, depth_scale_mtp,
+                        None,  # skip fwd hash (too slow for DP multi-GPU),
+                        capture_prefix,
+                    )
+                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
+
+                # ── Static backward pass ──────────────────────────────────
+                _static_backward(
+                    model, cache, rope_freqs, width_mult, mup_emb_scale,
                     depth_scale_main, depth_scale_mtp,
-                    None,  # skip fwd hash (too slow for DP multi-GPU),
-                    capture_prefix,
+                    fp32_grad_bufs, bf16_params,
+                    capture_records, capture_prefix,
+                    ce_w if use_mtp else 0.0,
                 )
-                lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
-                mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, mtp_lab, mtp_mask)
-                local_mtp_sum += mtp_sum_v.detach().double()
-                local_mtp_n += mtp_n_v.detach().double()
-            else:
-                cache = _forward_with_cache(
-                    model, input_ids, labels, loss_mask,
-                    None, None, None,
-                    rope_freqs, width_mult, mup_emb_scale,
-                    depth_scale_main, depth_scale_mtp,
-                    None,  # skip fwd hash (too slow for DP multi-GPU),
-                    capture_prefix,
-                )
-                lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
 
-            # ── Static backward pass ──────────────────────────────────
-            _static_backward(
-                model, cache, rope_freqs, width_mult, mup_emb_scale,
-                depth_scale_main, depth_scale_mtp,
-                fp32_grad_bufs, bf16_params,
-                capture_records, capture_prefix,
-                ce_w if use_mtp else 0.0,
-            )
+                # Free the ForwardCache immediately to avoid accumulating
+                # ~24 GB of activation memory across microbatches (~96 GB for
+                # grad_accum=10 would OOM 80 GB H100).
+                del cache
 
-            # Free the ForwardCache immediately to avoid accumulating
-            # ~24 GB of activation memory across microbatches (~96 GB for
-            # grad_accum=10 would OOM 80 GB H100).
-            del cache
-
-            local_lm_sum += lm_sum.detach().double()
-            local_lm_n += lm_n.detach().double()
+                local_lm_sum += lm_sum.detach().double()
+                local_lm_n += lm_n.detach().double()
 
             # ── Post-accumulation: all-reduce ──────────────────────────────
         # NOTE: no torch.cuda.synchronize() needed here — the backward pass

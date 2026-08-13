@@ -486,3 +486,82 @@ The GPU kernel time increase is run-to-run variation (no code change affecting G
   1. Gradient bucketing (overlap NCCL all-reduce with backward compute)
   2. CUDA graph capture of the forward+backward pass
   3. Operator fusion (residual-add + RMSNorm, RoPE fusion)
+- review R24 PASS: _foreach_norm replaces clip_grad_norm_, no proxy; stage1 in-progress (no STAGE_STATUS:finished)
+
+## [stage1] Round 25 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 4: CUDA graph capture attempted)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented CUDA graph capture for the forward+backward pass of one
+microbatch, then replay for each microbatch (10 microbatches/step).  The graph
+captures the full forward+backward sequence (embedding → 25 transformer layers →
+final norm → LM head → MTP → backward of all layers into fp32_grad_bufs).
+
+**CUDA graph capture — successful capture, modest MFU gain**:
+
+- The graph was captured successfully (21.08 GiB private pools on the GPU for the
+  captured intermediate tensors).  Warmup + `torch.cuda.empty_cache()` is required
+  before capture to free the ~24 GiB activation memory from the warmup run.
+- The per-kernel `cudaLaunchKernel` overhead (~3814ms/step, 389K launches) is
+  replaced by a single `cudaGraphLaunch` per microbatch (~50us).
+- **MFU: 18.8%** (up from 18.5% in Round 24).  The modest gain (+0.3pp) is
+  because the `cudaLaunchKernel` time is heavily overlapped with GPU kernel
+  execution; the GPU idle (2215ms → 2087ms) is reduced by only 128ms.
+
+**Memory constraint — per-parameter bf16 sync**:
+
+- The CUDA graph's private pools (21.08 GiB) push total GPU memory to 75.80 GiB,
+  leaving only 1.98 GiB free.  The flat `_flatten_dense_tensors` + `bfloat16()`
+  approach in `_sync_bf16_from_fp32` needed 2.08 GiB of contiguous memory,
+  causing OOM.
+- Fixed by switching to **per-parameter `bfloat16()` + `copy_()`**, which limits
+  each temporary allocation to the largest parameter's bf16 size (534 MB for the
+  130560×2048 output weight).  This avoids the 2.08 GiB contiguous allocation.
+- The per-parameter approach adds 157 kernel launches vs 1 for the flat approach,
+  but the launch overhead (1.25ms) is negligible vs the 248ms of GPU kernel time.
+
+### Profile results (long-horizon_round26 vs round25)
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Step time (ms) | 7127 | 7011 | **-116ms** |
+| MFU (standard) | 18.45% | 18.75% | **+0.30pp** |
+| cudaLaunchKernel (ms) | 3814 | N/A (nsys graphs) | — |
+
+Note: nsys CUPTI folds the captured CUDA graph into a single `cudaGraphLaunch`
+event, so per-kernel breakdowns are unavailable when the graph is enabled.
+The `--cuda-graph-trace=node` flag is needed to see individual kernels.
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: `loss_rel 0.107% < 2.50%` PASS;
+  `signed_rel +0.0201%` (no drift warning); MFU **18.8%** (up from 18.5%).
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+
+### Analysis
+
+The CUDA graph capture is successful but the MFU improvement is limited by:
+
+1. **GPU kernel time dominates** (4913ms of 7127ms = 69%): the graph doesn't
+   eliminate the actual GPU computation, only the CPU launch overhead.
+2. **cudaStreamSynchronize overhead** (819ms): from PyTorch internals, not
+   graph-capturable.
+3. **Graph memory overhead** (21.08 GiB private pools): the captured intermediate
+   tensors consume significant GPU memory, leaving little headroom for optimizer
+   state and gradient buffers.
+
+### Next steps
+
+- Phase 3: gradient bucketing (overlap NCCL all-reduce with backward compute)
+  — the GPU idle is still 2087ms, partly from NCCL synchronization.
+- Phase 2 continued: operator fusion (residual-add + RMSNorm, RoPE fusion)
+  — small MFU gain but reduces memory pressure.
+- Candidate levers:
+  1. Async gradient bucketing (overlap all-reduce with backward)
+  2. Operator fusion for memory reduction (enable larger MBS)
+  3. CUDA graph capture for the optimizer step (smaller memory footprint)
