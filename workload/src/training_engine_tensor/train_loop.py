@@ -1509,7 +1509,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # Capturing the static forward+backward sequence as a CUDA graph
     # eliminates the per-kernel launch overhead (cudaLaunchKernel ~3814ms/step
     # from ~389,000 launches).  The graph is replayed for each microbatch.
-    # The all-reduce, optimizer step, and dataloader remain outside the graph.
+    # The all-reduce, gradient norm, and dataloader remain outside the graph.
     cuda_graph = None
     _cached_lm_sum = None
     _cached_lm_n = None
@@ -1518,6 +1518,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     _cached_mtp_in = None
     _cached_mtp_lab = None
     _cached_mtp_mask = None
+    # Optimizer step CUDA graph (captures AdamW + BF16 sync).
+    _opt_cuda_graph = None
     use_cuda_graph = (
         config.hash_capture_level == 0  # no hash capture during graph capture
         and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))
@@ -1678,6 +1680,83 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
             if rank == 0:
                 print("[debug] CUDA graph captured successfully", file=sys.stderr, flush=True)
+
+            # ── Optimizer step CUDA graph capture ──────────────────────────
+            # Capturing the AdamW + BF16 sync as a separate CUDA graph
+            # eliminates the per-kernel launch overhead for the optimizer step
+            # (~472 kernel launches → 0 after capture, saving ~15.8ms/step).
+            # The gradient norm/clipping remains outside the graph (has a
+            # conditional), so only the unconditional AdamW step + BF16 sync
+            # are captured.
+            try:
+                # Save the optimizer state before warmup so we can restore
+                # after capture.  The save is ~6 GB (fp32_master + exp_avgs +
+                # exp_avg_sqs), which is ~8% of HBM and is freed immediately
+                # after capture.
+                _saved_fp32 = [p.clone() for p in fp32_master]
+                _saved_avgs = [exp_avgs[p.data_ptr()].clone() for p in fp32_master]
+                _saved_sqrs = [exp_avg_sqs[p.data_ptr()].clone() for p in fp32_master]
+                _saved_stps = [opt_state_steps[p.data_ptr()].clone() for p in fp32_master]
+
+                # Set .grad on fp32_master (required for _fused_adamw_).
+                for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
+                    p_fp32.grad = buf
+
+                # Warmup: run the optimizer step once (modifies state).
+                _adamw_step(
+                    optim_groups, fp32_master,
+                    exp_avgs, exp_avg_sqs, opt_state_steps,
+                    beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
+                )
+                _sync_bf16_from_fp32(bf16_params, fp32_master)
+                torch.cuda.synchronize()
+
+                # Restore the saved state.
+                for p_fp32, saved in zip(fp32_master, _saved_fp32):
+                    p_fp32.copy_(saved)
+                for p_fp32, saved in zip(fp32_master, _saved_avgs):
+                    exp_avgs[p_fp32.data_ptr()].copy_(saved)
+                for p_fp32, saved in zip(fp32_master, _saved_sqrs):
+                    exp_avg_sqs[p_fp32.data_ptr()].copy_(saved)
+                for p_fp32, saved in zip(fp32_master, _saved_stps):
+                    opt_state_steps[p_fp32.data_ptr()].copy_(saved)
+                _sync_bf16_from_fp32(bf16_params, fp32_master)
+                torch._foreach_zero_(fp32_grad_bufs)
+
+                # Capture the optimizer step (AdamW + BF16 sync).
+                _opt_cuda_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(_opt_cuda_graph):
+                    _adamw_step(
+                        optim_groups, fp32_master,
+                        exp_avgs, exp_avg_sqs, opt_state_steps,
+                        beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
+                    )
+                    _sync_bf16_from_fp32(bf16_params, fp32_master)
+
+                # Restore the saved state again (the capture also modified it).
+                for p_fp32, saved in zip(fp32_master, _saved_fp32):
+                    p_fp32.copy_(saved)
+                for p_fp32, saved in zip(fp32_master, _saved_avgs):
+                    exp_avgs[p_fp32.data_ptr()].copy_(saved)
+                for p_fp32, saved in zip(fp32_master, _saved_sqrs):
+                    exp_avg_sqs[p_fp32.data_ptr()].copy_(saved)
+                for p_fp32, saved in zip(fp32_master, _saved_stps):
+                    opt_state_steps[p_fp32.data_ptr()].copy_(saved)
+                _sync_bf16_from_fp32(bf16_params, fp32_master)
+                torch._foreach_zero_(fp32_grad_bufs)
+
+                # Free saved state to reclaim ~6 GB HBM.
+                del _saved_fp32, _saved_avgs, _saved_sqrs, _saved_stps
+
+                if rank == 0:
+                    print("[debug] Optimizer CUDA graph captured successfully",
+                          file=sys.stderr, flush=True)
+            except Exception as e:
+                if rank == 0:
+                    print(f"[debug] Optimizer CUDA graph capture failed: {e}",
+                          file=sys.stderr, flush=True)
+                _opt_cuda_graph = None
+
         except Exception as e:
             if rank == 0:
                 print(f"[debug] CUDA graph capture failed, falling back to eager: {e}", file=sys.stderr, flush=True)
@@ -1949,18 +2028,27 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             opt_lr_warmup, opt_lr_decay, opt_lr_wsd_decay,
         )
 
-        # ── AdamW optimizer step ──────────────────────────────────────
+        # ── AdamW optimizer step (CUDA graph or imperative) ────────────
         # Update per-group LR to match ref's ``pg["lr"] = lr * mult``
         for g, mult in zip(optim_groups, lr_mult_per_group):
             g["lr"] = current_lr * mult
-        _adamw_step(
-            optim_groups, fp32_master,
-            exp_avgs, exp_avg_sqs, opt_state_steps,
-            beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
-        )
-
-        # ── Sync BF16 params from FP32 master ─────────────────────────
-        _sync_bf16_from_fp32(bf16_params, fp32_master)
+        if _opt_cuda_graph is not None:
+            # Set .grad on fp32_master (must match the graph capture's
+            # tensor addresses — fp32_grad_bufs are never reallocated).
+            for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
+                p_fp32.grad = buf
+            # Replay the captured optimizer graph (AdamW + BF16 sync).
+            # The graph is a single replay that replaces ~472 kernel
+            # launches worth of Python launch overhead.
+            _opt_cuda_graph.replay()
+        else:
+            _adamw_step(
+                optim_groups, fp32_master,
+                exp_avgs, exp_avg_sqs, opt_state_steps,
+                beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
+            )
+            # ── Sync BF16 params from FP32 master ─────────────────────────
+            _sync_bf16_from_fp32(bf16_params, fp32_master)
 
         # ── Per-step logging ──────────────────────────────────────────
         step_end_event.record()

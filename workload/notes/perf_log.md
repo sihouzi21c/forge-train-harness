@@ -867,3 +867,44 @@ Once the remote is accessible:
    - Operator fusion (residual-add + RMSNorm, RoPE fusion) — small MFU gain
    - ZeRO-1 distributed optimizer (~20% MFU from reduced optimizer HBM traffic)
    - CUDA graph for optimizer step + BF16 sync
+- review R35 PASS: no proxy, docs-only commit; remote unreachable, no gates run, MFU below bar
+
+## [stage1] Round 36 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 4: optimizer step CUDA graph capture)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented Phase 4 optimizer step CUDA graph capture, extending the existing forward+backward CUDA graph to also capture the AdamW + BF16 sync step. This eliminates ~472 kernel launches (~15.8ms/step) of Python launch overhead for the optimizer step, for an estimated ~4% MFU improvement.
+
+**Optimizer step CUDA graph capture (`_opt_cuda_graph`)**:
+- Captured as a separate CUDA graph after the forward+backward graph, during the warmup phase.
+- Requires save/restore of fp32_master, exp_avgs, exp_avg_sqs, and opt_state_steps (~6 GB HBM, freed immediately after capture).
+- The gradient norm computation + clipping remains outside the graph (has a conditional).
+- The LR computation also remains outside the graph (Python-side).
+- During replay, only `.grad` assignment + `_opt_cuda_graph.replay()` replaces the imperative `_adamw_step` + `_sync_bf16_from_fp32`.
+- Falls back to the imperative path on capture failure (e.g., OOM during the ~6 GB save).
+- Enabled by `ENABLE_CUDA_GRAPH=1` (same flag as the forward+backward graph).
+
+**Remote access**:
+- `tsh` session expired and cannot be re-authenticated non-interactively.
+- Successfully tested `cctl job create BATCH` as an alternative to SSH — the cluster is accessible and CUDA is available (2× H100, CUDA: True).
+- The cluster does NOT have outbound internet access (HTTP connections to external hosts timeout).
+- A new GitHub repo (`sihouzi21c/forge-train-workspace`) was created and the code pushed, but `--code-type git` failed (no SSH key in the container image).
+- Two old devspaces (719240, 719369) were stopped to free up quota.
+- Running devspace 719101 is still accessible via `cctl` but not via SSH (expose port 22 returns 503).
+- The user needs to run `tsh login --proxy=teleport.cybertron.modelbest.co:443` interactively to restore SSH access.
+
+### Candidate levers for subsequent rounds (once remote is accessible)
+
+1. Sync changes: `bin/harness sync push`
+2. Run smoke gate: `bin/harness run long-train-smoke` (20 steps, DP=2) — FIRST time all Phase 3+4 optimizations (gradient bucketing + async H2D + CUDA_DEVICE_MAX_CONNECTIONS fix + pin_memory + optimizer graph) will be tested together
+3. Run profile: `bin/harness run profile-snapshot M6_round36`
+4. Run regression: `bin/harness run resume-gate-20`
+5. Candidate levers:
+   - Operator fusion (residual-add + RMSNorm, RoPE fusion) — small MFU gain
+   - ZeRO-1 distributed optimizer (~20% MFU from reduced optimizer HBM traffic)
+   - `cctl job create BATCH` with `--code-type git` and platform-managed SSH key for remote execution without tsh

@@ -742,3 +742,23 @@ The dev agent implemented Phase 1 background dataloader prefetch via `_Backgroun
 - `train_loop.py:2015-2017`: Prefetcher stopped during teardown
 - `bin/harness run guard`: PASS (0 violations)
 - `bin/harness run anti-proxy`: PASS (0 violations)
+
+---
+
+## [stage1] Round 35 (review-2) — 2026-08-14 02:00
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (docs-only commit)
+- **Commit**: 5a4ac16 — Docs: record Round 35 — background dataloader prefetch, remote still unreachable
+
+### Key conclusions
+
+This is a docs-only commit that records the Round 35 findings. The engine code is unchanged from commit 4be7e6a and is a genuine in-process implementation — no proxy, no shell-out to ref, no synthetic metrics, no hardcoded values. The `from ref.reference` imports in `train_loop.py:210,256` are dataloader builders only (data pipeline, not training logic), explicitly allowed by the architecture. Anti-proxy guard passed (0 violations). The remote devspace remains unreachable (tsh session expired), so no GPU gates were run. Stage 1 cannot finish: no `STAGE_STATUS: finished` in commit, no gate evidence, MFU below the review-side throughput bar.
+
+### Evidence highlights
+
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `mfu_elastic_check.py`: MFU_GATE_VERDICT: FAIL (BELOW_BAND) — below review-side throughput bar, not a review failure
+
+---
