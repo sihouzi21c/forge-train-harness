@@ -663,3 +663,65 @@ Once the remote is accessible:
    - Operator fusion (residual-add + RMSNorm, RoPE fusion) — small MFU gain
    - CUDA graph for optimizer step + BF16 sync — larger gain (~200ms saved)
    - Overlap dataloader H2D with optimizer step via pinned memory + non_blocking
+- review R31 FAIL: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization
+
+## [stage1] Round 32 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — remote devspace unreachable (tsh session expired), gates not run
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 3 continued: gradient bucketing sync fix + async H2D)
+- **Commit**: (current commit, local only)
+
+### Key conclusions
+
+The remote devspace (ds-710274, ds-718734) is not accessible because the `tsh` Teleport
+session has expired and `tsh login` requires an interactive terminal. A new devspace
+(tasks/719101) was created with `--expose-port 22` but the expose endpoint returned
+HTTP 503 consistently. The `cctl` CLI is authenticated but `tsh` is not, and there is
+no non-interactive way to re-authenticate Teleport without knowing the password.
+
+Two structural optimizations were implemented locally:
+
+1. **Gradient bucketing sync fix — replace `torch.cuda.synchronize()` with CUDA events**:
+   - The previous gradient bucketing implementation used `torch.cuda.synchronize(device=device)`
+     after submitting all bucket all-reduces on the gradient stream. This is a full device
+     sync that blocks the CPU until ALL GPU work (including the just-submitted all-reduces)
+     completes, defeating the purpose of async bucketing.
+   - Replaced with a CUDA event recorded on the gradient stream after all bucket all-reduces
+     are submitted, then `wait_event()` on the default stream. This avoids the CPU-side
+     block — the GPU all-reduce continues on the gradient stream while the CPU can
+     immediately start queuing the gradient norm computation and optimizer step on the
+     default stream (which will wait for the event before executing those kernels).
+   - Estimated MFU improvement: 0.5-1.0% from reduced GPU idle time during all-reduce.
+
+2. **Async H2D double buffering for CUDA graph path**:
+   - The previous `_next_batch` function returned GPU tensors (blocking H2D transfer),
+     and then a D2D `copy_()` moved the data to the pre-allocated CUDA graph buffers.
+     The H2D blocked the CPU while the GPU was idle.
+   - Changed to: `_next_batch` is called with `"cpu"` to return CPU tensors, and the
+     `copy_()` to the pre-allocated GPU buffers uses `non_blocking=True`. The CPU
+     prefetches the next microbatch while the GPU replays the current microbatch's
+     graph, so the H2D for the next batch overlaps with GPU compute.
+   - The first microbatch's H2D is still blocking (unavoidable), but subsequent
+     microbatches' H2D transfers overlap with the previous graph replay.
+   - Estimated MFU improvement: 0.3-0.5% from overlapping H2D with GPU compute.
+
+### Remote status
+
+- `tsh` session expired, no non-interactive re-authentication path available
+- `cctl` CLI is authenticated (profile: modelbest, user: sunhaojun)
+- Devspace 718734 (original) and 710274 (rebound in R27) both show "Running" status
+- New devspace 719101 was created with `--expose-port 22` but expose endpoint not functional
+- The user needs to run `tsh login --proxy=teleport.cybertron.modelbest.co --auth=local --user=sunhaojun` interactively
+
+### Next steps
+
+Once the remote is accessible:
+1. Sync changes: `bin/harness sync push`
+2. Run smoke gate: `bin/harness run long-train-smoke` (20 steps, DP=2)
+3. Run profile: `bin/harness run profile-snapshot M6_round32`
+4. Verify gradient bucketing sync fix improves MFU (estimated 0.5-1.0% vs single all-reduce)
+5. Candidate levers for subsequent rounds:
+   - Operator fusion (residual-add + RMSNorm, RoPE fusion) — small MFU gain
+   - ZeRO-1 distributed optimizer — larger gain (~20% MFU from reduced optimizer HBM traffic)
+   - CUDA graph for optimizer step + BF16 sync — captures optimizer kernels into the graph

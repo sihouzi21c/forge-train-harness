@@ -622,3 +622,19 @@ The dev agent implemented Phase 3 gradient bucketing to overlap NCCL all-reduce 
 - Remote devspace recovery requires interactive `tsh login`; new devspace ds-710274 is provisioned
 
 ---
+
+## [stage1] Round 31 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: fb8a958 — Perf: Phase 3 gradient bucketing for NCCL all-reduce overlap
+
+### Key conclusions
+The dev agent implemented Phase 3 gradient bucketing to overlap NCCL all-reduce with backward compute. The implementation is genuine in-process PyTorch code using `torch.cuda.Stream()`, `dist.all_reduce()`, and standard tensor operations — no proxy, no shell-out to ref, no synthetic metrics. The commit is a legitimate optimization touching only `train_loop.py`. Stage 1 cannot finish: the commit lacks `STAGE_STATUS: finished`, no gates were run this round (devspace inaccessible), no profile snapshot is committed, and the long-horizon throughput check is below the review-side bar.
+
+### Evidence highlights
+- `train_loop.py:1440-1457`: Gradient bucketing setup — `ENABLE_GRAD_BUCKETING`, `NUM_GRAD_BUCKETS`, `_grad_ar_stream`, per-bucket boundary computation
+- `train_loop.py:1721-1751`: Gradient bucketed all-reduce — per-bucket `dist.all_reduce` on separate stream, synchronize, unflatten
+- Anti-proxy guard: passed (0 violations)
+
+---

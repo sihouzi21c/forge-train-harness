@@ -1462,13 +1462,20 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         input_ids_buf = torch.empty(B, S, dtype=torch.long, device=device)
         labels_buf = torch.empty(B, S, dtype=torch.long, device=device)
         loss_mask_buf = torch.empty(B, S, dtype=torch.float32, device=device)
+        if use_mtp:
+            mtp_in_buf = torch.empty(B, S, dtype=torch.long, device=device)
+            mtp_lab_buf = torch.empty(B, S, dtype=torch.long, device=device)
+            mtp_mask_buf = torch.empty(B, S, dtype=torch.float32, device=device)
 
         # Warmup: run one microbatch to trigger CUDA autotuning and allocate
         # all intermediate tensors (so the graph capture has stable addresses).
-        warmup_ids, warmup_lab, warmup_mask = _next_batch(iter_dl, device)
-        input_ids_buf.copy_(warmup_ids)
-        labels_buf.copy_(warmup_lab)
-        loss_mask_buf.copy_(warmup_mask)
+        # Use CPU tensors with non_blocking H2D to match the async hot path.
+        warmup_ids, warmup_lab, warmup_mask = _next_batch(iter_dl, "cpu")
+        # The data is already on CPU, so no sync needed before the H2D copy.
+        input_ids_buf.copy_(warmup_ids, non_blocking=True)
+        labels_buf.copy_(warmup_lab, non_blocking=True)
+        loss_mask_buf.copy_(warmup_mask, non_blocking=True)
+        torch.cuda.synchronize()  # ensure H2D completed before warmup forward
         if use_mtp:
             mtp_in_buf = torch.empty(B, S, dtype=torch.long, device=device)
             mtp_lab_buf = torch.empty(B, S, dtype=torch.long, device=device)
@@ -1609,25 +1616,33 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # CUDA graph replay path: replay the captured graph for each microbatch.
             # The graph records the forward+backward.  Input data is copied into
             # pre-allocated buffers (stable addresses) before each replay.
+            #
+            # Async H2D double buffering: the next microbatch's H2D is started
+            # during the current microbatch's graph replay, so the H2D transfer
+            # overlaps with GPU compute instead of blocking the CPU.
+            # Pre-fetch the first microbatch as CPU tensors, then start H2D.
+            _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
             for _mb in range(config.grad_accum_steps):
-                input_ids, labels, loss_mask = _next_batch(iter_dl, device)
-                # Copy into pre-allocated buffers (stable addresses for graph replay).
-                input_ids_buf.copy_(input_ids)
-                labels_buf.copy_(labels)
-                loss_mask_buf.copy_(loss_mask)
+                # Start H2D for this microbatch (async, non-blocking for CPU).
+                input_ids_buf.copy_(_prefetch_ids, non_blocking=True)
+                labels_buf.copy_(_prefetch_lab, non_blocking=True)
+                loss_mask_buf.copy_(_prefetch_mask, non_blocking=True)
                 if use_mtp:
-                    # Compute MTP tensors and copy into pre-allocated buffers.
-                    # The _build_mtp_tensors creates temporary tensors, but the
-                    # copy_() writes to the stable buffer addresses captured by
-                    # the CUDA graph.
-                    _mtp = _build_mtp_tensors(input_ids, labels, loss_mask)
-                    mtp_in_buf.copy_(_mtp[0])
-                    mtp_lab_buf.copy_(_mtp[1])
-                    mtp_mask_buf.copy_(_mtp[2])
+                    _prefetch_mtp = _build_mtp_tensors(_prefetch_ids, _prefetch_lab, _prefetch_mask)
+                    mtp_in_buf.copy_(_prefetch_mtp[0], non_blocking=True)
+                    mtp_lab_buf.copy_(_prefetch_mtp[1], non_blocking=True)
+                    mtp_mask_buf.copy_(_prefetch_mtp[2], non_blocking=True)
 
                 # Replay the captured graph — the forward+backward runs at captured
                 # tensor addresses.  The _cached_lm_* tensors are updated in place.
                 cuda_graph.replay()
+
+                # While the GPU runs the current microbatch, prefetch the next
+                # microbatch's data on the CPU (no H2D yet).  The next iteration's
+                # copy_(..., non_blocking=True) will start the H2D that overlaps
+                # with the current graph replay's tail on the GPU.
+                if _mb < config.grad_accum_steps - 1:
+                    _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
 
                 # Read the updated loss values from the captured tensor addresses.
                 local_lm_sum += _cached_lm_sum.detach().double()
@@ -1734,8 +1749,17 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         dist.all_reduce(bucket_flat, op=dist.ReduceOp.SUM)
                         bucket_flat.mul_(norm_factor_float)
                         bucket_results.append((b_start_off, b_end_off, bucket_flat))
-                # Wait for all bucket all-reduces to complete.
-                torch.cuda.synchronize(device=device)
+                    # Record event on the gradient stream after all all-reduces are
+                    # submitted.  This avoids the CPU-blocking torch.cuda.synchronize()
+                    # below — the default stream waits for the gradient stream via the
+                    # event, so the CPU can proceed to queue the next operations
+                    # (gradient norm, optimizer step) without blocking.
+                    _grad_ar_event = torch.cuda.Event()
+                    _grad_ar_stream.record_event(_grad_ar_event)
+                # Wait on default stream (non-blocking for CPU).  The default stream's
+                # subsequent copy operations will wait for the gradient stream's
+                # all-reduce to complete, but the CPU can continue queuing work.
+                torch.cuda.current_stream().wait_event(_grad_ar_event)
                 # Copy the bucketed results back into the flat tensor.
                 for b_start_off, b_end_off, bucket_flat in bucket_results:
                     flat[b_start_off:b_end_off].copy_(bucket_flat)
