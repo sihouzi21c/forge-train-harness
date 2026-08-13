@@ -784,3 +784,20 @@ The dev agent implemented Phase 4 optimizer step CUDA graph capture in `train_lo
 - `mfu_elastic_check.py`: MFU_GATE_VERDICT: FAIL (BELOW_BAND) — below review-side throughput bar, not a review failure
 
 ---
+
+## [stage1] Round 37 — 2026-08-14 03:29:02
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: d67bc86 — Perf: Phase 2 — ZeRO-1 distributed optimizer (reduce_scatter + sharded AdamW)
+
+### Key conclusions
+
+The dev agent implemented a genuine ZeRO-1 distributed optimizer in `workload/src/training_engine_tensor/zero_optimizer.py`, sharding FP32 optimizer state (master weights, Adam m/v, step counters) across DP ranks. The implementation uses `torch.distributed` primitives (`reduce_scatter`, `all_gather_into_tensor`, `all_reduce`) and `torch._fused_adamw_` — no shell-outs to `ref/`, no reference imports, no hardcoded synthetic metrics. The integration into `train_loop.py` (lines 1407-1423, 1439-1446) is clean and conditional on the `ENABLE_ZERO_OPTIMIZER` env var. Stage 1 remains in-progress because the commit does not declare `STAGE_STATUS: finished`, no profile snapshot is included, and the long-horizon throughput bar has not been reached.
+
+### Evidence highlights
+- `zero_optimizer.py:186-190` — `dist.reduce_scatter` with `ReduceOp.SUM` for gradient communication
+- `zero_optimizer.py:257-331` — `zero_optimizer_step` uses `torch._fused_adamw_` on the shard's params only
+- `train_loop.py:63-73` — imports from `training_engine_tensor.zero_optimizer`, not from `ref/`
+
+---

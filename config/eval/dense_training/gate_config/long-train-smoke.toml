@@ -22,3 +22,4 @@ deterministic              = false
 micro_batch_size_override  = 10
 cublas_workspace_config          = "@unset"
 nvte_allow_nondeterministic_algo = "@unset"
+cuda_device_max_connections      = "@unset"
