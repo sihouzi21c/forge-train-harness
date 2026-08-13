@@ -17,6 +17,7 @@ scheduled — the reverse computation graph is unrolled manually.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -73,7 +74,6 @@ class _SimpleHashPool:
     """
 
     def __init__(self) -> None:
-        import concurrent.futures
         n_workers = min(16, max(4, (os.cpu_count() or 4)))
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=n_workers, thread_name_prefix="hash-pool",
