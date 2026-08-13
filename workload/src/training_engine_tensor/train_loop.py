@@ -611,6 +611,8 @@ def _static_backward(
     # MTP BRANCH BACKWARD (if enabled)
     # ====================================================================
     d_hidden_normed_main = None  # gradient from MTP into hidden_normed
+    dw_output_mtp_accum = None  # shared param: output_weight MTP contribution
+    dw_mtp_emb_accum = None  # shared param: tok_embeddings MTP contribution
 
     if cache.mtp_logits is not None and model.mtp is not None:
         # ── MTP Cross-entropy loss backward ────────────────────────────
@@ -629,7 +631,11 @@ def _static_backward(
         g2_mtp = grad_mtp_logits.reshape(-1, V)
         mtp_pre = cache.mtp_pre_head.reshape(-1, H)
         dw_output_mtp = torch.matmul(g2_mtp.transpose(0, 1), mtp_pre).float()
-        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.output_weight, dw_output_mtp)
+        # Defer add: combine with main contribution in fp32 first (matching ref's
+        # single ``buf.add_(main_grad)`` per microbatch).  Two separate ``add_``
+        # calls produce ``(buf + A) + B`` while the ref does ``buf + (A + B)``;
+        # these differ in fp32 when ``buf != 0`` (microbatch >= 2).
+        dw_output_mtp_accum = dw_output_mtp
 
         # ── width_mult backward: d(hidden) = d(mtp_pre_head) / width_mult
         d_mtp_final = d_mtp_pre_head / width_mult
@@ -743,7 +749,7 @@ def _static_backward(
         dw_mtp_emb = embedding_backward(
             grad_mtp_emb * mup_emb_scale, cache.mtp_input_ids, V
         )
-        _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.tok_embeddings_weight, dw_mtp_emb)
+        dw_mtp_emb_accum = dw_mtp_emb  # defer add: combine with main contribution
 
         # Accumulate gradient into hidden_normed from MTP
         d_hidden_normed_main = d_hidden_normed_mtp
@@ -762,7 +768,10 @@ def _static_backward(
     g2_main = grad_logits.reshape(-1, V)
     main_pre = cache.main_pre_head.reshape(-1, H)
     dw_output_main = torch.matmul(g2_main.transpose(0, 1), main_pre).float()
-    _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.output_weight, dw_output_main)
+    # Combine MTP + main contributions in fp32 before a single add_ into
+    # fp32_grad_bufs (matching ref's ``buf.add_(main_grad)`` per microbatch).
+    dw_output = dw_output_main + dw_output_mtp_accum if dw_output_mtp_accum is not None else dw_output_main
+    _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.output_weight, dw_output)
 
     # ── width_mult backward: d(hidden) = d(main_pre_head) / width_mult
     d_hidden_normed = d_main_pre_head / width_mult
@@ -856,6 +865,10 @@ def _static_backward(
     dw_emb = embedding_backward(
         d_hidden * mup_emb_scale, cache.input_ids, C.VOCAB_SIZE
     )
+    # Combine MTP + main contributions in fp32 before a single add_ into
+    # fp32_grad_bufs (matching ref's ``buf.add_(main_grad)`` per microbatch).
+    if dw_mtp_emb_accum is not None:
+        dw_emb = dw_emb + dw_mtp_emb_accum
     _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.tok_embeddings_weight, dw_emb)
 
 
@@ -1262,8 +1275,13 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # clip_grad_norm_ reads the same .grad fields the ref does.
         for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
             p_fp32.grad = buf
+        # Match the ref's clip_grad_norm_ call exactly (same positional args)
+        # for bitwise-identical grad norm computation.  The fp32_master order
+        # now matches the ref's model.parameters() order (tok_embeddings →
+        # layers → norm → output → mtp), so the per-tensor norm stack is
+        # bitwise-identical.
         grad_norm_val = torch.nn.utils.clip_grad_norm_(
-            fp32_master, max_norm=opt_clip_grad, norm_type=2.0,
+            fp32_master, opt_clip_grad,
         )
 
         # ── Compute LR for this step ──────────────────────────────────
@@ -1365,9 +1383,12 @@ def _collect_bf16_params(model: ModelParameters) -> list[torch.Tensor]:
 
     The ref's model keeps ``tok_embeddings.weight`` and ``output.weight`` as
     SEPARATE tensors with independent optimizer state (m, v).  Both are
-    included in the parameter list.
+    included in the parameter list.  The order must match the ref's
+    ``model.parameters()`` order (tok_embeddings → layers → norm → output
+    → mtp) so that ``torch.linalg.vector_norm`` on the stacked per-tensor
+    norms produces a bitwise-identical total gradient norm.
     """
-    params = [model.tok_embeddings_weight, model.output_weight]
+    params = [model.tok_embeddings_weight]
     for layer in model.layers:
         params.extend([
             layer.input_norm_weight,
@@ -1378,6 +1399,7 @@ def _collect_bf16_params(model: ModelParameters) -> list[torch.Tensor]:
             layer.mlp_fc2_weight,
         ])
     params.append(model.final_norm_weight)
+    params.append(model.output_weight)
     if model.mtp is not None:
         params.extend([
             model.mtp.emb_input_norm_weight,

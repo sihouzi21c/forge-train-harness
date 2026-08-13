@@ -328,3 +328,27 @@ None.
 - anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)
 - Engine is a genuine in-process implementation (no subprocess calls to ref/ scripts, no hardcoded synthetic metrics, no renamed proxy variants)
 - Stage 1 finish conditions not satisfied: no `STAGE_STATUS: finished` in commit message, no harness-written gate evidence for the four required suites (long-train, resume-gate-20, resume-startup-90, perf-bitwise)
+
+---
+
+## [stage1] Round 16 — 2026-08-13 12:25:00
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: def4b93 — Fix: add preallreduce hash capture, bisect multi-GPU gradient divergence to shared params
+
+### Key conclusions
+The dev agent added `preallreduce` hash capture to the in-house engine (matching the ref's `harness_dp` pre-all-reduce pattern) and bisected the `multistep` (DP=2) gradient divergence. The preallreduce capture captures gradients BEFORE the all-reduce and scaling, allowing separation of the gradient computation error from the all-reduce error. The bisect reveals that only the shared parameters (tok_embeddings, output_weight) have wrong gradients at step 0 — all other 310 parameters (MTP-specific and main-specific) are correct. The `dptr_idx` mapping is verified correct. The engine remains a genuine in-process implementation — no proxy, forgery, hardcoded metrics, or shell-outs. The anti-proxy guard passes. Stage 1 finish conditions are not met.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:1318-1330`: `_capture_all_gradients` now supports `suffix` parameter for `preallreduce`/`postallreduce` capture
+- `train_loop.py:1224-1229, 1237-1242`: `preallreduce` hash capture before all-reduce + scaling (multi-GPU and single-GPU paths)
+- `workload/notes/perf_log.md`: Round 16 findings documented — preallreduce hash bisect shows shared-param gradient divergence at step 0
+- anti-proxy guard: PASS (0 violations); no gate configs, `remote.toml`, or run-shape keys modified
+- Engine is a genuine in-process implementation (`ref.reference` imports at lines 206, 252 are dataloader utility reuse, not training logic proxy — unchanged from prior rounds)
+- Stage 1 finish conditions not satisfied: no `STAGE_STATUS: finished` in commit message, no harness-written gate evidence for the four required suites (long-train, resume-gate-20, resume-startup-90, perf-bitwise)
+
+---

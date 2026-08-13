@@ -131,3 +131,40 @@ The dev agent added `preallreduce` hash capture to the in-house engine (matching
 ### Next step
 
 Investigate the root cause of the shared-parameter gradient divergence. The fact that only parameters receiving gradients from two branches (MTP + main) are wrong while all single-branch params are correct suggests the issue is in the `_add_to_grad_bufs` accumulation order or a CUDA kernel selection difference when NCCL is initialized for multi-GPU.
+- review R16 PASS: genuine engine debug, preallreduce bisect to shared params, no proxy; stage 1 in-progress
+
+## [stage1] Round 17 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: bitwise-multicard — **PASS**
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent resolved the multi-GPU DP gradient divergence by fixing two bugs:
+
+1. **Shared param gradient accumulation order — two `add_` vs one `add_`**:
+   - The `_static_backward` was doing two separate `_add_to_grad_bufs` calls for shared params (`output_weight`, `tok_embeddings_weight`) — one from the MTP branch, one from the main branch.
+   - The ref does a single `buf.add_(main_grad)` per microbatch where `main_grad` already contains both MTP and main contributions.
+   - For fp32: `(buf + A) + B` ≠ `buf + (A + B)` when `buf ≠ 0` (microbatch ≥ 2).
+   - Fixed by deferring the `_add_to_grad_bufs` calls for shared params and combining MTP + main contributions in fp32 before a single `add_` into `fp32_grad_bufs`.
+
+2. **`_collect_bf16_params` order mismatch — `torch.linalg.vector_norm` order sensitivity**:
+   - The `_collect_bf16_params` order placed `output_weight` at position 1 (after `tok_embeddings`), while the ref's `model.parameters()` places it at position 4 (after `norm.weight`).
+   - `torch.linalg.vector_norm(torch.stack(norms))` in `clip_grad_norm_` is order-dependent for fp32 summation: `sqrt(sum(x_i^2))` differs when the per-tensor norms are in a different order.
+   - Fixed by moving `output_weight` after `final_norm_weight` in `_collect_bf16_params` to match the ref's `model.parameters()` order.
+
+### Gate results (multistep, DP=2)
+
+- **Loss**: 8/8 steps bitwise match (max_abs_diff == 0.0)
+- **Grad norm**: 8/8 steps bitwise match (max_abs_diff == 0.0)
+- **Hash**: 5024/5024 keys match (both preallreduce and postallreduce)
+- **correctness_pass**: True
+- **hash_pass**: True
+
+### Milestone declaration
+
+All 8 steps of loss and grad_norm are bitwise identical to the ref. All 5024 hash keys match (157 params × 2 ranks × 2 suffixes × 8 steps). The `multistep` (DP=2, MBS=2, GBS=40, grad_accum=10, hash_capture_level=2) gate passes.
+
+**MILESTONE_STATUS: bitwise-multicard PASS**
