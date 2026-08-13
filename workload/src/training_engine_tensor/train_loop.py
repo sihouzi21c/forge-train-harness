@@ -1182,6 +1182,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     if config.hash_capture_level > 0:
         capture_records = {}
         if config.hash_capture_level >= 2:
+            # Disable the pinned staging ring (bitwise-multicard constraint):
+            # pinned memory + CUDA copy streams deadlock with
+            # CUDA_DEVICE_MAX_CONNECTIONS=1 (multi-GPU DP).  The pageable
+            # snapshot path avoids the issue entirely.
+            os.environ["FORGE_HASH_STAGING_MB"] = "0"
             hasher = OffloadHasher()
         # NOTE: capture_prefix and grad_prefix are updated per-step below
         # (the step number changes each iteration).  The initial values are
