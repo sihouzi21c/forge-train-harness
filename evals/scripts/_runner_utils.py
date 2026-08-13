@@ -38,8 +38,15 @@ def abort_if_gpu_dirty() -> None:
     CPU-only CI). The gate would not be functional in those environments
     anyway, so skipping the check is safe — actual GPU-required suites
     fail downstream with a clearer message.
+
+    Skipped when ``FORGE_NSYS_RANK0_OUTPUT`` is set (``nsys profile``
+    wrapper creates a CUDA context that shows up as a compute app, causing
+    a false positive — the ``profile-snapshot`` suite is the only caller
+    that sets this env var).
     """
     if int(os.environ.get("RANK", "0")) != 0:
+        return
+    if os.environ.get("FORGE_NSYS_RANK0_OUTPUT"):
         return
     try:
         out = subprocess.check_output(

@@ -28,6 +28,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from evals.capture_offload import hash_batch_sync
 
 from training_engine_tensor import config as C
 from training_engine_tensor.backward import (
@@ -994,9 +995,20 @@ def _sync_bf16_from_fp32(
     bf16_params: list[torch.Tensor],
     fp32_master: list[torch.Tensor],
 ) -> None:
-    """Copy FP32 master weights back to BF16 params (in-place, no grad)."""
-    for p_bf16, p_fp32 in zip(bf16_params, fp32_master):
-        p_bf16.data.copy_(p_fp32.data)
+    """Copy FP32 master weights back to BF16 params using a single flat copy.
+
+    Flattens all FP32 masters into one contiguous tensor, does a single BF16
+    conversion, then scatters back to the per-param BF16 buffers.  This reduces
+    the per-param ``copy_()`` kernel launches (157 → 1) and replaces the
+    element-wise ``bfloat16()`` + ``copy_()`` with a single fused kernel.
+    """
+    flat_fp32 = torch._utils._flatten_dense_tensors(fp32_master)
+    flat_bf16 = flat_fp32.bfloat16()
+    for p_bf16, sub in zip(
+        bf16_params,
+        torch._utils._unflatten_dense_tensors(flat_bf16, bf16_params),
+    ):
+        p_bf16.data.copy_(sub)
 
 
 def _init_optimizer_state(
@@ -1335,17 +1347,22 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
 def _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model,
                            prefix: str = "", suffix: str = "postallreduce"):
-    """Capture all parameter gradients as hash records (inline synchronous).
+    """Capture all parameter gradients as hash records (offloaded to thread pool).
 
-    Args:
-        suffix: ``"postallreduce"`` (default) or ``"preallreduce"``.
+    Uses ``evals.capture_offload.hash_batch_sync`` to run blake2b on the
+    shared thread pool, avoiding the inline ``_hash_tensor`` overhead.
     """
     fqn_map = _build_fqn_map(model)
+    items = []
     for buf, p in zip(fp32_grad_bufs, bf16_params):
         fqn = fqn_map.get(p.data_ptr(), None)
         if fqn is not None:
             key = f"{prefix}rank{os.environ.get('RANK', '0')}.grad.{fqn}.{suffix}"
-            capture_records[key] = _hash_tensor(buf)
+            items.append((key, buf))
+    if items:
+        results = hash_batch_sync(items)
+        for key, record in results:
+            capture_records[key] = record
 
 
 def _build_fqn_map(model: ModelParameters) -> dict:

@@ -375,3 +375,22 @@ None.
 - `train_loop.py:1386-1402`: _collect_bf16_params order matches ref's model.parameters() (tok_embeddings → layers → norm → output → mtp)
 - anti-proxy guard: PASS (0 violations); framework guard: PASS (0 violations)
 - multistep gate: 8/8 loss, 8/8 grad_norm, 5024/5024 hash — all PASS
+
+## [stage1] Round 17 (review) — 2026-08-13 13:14:01
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 362addb — Docs: record Round 17 review notes — bitwise-multicard PASS
+
+### Key conclusions
+This commit is a docs-only update recording review notes from the previous round (commit 11816d4). The engine code is unchanged. The notes document the resolution of two bugs: shared-param gradient accumulation ordering and `_collect_bf16_params` order mismatch. All 8/8 loss and grad_norm steps are bitwise identical, 5024/5024 hash keys match. No proxy, forgery, hardcoding, or shell-out detected. Stage 1 finish conditions not satisfied (no `STAGE_STATUS: finished` in commit message). Milestone bitwise-multicard is active, not long-horizon, so no throughput check needed.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `workload/notes/review.md`: only file modified — 23 lines of review notes appended
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `git diff HEAD~1 HEAD`: only `workload/notes/review.md` changed
+
+---

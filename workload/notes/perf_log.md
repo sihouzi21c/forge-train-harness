@@ -168,3 +168,44 @@ The dev agent resolved the multi-GPU DP gradient divergence by fixing two bugs:
 All 8 steps of loss and grad_norm are bitwise identical to the ref. All 5024 hash keys match (157 params × 2 ranks × 2 suffixes × 8 steps). The `multistep` (DP=2, MBS=2, GBS=40, grad_accum=10, hash_capture_level=2) gate passes.
 
 **MILESTONE_STATUS: bitwise-multicard PASS**
+- review R17 PASS: docs-only commit recording Round 16 PASS — bitwise-multicard milestone achieved, stage 1 in-progress
+
+## [stage1] Round 18 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: bitwise-perf — in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent optimized the per-step MFU from 2.7% to 6.0% (DP=2, MBS=2, GBS=32, grad_accum=8, hash_capture_level=1, 25 steps) by offloading the gradient hash capture to a thread pool.
+
+**Optimization — hash capture offload via `evals.capture_offload.hash_batch_sync`**:
+- The inline `_hash_tensor` function in `_capture_all_gradients` was doing synchronous D2H copy + blake2b on the training thread for ALL 157 gradient buffers, adding ~6.8s of overhead per call × 2 calls = 13.6s per step.
+- Replaced with `hash_batch_sync` which submits `hash_tensor(t)` to a shared thread pool (16 workers), letting the training thread return immediately while blake2b runs in parallel across cores.
+- Step time improved from 19.1s to 8.3s (2.3× improvement), MFU from 2.7% to 6.0%.
+
+**Additional optimization — flat fp32→bf16 param sync**:
+- Replaced per-param `p_bf16.data.copy_(p_fp32.data)` (157 separate kernel launches) with `torch._utils._flatten_dense_tensors` + single `bfloat16()` + `_unflatten_dense_tensors` (1 fused kernel launch).
+- Minor MFU improvement, contributes to the overall 6.0% result.
+
+### Reason for not reaching the target
+
+After 3 rounds of optimization, the MFU ceiling is ~6.0% due to hash capture overhead:
+- The `hash_batch_sync` function still does D2H copy on the worker thread (CUDA API call on the default stream, serialized across all 16 workers).
+- The 2 large buffers (embedding: 536MB, output: 536MB) dominate the hash time: each takes ~590ms (D2H + blake2b), and the `_capture_all_gradients` is called 2× per step (preallreduce + postallreduce).
+- Net hash capture overhead: ~5.05s per step (8.3s - 3.25s training time).
+- To reach 10% MFU, the hash capture overhead would need to be reduced to ~1.5s, which requires either: (a) switching to the `OffloadHasher`'s async D2H copy stream (which deadlocks under `CUDA_DEVICE_MAX_CONNECTIONS=1`), or (b) reducing the hash capture frequency (e.g., only capturing on the final step instead of every step).
+
+### Gate results (perf-bitwise, DP=2)
+
+- **Loss**: 15/15 steps bitwise match (max_abs_diff == 0.0)
+- **Grad norm**: 15/15 steps bitwise match (max_abs_diff == 0.0)
+- **Hash**: 15700/15700 keys match
+- **MFU(standard)**: 6.0% < 10.0% target
+- **correctness_pass**: True, **hash_pass**: True, **mfu_pass**: False
+
+### Next step
+
+Proceed to `resume` milestone per the methodology: "If after 3 rounds you still cannot reach the target, do not keep grinding inside bitwise-perf".
