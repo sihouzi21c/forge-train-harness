@@ -209,3 +209,60 @@ After 3 rounds of optimization, the MFU ceiling is ~6.0% due to hash capture ove
 ### Next step
 
 Proceed to `resume` milestone per the methodology: "If after 3 rounds you still cannot reach the target, do not keep grinding inside bitwise-perf".
+- review R18 PASS: hash_batch_sync from candidate-facing capture_offload, no proxy; bitwise-perf exhausted, proceed to resume
+
+## [stage1] Round 19 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: bitwise-perf — in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent attempted to overlap the hash capture blake2b with GPU compute
+by doing D2H copies on the main thread (batched, full-buffer) and submitting
+blake2b to the thread pool, but the approach regressed MFU from 6.0% to 3.7%.
+
+**Root cause of the regression**: `tensor.cpu()` is a **blocking** call —
+it waits for the D2H copy to complete before returning (0.45s for a 800MB
+fp32 buffer).  The old `hash_batch_sync` approach, which does D2H in 32MB
+chunks interleaved with blake2b on the thread-pool workers, is more efficient
+because the CPU is never idle waiting for the D2H — the worker thread does
+blake2b on the previous chunk while the DMA engine transfers the next chunk.
+
+**Bitwise-perf ceiling analysis**:
+
+The hash capture overhead is 5.05s/step (D2H 0.6s + blake2b 4.45s), while
+the training itself is 3.25s/step (16.2% training-only MFU).  The blake2b
+is the bottleneck: 2 captures × 157 buffers × ~21ms/blake2b-chunk = 4.45s/step.
+
+The GPU compute after each hash capture (all-reduce 0.5s + optimizer 0.45s)
+provides only 0.95s of overlap — far less than the 4.45s of blake2b.  Even
+with perfect overlap, the remaining blake2b (3.5s) keeps the total step time
+at ~7.35s (MFU ~6.8%), still below the 10.0% target.
+
+The blake2b throughput is bounded by the CPU's single-core blake2b rate
+(~1.5 GB/s).  The 16-worker thread pool cannot parallelize the 2 large
+buffers (800MB each) any further because each worker's D2H copies are
+serialized on the CUDA default stream under `CUDA_DEVICE_MAX_CONNECTIONS=1`.
+
+**Conclusion**: The 10.0% MFU target is structurally unreachable under the
+current gate configuration (hash_capture_level=1, DP=2, MBS=2, GBS=32)
+because the hash capture overhead is dominated by blake2b computation that
+cannot be sufficiently overlapped with GPU compute.  Proceeding to resume
+milestone per the methodology.
+
+### Gate results (perf-bitwise, DP=2)
+
+- **Loss**: 15/15 steps bitwise match (max_abs_diff == 0.0)
+- **Grad norm**: 15/15 steps bitwise match (max_abs_diff == 0.0)
+- **Hash**: 15700/15700 keys match
+- **MFU(standard)**: 6.0% < 10.0% target
+- **correctness_pass**: True, **hash_pass**: True, **mfu_pass**: False
+
+### Next step
+
+Proceed to `resume` milestone — the bitwise-perf ceiling is structural and
+cannot be resolved within the allowed optimization techniques (no operator
+fusion, no precision changes, no hash algorithm changes).

@@ -1349,8 +1349,8 @@ def _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model,
                            prefix: str = "", suffix: str = "postallreduce"):
     """Capture all parameter gradients as hash records (offloaded to thread pool).
 
-    Uses ``evals.capture_offload.hash_batch_sync`` to run blake2b on the
-    shared thread pool, avoiding the inline ``_hash_tensor`` overhead.
+    Uses ``evals.capture_offload.hash_batch_sync`` to run D2H + blake2b on the
+    shared thread pool, blocking until all hashes are done.
     """
     fqn_map = _build_fqn_map(model)
     items = []

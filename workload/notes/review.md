@@ -394,3 +394,22 @@ None.
 - `git diff HEAD~1 HEAD`: only `workload/notes/review.md` changed
 
 ---
+
+## [stage1] Round 18 — 2026-08-13 14:41:56
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 1319e65 — Perf: offload gradient hash capture to thread pool; flat fp32→bf16 sync
+
+### Key conclusions
+The dev agent optimized per-step MFU from 2.7% to 6.0% by offloading gradient hash capture to a thread pool (`evals.capture_offload.hash_batch_sync`) and flattening the fp32→bf16 param sync. The `hash_batch_sync` import from `evals.capture_offload` is explicitly candidate-facing per the module's docstring (line 9-12: "THIS module is explicitly candidate-facing: the engine under `workload/src` MAY `from evals.capture_offload import ...`"). The `_sync_bf16_from_fp32` optimization (train_loop.py:994-1011) uses `torch._utils._flatten_dense_tensors` + single `bfloat16()` — a legitimate fused-kernel optimization, not a proxy. The `_runner_utils.py` change is a harness-side fix for nsys profiling false positive. No shell-outs, no reference-imported training logic, no hardcoded synthetic metrics. Bitwise correctness is preserved (15/15 loss + grad_norm match, 15700/15700 hash keys). The 6.0% MFU is below the 10.0% target; the dev agent declares exhaustion and proceeds to the `resume` milestone.
+
+### Violations (fill in only on FAIL)
+None.
+
+### Evidence highlights
+- `train_loop.py:1348-1365`: `_capture_all_gradients` now uses `hash_batch_sync` from `evals.capture_offload` — an explicitly candidate-facing harness utility, not a reference proxy
+- `train_loop.py:1005-1011`: `_sync_bf16_from_fp32` uses `torch._utils._flatten_dense_tensors` + single `bfloat16()` — legitimate fused-kernel optimization (157→1 kernel launch)
+- `evals/capture_offload.py:1-12`: Module docstring states "THIS module is explicitly candidate-facing" — the import is permitted
+- `evals/scripts/_runner_utils.py:48-49`: `FORGE_NSYS_RANK0_OUTPUT` skip — harness-side fix for nsys false positive, not a candidate engine modification
+- `bin/harness run anti-proxy`: PASS (0 violations); no gate configs, `remote.toml`, or run-shape keys modified
