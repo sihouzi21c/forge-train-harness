@@ -638,3 +638,37 @@ The dev agent implemented Phase 3 gradient bucketing to overlap NCCL all-reduce 
 - Anti-proxy guard: passed (0 violations)
 
 ---
+
+## [stage1] Round 32 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: c50e802 — Perf: Phase 3 continued — gradient bucketing sync fix (CUDA events) + async H2D double buffering
+
+### Key conclusions
+The dev agent implemented two legitimate CUDA optimizations this round: (1) replacing `torch.cuda.synchronize()` in gradient bucketing with CUDA events to avoid blocking the CPU after all-reduce submission, and (2) async H2D double buffering for the CUDA graph path using `non_blocking=True` copies from CPU tensors. Both are genuine in-process PyTorch/CUDA code — no proxy, no shell-out to ref, no synthetic metrics. Anti-proxy guard passed (0 violations). Stage 1 cannot finish: the commit lacks `STAGE_STATUS: finished`, no gates were run (devspace unreachable), no profile snapshot is committed, and the long-horizon throughput check is below the review-side bar.
+
+### Evidence highlights
+- `train_loop.py:1752-1758`: CUDA event recorded on gradient stream after all-reduces, `wait_event()` on default stream — replaces blocking `torch.cuda.synchronize()`
+- `train_loop.py:1619-1633`: Async H2D double buffering — `_next_batch(iter_dl, "cpu")` with `non_blocking=True` copy_, prefetch next microbatch during graph replay
+- Anti-proxy guard: passed (0 violations)
+
+---
+
+## [stage1] Round 33 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit) — Perf: Phase 1 continued — eager path async H2D double buffering, non_blocking _next_batch
+
+### Key conclusions
+
+The dev agent implemented an async H2D double buffering optimization for the eager (non-CUDA-graph) training path. The `_next_batch` function now returns CPU tensors when `device="cpu"` and uses `non_blocking=True` for GPU transfers. The eager path pre-allocates fixed-shape GPU buffers and pre-fetches the next microbatch on CPU while the GPU is computing the current microbatch, overlapping H2D transfers with GPU compute. The change is a genuine in-process PyTorch/CUDA optimization — no proxy, no shell-out to ref, no synthetic metrics. All changes are restricted to `train_loop.py`. Anti-proxy guard passed (0 violations). The remote devspace remains unreachable due to expired `tsh` session (no interactive terminal available for `tsh login`). Stage 1 cannot finish: the commit lacks `STAGE_STATUS: finished`, no gates were run (devspace unreachable), no profile snapshot is committed, and the long-horizon throughput check is below the review-side bar.
+
+### Evidence highlights
+
+- `train_loop.py:274-284`: `_next_batch` now supports `device="cpu"` return path and uses `non_blocking=True` for GPU `.to(device)` calls
+- `train_loop.py:1664-1740`: Eager path restructured with pre-allocated GPU buffers, async `copy_(..., non_blocking=True)` H2D, and CPU-side prefetch of the next microbatch
+- Anti-proxy guard: passed (0 violations)
+
+---

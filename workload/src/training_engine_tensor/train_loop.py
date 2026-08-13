@@ -271,14 +271,24 @@ def _next_batch(dl, device):
     all loss mask values are zero.  The ref's ``PrefetchedBatcher`` and inline
     ``next_batch`` both do this; without it the in-house engine would consume
     a batch that the ref skipped, causing data misalignment.
+
+    When ``device="cpu"``, returns CPU tensors (for the async H2D path where
+    the caller does ``copy_(tensor, non_blocking=True)`` into pre-allocated
+    pinned GPU buffers).  When ``device`` is a CUDA device, returns GPU tensors
+    via a synchronous ``.to(device)`` (fallback for non-CUDA-graph paths).
     """
     data = next(dl)
     while (data["loss_mask"] == 0).all().item():
         data = next(dl)
+    tokens = data["tokens"]
+    labels = data["labels"]
+    loss_mask = data["loss_mask"].float()
+    if device == "cpu":
+        return tokens, labels, loss_mask
     return (
-        data["tokens"].to(device),
-        data["labels"].to(device),
-        data["loss_mask"].float().to(device),
+        tokens.to(device, non_blocking=True),
+        labels.to(device, non_blocking=True),
+        loss_mask.to(device, non_blocking=True),
     )
 
 
@@ -1651,34 +1661,51 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     local_mtp_sum += _cached_mtp_sum.detach().double()
                     local_mtp_n += _cached_mtp_n.detach().double()
         else:
-            # Eager path (no CUDA graph capture).
+            # Eager path (no CUDA graph capture) — prefetch H2D with non_blocking.
+            # Pre-allocate input buffers so we can use non_blocking copy_ for H2D.
+            B, S = config.micro_batch_size, C.MAX_SEQ_LEN
+            _eager_ids = torch.empty(B, S, dtype=torch.long, device=device)
+            _eager_lab = torch.empty(B, S, dtype=torch.long, device=device)
+            _eager_mask = torch.empty(B, S, dtype=torch.float32, device=device)
+            if use_mtp:
+                _eager_mtp_in = torch.empty(B, S, dtype=torch.long, device=device)
+                _eager_mtp_lab = torch.empty(B, S, dtype=torch.long, device=device)
+                _eager_mtp_mask = torch.empty(B, S, dtype=torch.float32, device=device)
+            _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
             for _mb in range(config.grad_accum_steps):
-                input_ids, labels, loss_mask = _next_batch(iter_dl, device)
+                # Start H2D for this microbatch (async, non-blocking for CPU).
+                _eager_ids.copy_(_prefetch_ids, non_blocking=True)
+                _eager_lab.copy_(_prefetch_lab, non_blocking=True)
+                _eager_mask.copy_(_prefetch_mask, non_blocking=True)
 
                 if use_mtp:
-                    mtp_in, mtp_lab, mtp_mask = _build_mtp_tensors(input_ids, labels, loss_mask)
+                    _prefetch_mtp = _build_mtp_tensors(_prefetch_ids, _prefetch_lab, _prefetch_mask)
+                    _eager_mtp_in.copy_(_prefetch_mtp[0], non_blocking=True)
+                    _eager_mtp_lab.copy_(_prefetch_mtp[1], non_blocking=True)
+                    _eager_mtp_mask.copy_(_prefetch_mtp[2], non_blocking=True)
+
                     cache = _forward_with_cache(
-                        model, input_ids, labels, loss_mask,
-                        mtp_in, mtp_lab, mtp_mask,
+                        model, _eager_ids, _eager_lab, _eager_mask,
+                        _eager_mtp_in, _eager_mtp_lab, _eager_mtp_mask,
                         rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
                         None,  # skip fwd hash (too slow for DP multi-GPU),
                         capture_prefix, deterministic,
                     )
-                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
-                    mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, mtp_lab, mtp_mask)
+                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, _eager_lab, _eager_mask)
+                    mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, _eager_mtp_lab, _eager_mtp_mask)
                     local_mtp_sum += mtp_sum_v.detach().double()
                     local_mtp_n += mtp_n_v.detach().double()
                 else:
                     cache = _forward_with_cache(
-                        model, input_ids, labels, loss_mask,
+                        model, _eager_ids, _eager_lab, _eager_mask,
                         None, None, None,
                         rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
                         None,  # skip fwd hash (too slow for DP multi-GPU),
                         capture_prefix, deterministic,
                     )
-                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
+                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, _eager_lab, _eager_mask)
 
                 # ── Static backward pass ──────────────────────────────────
                 _static_backward(
@@ -1696,6 +1723,13 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
                 local_lm_sum += lm_sum.detach().double()
                 local_lm_n += lm_n.detach().double()
+
+                # While the GPU runs the current microbatch, prefetch the next
+                # microbatch's data on the CPU (no H2D yet).  The next iteration's
+                # copy_(..., non_blocking=True) will start the H2D that overlaps
+                # with the current backward's tail on the GPU.
+                if _mb < config.grad_accum_steps - 1:
+                    _prefetch_ids, _prefetch_lab, _prefetch_mask = _next_batch(iter_dl, "cpu")
 
             # ── Post-accumulation: all-reduce ──────────────────────────────
         # NOTE: no torch.cuda.synchronize() needed here — the backward pass

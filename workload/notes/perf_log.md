@@ -722,6 +722,67 @@ Once the remote is accessible:
 3. Run profile: `bin/harness run profile-snapshot M6_round32`
 4. Verify gradient bucketing sync fix improves MFU (estimated 0.5-1.0% vs single all-reduce)
 5. Candidate levers for subsequent rounds:
+- review R32 PASS: no proxy detected; STAGE_STATUS:in-progress — no gate evidence, long-horizon below bar
    - Operator fusion (residual-add + RMSNorm, RoPE fusion) — small MFU gain
    - ZeRO-1 distributed optimizer — larger gain (~20% MFU from reduced optimizer HBM traffic)
    - CUDA graph for optimizer step + BF16 sync — captures optimizer kernels into the graph
+
+## [stage1] Round 33 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — remote devspace unreachable (tsh session expired), gates not run
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: eager path async H2D)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The remote devspace (ds-710274, ds-718734, ds-719101, ds-719240) is still not accessible because the `tsh`
+Teleport session has expired and cannot be re-authenticated non-interactively (`tsh login` requires a
+terminal for password input or a browser for OIDC SSO).  New devspaces (719240, 719261) were created
+with `cctl devspace create` and `cctl job create` but the `forge_train:0.9` image does not have an
+SSH daemon on port 22 (expose endpoint returns 503 with "connection refused"), and Teleport SSH
+requires a valid `tsh` session.
+
+**Structural optimization implemented locally — eager path async H2D double buffering**:
+
+1. **`_next_batch` — `non_blocking=True` for GPU transfers**:
+   - Changed `.to(device)` to `.to(device, non_blocking=True)` so the H2D transfer is asynchronous
+     when the source CPU tensors are pinned (the dataloader may return pinned tensors internally).
+   - Added explicit `device="cpu"` return path that returns raw CPU tensors for the caller to
+     manage the H2D transfer via `copy_(..., non_blocking=True)`.
+
+2. **Eager path — pre-allocated buffers + async H2D + CPU prefetch**:
+   - Pre-allocate fixed-shape GPU buffers (`_eager_ids`, `_eager_lab`, `_eager_mask`) before the
+     microbatch loop, so `copy_(..., non_blocking=True)` avoids the `.to(device)` allocation cost.
+   - Pre-fetch the next microbatch on CPU (`_next_batch(iter_dl, "cpu")`) while the GPU is
+     computing the current microbatch, overlapping the H2D transfer of the next microbatch with
+     the current backward's GPU compute.
+   - Allocated separate MTP buffers (`_eager_mtp_in`, `_eager_mtp_lab`, `_eager_mtp_mask`) to
+     avoid per-iteration allocation.
+
+### Estimated MFU impact
+
+The eager path is a fallback for when CUDA graph is disabled (e.g. `hash_capture_level > 0`).  In
+the current long-horizon configuration, CUDA graph is enabled by default, so this optimization
+is primarily a safety net.  The estimated MFU improvement when the eager path is active is
+~0.2-0.5% from overlapping H2D with GPU compute across grad_accum microbatches.
+
+### Remote recovery status
+
+- `cctl` CLI is authenticated (profile: modelbest, user: sunhaojun)
+- `tsh` is NOT logged in; `tsh login --auth=local` requires a terminal
+- 5 devspaces are running (718734, 718929, 719101, 719240, 719032) — all looping project quota
+- New devspace 719240 is Running with Teleport connected but no SSH daemon on port 22
+- The user needs to run `tsh login --proxy=teleport.cybertron.modelbest.co:443` interactively
+- Once tsh is logged in, the loop can sync (`bin/harness sync push`) and run the gates
+
+### Next steps (once remote is accessible)
+
+1. Sync changes: `bin/harness sync push`
+2. Run smoke gate: `bin/harness run long-train-smoke` (20 steps, DP=2)
+3. Run profile: `bin/harness run profile-snapshot M6_round33`
+4. Run regression: `bin/harness run resume-gate-20`
+5. Candidate levers:
+   - Operator fusion (residual-add + RMSNorm, RoPE fusion)
+   - ZeRO-1 distributed optimizer (~20% MFU from reduced optimizer HBM traffic)
+   - CUDA graph for optimizer step + BF16 sync
