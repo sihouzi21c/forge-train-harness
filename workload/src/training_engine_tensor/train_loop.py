@@ -60,6 +60,18 @@ from training_engine_tensor.parameters import (
     load_weights_from_checkpoint,
 )
 
+from training_engine_tensor.zero_optimizer import (
+    ZeroOptimizer,
+    all_gather_bf16,
+    compute_zero_grad_norm,
+    init_zero_optimizer,
+    reduce_scatter_grads,
+    set_grad_from_shard,
+    zero_load_checkpoint,
+    zero_optimizer_step,
+    zero_save_checkpoint,
+)
+
 # ── H100 peak ────────────────────────────────────────────────────────────────
 H100_BF16_PEAK_FLOPS = 989.4e12
 
@@ -1392,6 +1404,24 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # so we can update per-group LR before each optimizer step (matching ref's pattern).
     lr_mult_per_group = [g["lr"] / opt_lr for g in optim_groups]
 
+    # ── ZeRO-1 distributed optimizer ─────────────────────────────────────
+    # Shard FP32 optimizer state across DP ranks, switching from all_reduce
+    # to reduce_scatter for gradient communication.  Enabled by default for
+    # long-horizon (non-deterministic) mode; disabled for deterministic mode
+    # to preserve bitwise alignment with the ref.
+    enable_zero = (
+        config.world_size > 1
+        and not deterministic
+        and int(os.environ.get("ENABLE_ZERO_OPTIMIZER", "1"))
+    )
+    zero_opt: ZeroOptimizer | None = None
+    if enable_zero:
+        zero_opt = init_zero_optimizer(
+            rank, config.world_size,
+            fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
+            bf16_params, fp32_grad_bufs, device,
+        )
+
     # ── Dataloader ─────────────────────────────────────────────────────
     dl = _build_dataloader(
         data_path=config.data_path,
@@ -1406,15 +1436,26 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # ── Resume from checkpoint ──────────────────────────────────────────
     resume_step = 0
     if config.resume_from is not None:
-        resume_step = load_checkpoint(
-            config.resume_from, fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
-            rank, init_weights_only=config.init_weights_only,
-        )
+        if enable_zero and zero_opt is not None:
+            resume_step = zero_load_checkpoint(
+                zero_opt, config.resume_from,
+                fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
+                rank, init_weights_only=config.init_weights_only,
+            )
+            # All-gather the full BF16 params after the shard load.
+            all_gather_bf16(zero_opt, bf16_params)
+        else:
+            resume_step = load_checkpoint(
+                config.resume_from, fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
+                rank, init_weights_only=config.init_weights_only,
+            )
         if rank == 0:
             import sys
             print(f"[debug] resume from {config.resume_from} at step {resume_step}", file=sys.stderr, flush=True)
-        # Sync BF16 params from the loaded FP32 master
-        _sync_bf16_from_fp32(bf16_params, fp32_master)
+        # Sync BF16 params from the loaded FP32 master (non-ZeRO path already does this;
+        # ZeRO path does it inside zero_load_checkpoint + all_gather_bf16).
+        if not enable_zero:
+            _sync_bf16_from_fp32(bf16_params, fp32_master)
         # Rebuild optim_groups after loading (LR multipliers unchanged)
         optim_groups = _build_optimizer_groups(
             fp32_master, bf16_params, model,
@@ -1523,6 +1564,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     use_cuda_graph = (
         config.hash_capture_level == 0  # no hash capture during graph capture
         and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))
+        and not enable_zero  # ZeRO-1 uses a sharded optimizer step, not compatible with the full optimizer graph
     )
 
     # ── Gradient bucketing for NCCL overlap ──────────────────────────────
@@ -1536,6 +1578,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         and not deterministic
         and int(os.environ.get("ENABLE_GRAD_BUCKETING", "1"))
     )
+    # Disable gradient bucketing when ZeRO-1 is active (they overlap in
+    # purpose — ZeRO-1's reduce_scatter is already a form of gradient
+    # partitioning that replaces the all-reduce, and the two would conflict
+    # on the gradient communication path).
+    if enable_zero:
+        enable_grad_bucketing = False
     num_grad_buckets = int(os.environ.get("NUM_GRAD_BUCKETS", "4"))
     # Pre-compute bucket boundaries: each bucket gets roughly equal param count.
     _bucket_boundaries: list[tuple[int, int]] = []
@@ -1920,7 +1968,15 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         reported_mtp = (local_mtp_sum / local_mtp_n.clamp(min=1.0)).item() if use_mtp else 0.0
 
         if config.world_size > 1:
-            if enable_grad_bucketing:
+            if enable_zero and zero_opt is not None:
+                # ── ZeRO-1: reduce_scatter gradients ──────────────────────────────
+                # Each rank receives only its shard's portion of the summed gradient.
+                # The shard's gradient buffers are updated in-place.
+                if config.hash_capture_level > 0 and config.persistent:
+                    _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
+                norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()
+                reduce_scatter_grads(zero_opt, fp32_grad_bufs, bf16_params, norm_factor_float)
+            elif enable_grad_bucketing:
                 # ── Gradient bucketed all-reduce ──────────────────────────────
                 # Split the flattened gradient into per-bucket chunks and all-reduce
                 # each on a separate stream.  The all-reduce of earlier buckets runs
@@ -2008,18 +2064,28 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             return  # Not reached (SystemExit raised in _ordered_teardown)
 
         # ── Compute gradient norm (also clips via _foreach_norm) ─────────
-        # Set .grad on fp32_master (matching ref's pattern exactly) so that
-        # the _fused_adamw_ kernel reads the same .grad fields the ref does.
-        for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
-            p_fp32.grad = buf
-        # Use _foreach_norm for batched per-tensor L2 norm computation
-        # (replaces 157 separate norm() kernel launches with a single
-        # fused kernel launch, matching the clip_grad_norm_ result exactly).
-        norms = torch._foreach_norm(fp32_grad_bufs)
-        total_norm = torch.linalg.vector_norm(torch.stack(norms))
-        if total_norm > opt_clip_grad:
-            torch._foreach_mul_(fp32_grad_bufs, opt_clip_grad / total_norm)
-        grad_norm_val = total_norm
+        if enable_zero and zero_opt is not None:
+            # ZeRO-1 aware gradient norm: each rank computes its shard's L2 norm,
+            # then all-reduces the squared norms to get the global total.
+            total_norm = compute_zero_grad_norm(zero_opt, fp32_grad_bufs, opt_clip_grad)
+            if total_norm > opt_clip_grad:
+                scale = opt_clip_grad / total_norm
+                for buf in zero_opt.my_grad_bufs:
+                    buf.mul_(scale)
+            grad_norm_val = total_norm
+        else:
+            # Set .grad on fp32_master (matching ref's pattern exactly) so that
+            # the _fused_adamw_ kernel reads the same .grad fields the ref does.
+            for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
+                p_fp32.grad = buf
+            # Use _foreach_norm for batched per-tensor L2 norm computation
+            # (replaces 157 separate norm() kernel launches with a single
+            # fused kernel launch, matching the clip_grad_norm_ result exactly).
+            norms = torch._foreach_norm(fp32_grad_bufs)
+            total_norm = torch.linalg.vector_norm(torch.stack(norms))
+            if total_norm > opt_clip_grad:
+                torch._foreach_mul_(fp32_grad_bufs, opt_clip_grad / total_norm)
+            grad_norm_val = total_norm
 
         # ── Compute LR for this step ──────────────────────────────────
         # ref uses ``step + 1`` (1-indexed) for the LR schedule
@@ -2032,7 +2098,20 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # Update per-group LR to match ref's ``pg["lr"] = lr * mult``
         for g, mult in zip(optim_groups, lr_mult_per_group):
             g["lr"] = current_lr * mult
-        if _opt_cuda_graph is not None:
+        if enable_zero and zero_opt is not None:
+            # ZeRO-1 optimizer step: only the rank's shard is updated.
+            # Set .grad on the shard's FP32 master tensors.
+            set_grad_from_shard(zero_opt, fp32_master, fp32_grad_bufs)
+            # Run the sharded AdamW step + sharded BF16 sync.
+            zero_optimizer_step(
+                zero_opt, optim_groups,
+                beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
+                opt_clip_grad=opt_clip_grad, total_norm=grad_norm_val,
+            )
+            # All-gather the full BF16 params so every rank has a complete copy
+            # for the forward pass of the next step.
+            all_gather_bf16(zero_opt, bf16_params)
+        elif _opt_cuda_graph is not None:
             # Set .grad on fp32_master (must match the graph capture's
             # tensor addresses — fp32_grad_bufs are never reallocated).
             for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
@@ -2084,11 +2163,16 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             if step == config.num_steps - 1:
                 should_save = True
             if should_save:
-                save_checkpoint(
-                    config.save_path, abs_step,
-                    fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
-                    rank,
-                )
+                if enable_zero and zero_opt is not None:
+                    zero_save_checkpoint(
+                        zero_opt, config.save_path, abs_step, rank,
+                    )
+                else:
+                    save_checkpoint(
+                        config.save_path, abs_step,
+                        fp32_master, exp_avgs, exp_avg_sqs, opt_state_steps,
+                        rank,
+                    )
                 if rank == 0:
                     import sys
                     print(f"[debug] checkpoint saved at step {abs_step} to {config.save_path}/step_{abs_step}", file=sys.stderr, flush=True)

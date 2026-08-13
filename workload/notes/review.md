@@ -762,3 +762,25 @@ This is a docs-only commit that records the Round 35 findings. The engine code i
 - `mfu_elastic_check.py`: MFU_GATE_VERDICT: FAIL (BELOW_BAND) — below review-side throughput bar, not a review failure
 
 ---
+
+## [stage1] Round 36 — 2026-08-14 02:46
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 9749b89 — Perf: Phase 4 — optimizer step CUDA graph capture (AdamW + BF16 sync)
+
+### Key conclusions
+
+The dev agent implemented Phase 4 optimizer step CUDA graph capture in `train_loop.py`, extending the existing forward+backward CUDA graph to also capture the AdamW + BF16 sync step. This is a genuine in-process implementation — no proxy, no shell-out to ref, no hardcoded synthetic values. The save/restore dance for ~6 GB of optimizer state during capture is real CUDA work. Stage 1 cannot finish: no `STAGE_STATUS: finished` in the commit message, no gate evidence (remote unreachable, no gates run), no profile snapshot for this perf-touching round, and the long-horizon throughput remains below the review-side bar.
+
+### Violations (fill in only on FAIL)
+
+(none)
+
+### Evidence highlights
+
+- `train_loop.py:1680-1750`: Optimizer step CUDA graph capture using `torch.cuda.CUDAGraph()` — genuine in-process code, no ref calls
+- `train_loop.py:2035-2045`: Graph replay path replacing imperative AdamW + BF16 sync with `_opt_cuda_graph.replay()`
+- `mfu_elastic_check.py`: MFU_GATE_VERDICT: FAIL (BELOW_BAND) — below review-side throughput bar, not a review failure
+
+---
