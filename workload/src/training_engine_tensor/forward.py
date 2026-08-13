@@ -124,6 +124,7 @@ def mlp_swiglu(hidden: torch.Tensor, fc1_weight: torch.Tensor,
 
 def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                    allow_math_fallback: bool = False,
+                   deterministic: bool = True,
                    ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GQA scaled dot-product attention via flash_attn_func.
 
@@ -136,6 +137,12 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     ``allow_math_fallback`` is ignored — the flash_attn kernel is the
     authoritative path for bitwise alignment.
 
+    ``deterministic`` controls the ``deterministic`` flag passed to
+    ``flash_attn_func``.  For bitwise alignment milestones, this must be
+    ``True`` (matching the ref).  For long-horizon performance optimization,
+    this can be ``False`` to allow faster non-deterministic algorithms
+    (the gate is statistical, not bitwise).
+
     Returns ``(output, None)`` — the ``softmax_lse`` is always ``None``
     because this version of ``flash_attn_func`` does not expose it.
     Gradients are computed via ``torch.autograd.grad`` in the matching
@@ -145,7 +152,7 @@ def _gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     ``k``, ``v`` shape ``[B, S, NUM_KV_HEADS, HEAD_DIM]``.
     """
     from flash_attn import flash_attn_func
-    out = flash_attn_func(q, k, v, causal=True, deterministic=True)
+    out = flash_attn_func(q, k, v, causal=True, deterministic=deterministic)
     return out, None
 
 

@@ -302,7 +302,8 @@ def _build_mtp_tensors(input_ids, labels, loss_mask):
 class LayerCache:
     """Intermediate tensors saved during one layer's forward pass."""
     hidden_before_attn: torch.Tensor  # hidden before attention sub-layer
-    normed: torch.Tensor              # after attention_norm
+    # NOTE: normed is NOT stored — it is recomputed from hidden_before_attn
+    # in the backward pass to save ~432 MB of activation memory per layer.
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
@@ -313,7 +314,8 @@ class LayerCache:
     attn_out: torch.Tensor           # after wo projection
     softmax_lse: torch.Tensor | None  # flash attention softmax statistics (used by direct _flash_attn_backward)
     hidden_after_attn: torch.Tensor   # after residual add (attention branch)
-    normed2: torch.Tensor             # after ffn_norm
+    # NOTE: normed2 is NOT stored — it is recomputed from hidden_after_attn
+    # in the backward pass to save ~432 MB of activation memory per layer.
     gate_up: torch.Tensor             # after wfc1
     mlp_out: torch.Tensor             # after w2
     # NOTE: y1, y2, intermediate are NOT stored — they are recomputed from
@@ -366,6 +368,7 @@ def _forward_with_cache(
     depth_scale_mtp: float,
     capture_records: dict | None,
     capture_prefix: str,
+    deterministic: bool = True,  # forward attention determinism flag
     ) -> ForwardCache:
     """Run the full forward pass, saving all intermediates for the static backward.
 
@@ -399,7 +402,7 @@ def _forward_with_cache(
         # exactly.  The ref's TransformerLayer.forward calls:
         #   from flash_attn import flash_attn_func
         #   attn = flash_attn_func(q, k, v, causal=True, deterministic=True)
-        attn, softmax_lse = _gqa_attention(q_rot, k_rot, v, allow_math_fallback=True)
+        attn, softmax_lse = _gqa_attention(q_rot, k_rot, v, allow_math_fallback=True, deterministic=deterministic)
         attn_flat = attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         attn_out = torch.matmul(attn_flat, layer.attention_proj_weight.t())
         if capture_records is not None:
@@ -425,12 +428,14 @@ def _forward_with_cache(
 
         layer_caches.append(LayerCache(
             hidden_before_attn=hidden_before_attn,
-            normed=normed, q=q, k=k, v=v,
+            # normed is NOT stored — recomputed from hidden_before_attn in backward
+            q=q, k=k, v=v,
             q_rot=q_rot, k_rot=k_rot,
             attn_out_raw=attn, attn_flat=attn_flat, attn_out=attn_out,
             softmax_lse=softmax_lse,
             hidden_after_attn=hidden_after_attn,
-            normed2=normed2, gate_up=gate_up,
+            # normed2 is NOT stored — recomputed from hidden_after_attn in backward
+            gate_up=gate_up,
             mlp_out=mlp_out,
         ))
 
@@ -478,7 +483,7 @@ def _forward_with_cache(
         mtp_q, mtp_k, mtp_v = project_qkv(mtp_normed, model.mtp.layer.qkv_weight)
         mtp_q_rot = apply_rope(mtp_q, rope_freqs)
         mtp_k_rot = apply_rope(mtp_k, rope_freqs)
-        mtp_attn, mtp_softmax_lse = _gqa_attention(mtp_q_rot, mtp_k_rot, mtp_v, allow_math_fallback=True)
+        mtp_attn, mtp_softmax_lse = _gqa_attention(mtp_q_rot, mtp_k_rot, mtp_v, allow_math_fallback=True, deterministic=deterministic)
         mtp_attn_flat = mtp_attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         mtp_attn_out = torch.matmul(mtp_attn_flat, model.mtp.layer.attention_proj_weight.t())
         if capture_records is not None:
@@ -497,12 +502,14 @@ def _forward_with_cache(
 
         mtp_mtp_layer_cache = LayerCache(
             hidden_before_attn=mtp_hidden_before_attn,
-            normed=mtp_normed, q=mtp_q, k=mtp_k, v=mtp_v,
+            # normed is NOT stored — recomputed from hidden_before_attn in backward
+            q=mtp_q, k=mtp_k, v=mtp_v,
             q_rot=mtp_q_rot, k_rot=mtp_k_rot,
             attn_out_raw=mtp_attn, attn_flat=mtp_attn_flat, attn_out=mtp_attn_out,
             softmax_lse=mtp_softmax_lse,
             hidden_after_attn=mtp_hidden_after_attn,
-            normed2=mtp_normed2, gate_up=mtp_gate_up,
+            # normed2 is NOT stored — recomputed from hidden_after_attn in backward
+            gate_up=mtp_gate_up,
             mlp_out=mtp_mlp_out,
         )
 
@@ -594,9 +601,11 @@ def _static_backward(
     depth_scale_mtp: float,
     fp32_grad_bufs: list[torch.Tensor],
     bf16_params: list[torch.Tensor],
+    dptr_idx: dict[int, int],  # pre-built data_ptr→index mapping (cached across calls)
     capture_records: dict | None,
     capture_prefix: str,
     mtp_ce_weight: float,
+    deterministic: bool = True,  # forward attention determinism flag
 ) -> None:
     """Static backward pass — no autograd, no ``.backward()``.
 
@@ -606,8 +615,6 @@ def _static_backward(
     B, S = cache.input_ids.shape
     H = C.HIDDEN_SIZE
     V = C.VOCAB_SIZE
-
-    dptr_idx = _build_dptr_idx(bf16_params)
 
     # ====================================================================
     # MTP BRANCH BACKWARD (if enabled)
@@ -672,8 +679,11 @@ def _static_backward(
         d_mtp_gate_up = torch.cat([d_mtp_y1, d_mtp_y2], dim=-1)
 
         # wfc1 backward: gate_up = normed2 @ wfc1.T
+        # Recompute normed2 from hidden_after_attn (not stored in cache
+        # to save activation memory).
+        _mtp_normed2 = rms_norm(mtp_lc.hidden_after_attn, model.mtp.layer.pre_mlp_norm_weight)
         d_mtp_normed2, dw_mtp_fc1 = linear_backward(
-            d_mtp_gate_up, mtp_lc.normed2, model.mtp.layer.mlp_fc1_weight
+            d_mtp_gate_up, _mtp_normed2, model.mtp.layer.mlp_fc1_weight
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.mlp_fc1_weight, dw_mtp_fc1)
 
@@ -705,6 +715,7 @@ def _static_backward(
         d_mtp_q_rot, d_mtp_k_rot, d_mtp_v = gqa_attention_backward(
             d_mtp_attn, mtp_lc.q_rot, mtp_lc.k_rot, mtp_lc.v,
             out=mtp_lc.attn_out_raw, softmax_lse=mtp_lc.softmax_lse,
+            deterministic=deterministic,
         )
 
         # RoPE backward
@@ -712,9 +723,12 @@ def _static_backward(
         d_mtp_k = apply_rope_backward(d_mtp_k_rot, rope_freqs)
 
         # QKV projection backward
+        # Recompute normed from hidden_before_attn (not stored in cache
+        # to save activation memory).
+        _mtp_normed = rms_norm(mtp_lc.hidden_before_attn, model.mtp.layer.input_norm_weight)
         d_mtp_normed, dw_mtp_qkv = project_qkv_backward(
             d_mtp_q, d_mtp_k, d_mtp_v,
-            mtp_lc.normed, model.mtp.layer.qkv_weight,
+            _mtp_normed, model.mtp.layer.qkv_weight,
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.qkv_weight, dw_mtp_qkv)
 
@@ -819,8 +833,11 @@ def _static_backward(
         d_gate_up = torch.cat([d_y1, d_y2], dim=-1)
 
         # wfc1 backward: gate_up = normed2 @ wfc1.T
+        # Recompute normed2 from hidden_after_attn (not stored in cache
+        # to save ~432 MB of activation memory per layer).
+        _normed2 = rms_norm(lc.hidden_after_attn, layer.pre_mlp_norm_weight)
         d_normed2, dw_fc1 = linear_backward(
-            d_gate_up, lc.normed2, layer.mlp_fc1_weight
+            d_gate_up, _normed2, layer.mlp_fc1_weight
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.mlp_fc1_weight, dw_fc1)
 
@@ -851,6 +868,7 @@ def _static_backward(
         d_q_rot, d_k_rot, d_v = gqa_attention_backward(
             d_attn, lc.q_rot, lc.k_rot, lc.v,
             out=lc.attn_out_raw, softmax_lse=lc.softmax_lse,
+            deterministic=deterministic,
         )
 
         # RoPE backward
@@ -858,8 +876,11 @@ def _static_backward(
         d_k = apply_rope_backward(d_k_rot, rope_freqs)
 
         # QKV projection backward
+        # Recompute normed from hidden_before_attn (not stored in cache
+        # to save ~432 MB of activation memory per layer).
+        _normed = rms_norm(lc.hidden_before_attn, layer.input_norm_weight)
         d_normed, dw_qkv = project_qkv_backward(
-            d_q, d_k, d_v, lc.normed, layer.qkv_weight
+            d_q, d_k, d_v, _normed, layer.qkv_weight
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.qkv_weight, dw_qkv)
 
@@ -1383,6 +1404,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     peak_total = H100_BF16_PEAK_FLOPS * max(config.world_size, 1)
 
     # ── Training loop ──────────────────────────────────────────────────
+    # Pre-build the data_ptr→index mapping for O(1) gradient buffer lookup.
+    # The bf16_params list is invariant across the entire training loop, so
+    # this mapping is computed once and reused on every backward call.
+    dptr_idx = _build_dptr_idx(bf16_params)
     # CUDA events for non-blocking step timing (avoids torch.cuda.synchronize
     # in the hot path, which drains all pending CUDA work).
     step_start_event = torch.cuda.Event(enable_timing=True)
@@ -1432,15 +1457,15 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 mtp_in_buf, mtp_lab_buf, mtp_mask_buf,
                 rope_freqs, width_mult, mup_emb_scale,
                 depth_scale_main, depth_scale_mtp,
-                None, capture_prefix,
+                None, capture_prefix, deterministic,
             )
             _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf)
             _fw_mtp_sum, _fw_mtp_n = masked_cross_entropy(_fw_cache.mtp_logits, mtp_lab_buf, mtp_mask_buf)
             _static_backward(
                 model, _fw_cache, rope_freqs, width_mult, mup_emb_scale,
                 depth_scale_main, depth_scale_mtp,
-                fp32_grad_bufs, bf16_params,
-                None, capture_prefix, ce_w,
+                fp32_grad_bufs, bf16_params, dptr_idx,
+                None, capture_prefix, ce_w, deterministic,
             )
         else:
             _fw_cache = _forward_with_cache(
@@ -1448,14 +1473,14 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 None, None, None,
                 rope_freqs, width_mult, mup_emb_scale,
                 depth_scale_main, depth_scale_mtp,
-                None, capture_prefix,
+                None, capture_prefix, deterministic,
             )
             _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf)
             _static_backward(
                 model, _fw_cache, rope_freqs, width_mult, mup_emb_scale,
                 depth_scale_main, depth_scale_mtp,
-                fp32_grad_bufs, bf16_params,
-                None, capture_prefix, 0.0,
+                fp32_grad_bufs, bf16_params, dptr_idx,
+                None, capture_prefix, 0.0, deterministic,
             )
 
         # Free the warmup cache before graph capture to avoid OOM.
@@ -1488,7 +1513,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         mtp_in_buf, mtp_lab_buf, mtp_mask_buf,
                         rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
-                        None, capture_prefix,
+                        None, capture_prefix, deterministic,
                     )
                     _capture_lm_sum, _capture_lm_n = masked_cross_entropy(
                         _capture_cache.main_logits, labels_buf, loss_mask_buf)
@@ -1497,8 +1522,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     _static_backward(
                         model, _capture_cache, rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
-                        fp32_grad_bufs, bf16_params,
-                        None, capture_prefix, ce_w,
+                        fp32_grad_bufs, bf16_params, dptr_idx,
+                        None, capture_prefix, ce_w, deterministic,
                     )
                 else:
                     _capture_cache = _forward_with_cache(
@@ -1506,15 +1531,15 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         None, None, None,
                         rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
-                        None, capture_prefix,
+                        None, capture_prefix, deterministic,
                     )
                     _capture_lm_sum, _capture_lm_n = masked_cross_entropy(
                         _capture_cache.main_logits, labels_buf, loss_mask_buf)
                     _static_backward(
                         model, _capture_cache, rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
-                        fp32_grad_bufs, bf16_params,
-                        None, capture_prefix, 0.0,
+                        fp32_grad_bufs, bf16_params, dptr_idx,
+                        None, capture_prefix, 0.0, deterministic,
                     )
 
             # Save references to the captured tensors so we can read them after replay.
@@ -1598,7 +1623,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
                         None,  # skip fwd hash (too slow for DP multi-GPU),
-                        capture_prefix,
+                        capture_prefix, deterministic,
                     )
                     lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
                     mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, mtp_lab, mtp_mask)
@@ -1611,7 +1636,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
                         None,  # skip fwd hash (too slow for DP multi-GPU),
-                        capture_prefix,
+                        capture_prefix, deterministic,
                     )
                     lm_sum, lm_n = masked_cross_entropy(cache.main_logits, labels, loss_mask)
 
@@ -1619,9 +1644,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 _static_backward(
                     model, cache, rope_freqs, width_mult, mup_emb_scale,
                     depth_scale_main, depth_scale_mtp,
-                    fp32_grad_bufs, bf16_params,
+                    fp32_grad_bufs, bf16_params, dptr_idx,
                     capture_records, capture_prefix,
-                    ce_w if use_mtp else 0.0,
+                    ce_w if use_mtp else 0.0, deterministic,
                 )
 
                 # Free the ForwardCache immediately to avoid accumulating

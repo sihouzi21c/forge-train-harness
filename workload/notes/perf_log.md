@@ -565,3 +565,49 @@ The CUDA graph capture is successful but the MFU improvement is limited by:
   1. Async gradient bucketing (overlap all-reduce with backward)
   2. Operator fusion for memory reduction (enable larger MBS)
   3. CUDA graph capture for the optimizer step (smaller memory footprint)
+- review R25 PASS: genuine in-process CUDA graph implementation, no proxy detected; stage1 in-progress — no STAGE_STATUS:finished, long-horizon throughput insufficient
+- review R26 PASS: genuine CUDA graph and per-param bf16 sync, no proxy; stage1 in-progress — throughput insufficient, continue MFU optimization
+- review R27 PASS: genuine in-process CUDA graph capture, no proxy; stage1 in-progress
+- review R28 PASS: genuine CUDA graph and per-param bf16 sync, no proxy; stage1 in-progress — missing gate evidence and profile snapshot
+- review R29 PASS: genuine CUDA graph and per-param bf16 sync, no proxy; stage1 in-progress — missing profile, long-horizon below bar
+
+## [stage1] Round 26 — 2026-08-13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: operator fusion + memory optimization)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented three structural optimizations:
+
+1. **LayerCache memory reduction — remove `normed`/`normed2` (saves ~21.6 GB)**:
+   - Removed `normed` (RMSNorm output) and `normed2` (MLP input RMSNorm output) from the `LayerCache` dataclass — these are ~432 MB each per layer.
+   - With 25 layers, the total saving is 25 × 2 × 432 MB = **21.6 GB** of activation memory.
+   - In the backward pass, `normed` is recomputed from `lc.hidden_before_attn` and `normed2` from `lc.hidden_after_attn` via `rms_norm()` (the same forward function used during the forward pass).
+   - The `rms_norm_backward` already recomputes `normed` internally, so the weight gradient computation is unaffected. The only additional cost is 2 × 25 = 50 RMSNorm forward calls per step, each a cheap fused kernel (~0.1ms).
+
+2. **`dptr_idx` caching (micro-optimization)**:
+   - Moved `_build_dptr_idx(bf16_params)` from inside `_static_backward` (called per-microbatch) to the training loop setup (called once per step).
+   - The `data_ptr` → index mapping is invariant across the entire training loop since `bf16_params` is a fixed list.
+   - Saves a 157-iteration Python loop on every backward call (10× per step with grad_accum=10).
+
+3. **Flash attention determinism configurable for long-horizon**:
+   - Added `deterministic` parameter to `_gqa_attention` (forward), `gqa_attention_backward` (backward), and `_forward_with_cache` / `_static_backward`.
+   - The flag is threaded from the `deterministic` env var in `run_training_loop` through all forward and backward calls.
+   - For long-horizon mode (`DETERMINISTIC=0`), `flash_attn_func` now uses `deterministic=False`, allowing faster non-deterministic algorithms.
+   - For bitwise alignment milestones (`DETERMINISTIC=1`), the behavior is unchanged (still `deterministic=True`).
+
+### Remote status
+
+The remote devspace (ds-718734) is not accessible — the `tsh` Teleport session has expired. A new devspace (tasks/718929) was created but could not be configured for SSH access without interactive `tsh login`. The next round should re-authenticate `tsh` before running GPU gates.
+
+### Next steps
+
+- Sync to remote and run `long-train-smoke` to verify the gate still passes
+- Run `profile-snapshot M6_round26` to get a profile and identify the next bottleneck
+- Candidate levers for next round:
+  1. Gradient bucketing with NCCL overlap (Phase 3)
+  2. Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
+  3. Triton wgrad GEMM with shape-specific tiling
