@@ -32,3 +32,37 @@ The commit is documentation-only — only `workload/notes/perf_log.md` was modif
 - Long-horizon throughput check: below review-side bar, no milestone override
 
 ---
+
+## [stage1] Round 41 — 2026-08-14 08:50
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 55d9bd8 — Docs: record Round 42 — CUDA graph crash fixed, MFU 18.3% (up from 17.0%), smoke PASS
+
+### Key conclusions
+
+The commit is documentation-only — only `workload/notes/perf_log.md` was modified. The dev agent recorded the CUDA graph crash fix results: forward+backward graph captures successfully at 20.96 GiB private pools, optimizer graph removed due to OOM risk (only 25 MiB free after fwd+bwd graph), and the long-train-smoke gate PASS with MFU 18.3% (up from 17.0%, +1.3pp) and loss_rel 0.193% < 2.50% threshold. No engine source code was changed in this commit (though the prior three commits in the round applied the actual CUDA graph fixes). The anti-proxy guard passes (0 violations). The engine (forward.py, backward.py, train_loop.py, zero_optimizer.py) computes all metrics in-process — `mfu_e2e_standard`, `global_loss`, `grad_norm` are computed values, not hardcoded literals. The only `ref/` references in engine code are docstrings pointing to `ref/reference/model_pure_mup_mtp.py`. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message, and the four gate suites (long-train 200-step, resume-gate-20, resume-startup-90, perf-bitwise) have not all been demonstrated green in the latest section of perf_log.md.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- Commit diff only touches `workload/notes/perf_log.md` — no engine code changes, no gate threshold tampering, no remote config edits
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- Stage 1 FINISH conditions: condition 1 (commit message) FAIL, condition 2 (gate evidence) FAIL — missing long-train 200-step, resume-gate-20, resume-startup-90, perf-bitwise PASS in latest section
+
+---
+
+## [stage1] Round 43 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The commit is documentation-only — only `workload/notes/perf_log.md` was modified. The dev agent re-validated the CUDA graph fix on the remote cluster via `cctl job create` with `--code-type git` (tsh session expired, SSH unavailable). The long-train-smoke gate (DP=2, 20 steps) PASS with MFU 18.3%, loss_rel 0.193% < 2.50%, signed_rel -0.1455% (no drift). No engine source code was changed in this commit (the CUDA graph fix was committed in prior rounds). The only engine-side changes are the `workload/notes/perf_log.md` entry. The anti-proxy guard passes (0 violations). The engine (forward.py, backward.py, train_loop.py, zero_optimizer.py) computes all metrics in-process — `mfu_e2e_standard`, `global_loss`, `grad_norm` are computed values, not hardcoded literals. The only `ref/` references in engine code are docstrings pointing to `ref/reference/model_pure_mup_mtp.py`. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message, and the four gate suites (long-train 200-step, resume-gate-20, resume-startup-90, perf-bitwise) have not all been demonstrated green in the latest section of perf_log.md.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- Commit diff only touches `workload/notes/perf_log.md` — no engine code changes, no gate threshold tampering, no remote config edits
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- Long-horizon throughput check: 18.3% MFU, below review-side bar, no milestone override

@@ -1216,3 +1216,58 @@ Expected MFU with CUDA graph enabled: **~18.8%** (matching the Round 25 baseline
    - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion) — small MFU gain
    - ZeRO-1 optimization for DP=2 (reduce_scatter overhead > benefit at DP=2, but may help at larger scales)
    - Overlap improvements (gradient bucketing still regresses at DP=2)
+- review R41 PASS: docs-only commit, no proxy detected
+
+## [stage1] Round 43 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 4: CUDA graph baseline confirmed at 18.3% MFU)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent confirmed the CUDA graph crash fix works correctly at DP=2, with the long-train-smoke gate passing at 18.3% MFU. The remote execution path via `cctl job create` with `--code-type git` was re-validated after the `tsh` Teleport session expired.
+
+**CUDA graph fix validated**:
+- Forward+backward CUDA graph captures successfully at 20.96 GiB private pools.
+- The `torch.cuda.synchronize()` before graph capture (Round 42 fix) resolves the "no [LOSS] lines parsed" crash.
+- The smoke gate runs to completion: 20 steps, DP=2, without crash or OOM.
+- Optimizer graph remains removed (OOM risk at 25 MiB free after fwd+bwd graph + 6 GiB save/restore).
+
+**Remote execution**:
+- `tsh` session expired (no interactive login available in agent loop).
+- `cctl job create` with `--code-type git --git-path "https://github.com/sihouzi21c/forge-train-harness.git" --git-ref harness` works for running gates.
+- Persistent filesystem 285 is mounted at `/user/sunhaojun/.forge_train/` in the container.
+- Logs are available via `cctl job logs <id>` after job completion (may be delayed).
+- Profile-snapshot (job 720253) and resume-gate-20 (job 720254) are queued for the next round.
+
+### Gate results (long-train-smoke, DP=2, 20 steps, cctl job 720233)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| loss_rel(point) | 0.193% | < 2.50% ✅ |
+| signed_rel | -0.1455% | no drift ✅ |
+| MFU(standard) | 18.3% | — |
+| pointwise_mean_rel | 0.193% | — |
+| max_rel_diff | 0.364% | — |
+| ref_elapsed_s | 230.4s | — |
+| loss_pass | True | — |
+
+### Profile analysis
+
+Profile-snapshot was not run this round (cluster at capacity). Based on the Phase 0-4 optimization ordering, the next bottleneck is likely:
+
+1. **GPU kernel time dominates** (~69% of step time from Round 25 profile): The CUDA graph eliminates launch overhead but the actual GPU compute remains.
+2. **Operator fusion** (residual-add + RMSNorm, RoPE fusion) could reduce kernel count and memory traffic.
+3. **ZeRO-1 optimization for DP=2** (reduce_scatter + all_gather overhead needs tuning).
+
+### Next steps
+
+1. Run `profile-snapshot M6_round43` to identify the exact bottleneck (job 720253 queued).
+2. Run `resume-gate-20` regression to verify CUDA graph doesn't break save/load (job 720254 queued).
+3. Run `long-train` (200 steps) for the full gate.
+4. Candidate levers based on profile:
+   - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
+   - ZeRO-1 optimization for DP=2
+   - Overlap improvements (gradient bucketing still regresses at DP=2)
