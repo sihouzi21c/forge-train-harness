@@ -1563,7 +1563,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     _opt_cuda_graph = None
     use_cuda_graph = (
         config.hash_capture_level == 0  # no hash capture during graph capture
-        and int(os.environ.get("ENABLE_CUDA_GRAPH", "0"))  # default 0: CUDA graph capture causes crash (debugging); enable via env
+        and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))  # default 1: reduce cudaLaunchKernel overhead (~3814ms/step); disable via env for debugging
         and not enable_zero  # ZeRO-1 uses a sharded optimizer step, not compatible with the full optimizer graph
     )
 
@@ -1674,6 +1674,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
         # Zero the grad bufs after warmup (the warmup accumulated gradients).
         torch._foreach_zero_(fp32_grad_bufs)
+        # CRITICAL: synchronize before graph capture.  `torch._foreach_zero_` is
+        # an async CUDA kernel launch.  Without sync, the pending kernel may be
+        # captured as part of the CUDA graph, corrupting the graph (the zeroing
+        # would happen on every replay instead of once per step).
+        torch.cuda.synchronize()
 
         # Capture the CUDA graph for one microbatch.
         # The graph records the forward+backward CUDA operations.  During replay,
@@ -1772,6 +1777,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     opt_state_steps[p_fp32.data_ptr()].copy_(saved)
                 _sync_bf16_from_fp32(bf16_params, fp32_master)
                 torch._foreach_zero_(fp32_grad_bufs)
+                # CRITICAL: synchronize before optimizer graph capture.  The
+                # copy_ and _foreach_zero_ operations above are async CUDA
+                # kernel launches.  Without sync, pending kernels may be
+                # captured as part of the optimizer CUDA graph, corrupting it.
+                torch.cuda.synchronize()
 
                 # Capture the optimizer step (AdamW + BF16 sync).
                 _opt_cuda_graph = torch.cuda.CUDAGraph()
