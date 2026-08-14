@@ -155,7 +155,85 @@ def wgrad_output(
         GROUP_SIZE_M=GROUP_SIZE_M,
     )
 
-    # ── Fused RMSNorm backward ─────────────────────────────────────────────────────
+    # ── Fused RMSNorm forward ──────────────────────────────────────────────────────
+#
+# Fuses the RMSNorm forward computation into a single Triton kernel:
+#   r = rsqrt(mean(x^2, dim=-1) + eps)
+#   normed = x * r * weight
+#
+# into a single Triton kernel.  The current PyTorch implementation
+# (forward.py:rms_norm) calls F.rms_norm which internally does bf16 -> fp32 ->
+# bf16 conversions.  This fused kernel reads bf16 directly, computes in fp32,
+# and writes bf16 output, eliminating the internal dtype round-trip overhead.
+#
+# Each program handles one (B, S) row of H elements.  Grid = (B * S,) programs.
+
+
+@triton.jit
+def _rms_norm_fwd_kernel(
+    hidden_ptr, weight_ptr, normed_ptr,
+    H,
+    eps: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+):
+    """Fused RMSNorm forward: normed = rms_norm(hidden, weight, eps).
+
+    One program per (B, S) row.  Reads bf16 input, computes in fp32,
+    writes bf16 output.
+    """
+    row = tl.program_id(0)
+
+    offs = row * H + tl.arange(0, BLOCK_SIZE_H)
+    mask = tl.arange(0, BLOCK_SIZE_H) < H
+
+    # Load hidden[pid, :] bf16 -> fp32.
+    x = tl.load(hidden_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # r = rsqrt(mean(x^2, dim=-1) + eps)
+    x2 = x * x
+    mean_x2 = tl.sum(x2, axis=0) / H
+    r = tl.rsqrt(mean_x2 + eps)
+
+    # Load weight[:] bf16 -> fp32 (shared across all rows).
+    w = tl.load(weight_ptr + tl.arange(0, BLOCK_SIZE_H), mask=mask, other=0.0).to(tl.float32)
+
+    # normed = x * r * weight
+    normed = x * r * w
+
+    # Write normed in bf16.
+    tl.store(normed_ptr + offs, normed.to(tl.bfloat16), mask=mask)
+
+
+def rms_norm_forward_fused(
+    hidden: torch.Tensor,   # [B, S, H] bf16
+    weight: torch.Tensor,   # [H] bf16
+    eps: float = 1e-6,
+) -> torch.Tensor:           # [B, S, H] bf16
+    """Fused RMSNorm forward: returns normed = rms_norm(hidden, weight, eps).
+
+    Reads bf16 input, computes in fp32, writes bf16 output.  Numerically
+    equivalent to ``F.rms_norm(hidden, (H,), weight, eps)``.
+    """
+    B, S, H = hidden.shape
+    BLOCK_SIZE_H = 1 << (H - 1).bit_length()  # next power of 2 >= H
+    assert BLOCK_SIZE_H <= 2048, \
+        f"rms_norm_forward_fused: H={H} requires BLOCK_SIZE_H={BLOCK_SIZE_H} > 2048"
+
+    # Allocate normed output (bf16, same shape as hidden).
+    normed = torch.empty_like(hidden, dtype=torch.bfloat16)
+
+    # Launch one program per (B, S) row.
+    grid = (B * S,)
+    _rms_norm_fwd_kernel[grid](
+        hidden, weight, normed,
+        H,
+        eps=eps,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+    )
+    return normed
+
+
+# ── Fused RMSNorm backward ─────────────────────────────────────────────────────
 #
 # Fuses the entire RMSNorm backward computation into a single Triton kernel:
 #   r = rsqrt(mean(x^2, dim=-1) + eps)

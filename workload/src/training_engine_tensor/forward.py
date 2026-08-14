@@ -11,6 +11,8 @@ inputs.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from training_engine_tensor.config import (
@@ -85,9 +87,18 @@ def project_qkv(hidden: torch.Tensor, weight: torch.Tensor
 
 # ── RMSNorm ────────────────────────────────────────────────────────────────
 
+# Lazy-import flag for the Triton RMSNorm forward kernel.
+_HAS_TRITON_RMSNORM_FWD: bool = False
+try:
+    from training_engine_tensor.triton_kernels import rms_norm_forward_fused  # noqa: F401
+    _HAS_TRITON_RMSNORM_FWD = True
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
+
 
 def rms_norm(hidden: torch.Tensor, weight: torch.Tensor,
-             eps: float | None = None) -> torch.Tensor:
+             eps: float | None = None,
+             deterministic: bool = True) -> torch.Tensor:
     """RMSNorm.  Uses ``torch.nn.functional.rms_norm`` directly, matching the
     ref's ``_RMSNormFn.forward`` (which calls ``F.rms_norm(x, shape, weight, eps)``).
 
@@ -95,9 +106,22 @@ def rms_norm(hidden: torch.Tensor, weight: torch.Tensor,
     at bf16.  The manual ``(x32 * r).to(bf16) * weight`` decomposition can
     differ in floating-point rounding due to the fused kernel's reduction
     order.
+
+    When ``deterministic=False`` and ``ENABLE_TRITON_RMSNORM_FWD=1``, uses
+    a fused Triton kernel that reads bf16 directly, computes in fp32, and
+    writes bf16 output — eliminating the internal dtype round-trip overhead.
     """
-    import torch.nn.functional as _F
     eps_val = eps if eps is not None else NORM_EPS
+    _use_triton = (
+        _HAS_TRITON_RMSNORM_FWD
+        and not deterministic
+        and hidden.is_cuda
+        and int(os.environ.get('ENABLE_TRITON_RMSNORM_FWD', '0'))
+    )
+    if _use_triton:
+        from training_engine_tensor.triton_kernels import rms_norm_forward_fused
+        return rms_norm_forward_fused(hidden, weight, eps_val)
+    import torch.nn.functional as _F
     return _F.rms_norm(hidden, (weight.shape[0],), weight, eps_val)
 
 

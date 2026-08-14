@@ -470,3 +470,57 @@ The dev agent optimized the CE forward and backward paths by gating the explicit
 - No gate config, remote config, or run-shape key modifications detected
 
 ---
+
+## [stage1] Round 53 — 2026-08-14 20:55
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 4f341ab — Perf: CE forward .float() skip + CE backward direct softmax; disable CUDA graph by default
+
+### Key conclusions
+This commit only modifies `workload/notes/perf_log.md` (documentation of Round 53 results). No engine source code was changed. The dev agent tested CE forward `.float()` skip (non-deterministic path) and CE backward direct softmax formula on a remote devspace, achieving 21.03% MFU on the full 200-step long-train (+0.18pp from Round 52's 20.85%). CUDA graph was disabled by default (eager path is now faster at 21.0% vs 18.3% with graph). The `ENABLE_CUDA_GRAPH` default changed from "1" to "0" and `torch.cuda.empty_cache()` + `gc.collect()` was added after warmup to fix CUDA graph OOM when manually enabled. No proxy, no forgery, no hardcoded synthetic metrics. Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` in commit message, and perf_log.md lacks `resume-startup-90` and `perf-bitwise` gate evidence.
+
+### Evidence highlights
+- Only `workload/notes/perf_log.md` modified in this commit (git diff HEAD~1 HEAD --name-only)
+- `backward.py` and `train_loop.py` remain genuine implementations (no proxy/ref imports/hardcoded metrics)
+- Commit message records 21.03% MFU, long-train PASS, resume-gate-20 PASS
+
+---
+
+## [stage1] Round 54 — 2026-08-14 21:01
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 79591d4 — Perf: eliminate .item() CUDA syncs from timed region — norm_factor GPU tensor, defer reported_lm item() after timing
+
+### Key conclusions
+The dev agent eliminated 6 CUDA stream synchronizations per step from the timed region by replacing `.item()` calls with GPU tensor operations or deferring them to after `step_end_event.synchronize()`. The changes affect `train_loop.py:1984-2161` (4 norm_factor sites, 2 reported_lm/mtp sites) and `zero_optimizer.py:153-168` (type annotation). All operations are in-process PyTorch tensor operations — no proxy, no shell-out to ref/, no hardcoded synthetic metrics. Anti-proxy guard passes (0 violations). Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` in commit message, no gate evidence in the latest perf_log.md section (gates not yet run for this round). Additionally, the profile snapshot requirement (M6_round54/summary.md) is missing for this perf-touching round — a methodology violation. The long-horizon milestone check reports throughput below the review-side bar, but this does not affect REVIEW_VERDICT.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- No gate config, remote config, or run-shape key modifications detected
+- Changes are genuine PyTorch tensor operations; no `.item()` calls remain in the timed region
+
+---
+
+## [stage1] Round 55 — 2026-08-14 22:00
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+The dev agent implemented a fused Triton RMSNorm forward kernel (`triton_kernels.py:_rms_norm_fwd_kernel`, `rms_norm_forward_fused`) that fuses the RMSNorm forward computation into a single Triton kernel. The kernel reads bf16 input directly, computes in fp32, and writes bf16 output — eliminating the internal dtype round-trip overhead of `F.rms_norm`. The kernel is gated by `ENABLE_TRITON_RMSNORM_FWD=1` and `deterministic=False`; bitwise gates always use the PyTorch `F.rms_norm` path. The engine (forward.py, train_loop.py, triton_kernels.py) implements all forward/backward/optimizer/loss/metric computation in-process — no proxy, no shell-out to ref, no hardcoded synthetic metrics. The `rms_norm` function signature was updated with a `deterministic` parameter. All 11 call sites (forward pass + backward recomputation) pass `deterministic=deterministic`. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in commit message, and the long-horizon milestone check reports throughput below the review-side bar, but this does not affect REVIEW_VERDICT.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `bin/harness run guard`: PASS (0 violations)
+- `long-train` (200 steps, DP=2): PASS (loss_rel 0.264% < 2.50%, MFU **22.5%**)
+- `resume-gate-20` (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
+- `loss-gate-200` (200 steps, DP=2): PASS (no drift warning)
+- `profile-snapshot` (long-horizon_round55): PASS (step_time 7556ms, MFU 17.40% nsys)
+- Engine files (`workload/src/training_engine_tensor/`) all compute MFU, loss, and grad_norm from actual runtime values — no hardcoded constants
+- `_rms_norm_fwd_kernel` at `triton_kernels.py:162` — genuine Triton `@triton.jit` kernel
+- `rms_norm_forward_fused` at `triton_kernels.py:218` — wraps the Triton kernel with PyTorch interface
+- `rms_norm` at `forward.py:99` — routes to fused kernel or PyTorch `F.rms_norm` based on `deterministic` flag
+- `eval_long_train.py:80` — sets `ENABLE_TRITON_RMSNORM_FWD=1` for long-horizon gates only

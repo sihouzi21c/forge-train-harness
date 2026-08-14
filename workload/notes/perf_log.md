@@ -1866,3 +1866,65 @@ All changes are numerically equivalent to the original code:
   1. **Operator fusion** — residual-add + RMSNorm forward (Triton) to reduce copy operations.
   2. **Optimizer step CUDA graph** — revisit if memory situation improves.
   3. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with working CUDA graph).
+- review R54 PASS: genuine .item() → GPU tensor optimization, no proxy detected
+
+## [stage1] Round 55 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused Triton RMSNorm forward, MFU 22.5%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented a fused Triton RMSNorm forward kernel (`triton_kernels.py:_rms_norm_fwd_kernel`, `rms_norm_forward_fused`) that fuses the RMSNorm forward computation into a single Triton kernel. The kernel reads bf16 input directly, computes in fp32, and writes bf16 output — eliminating the internal dtype round-trip overhead of `F.rms_norm`.
+
+**Phase 2 optimization — fused Triton RMSNorm forward:**
+
+1. **`_rms_norm_fwd_kernel` (Triton)**: Each program handles one (B, S) row of H elements. The kernel computes `r = rsqrt(mean(x^2) + eps)`, `normed = x * r * weight` — all in a single Triton kernel launch with fp32 internal accumulation.
+
+2. **Gating by `ENABLE_TRITON_RMSNORM_FWD=1`**: The Triton kernel is only used when `ENABLE_TRITON_RMSNORM_FWD=1` AND `deterministic=False` (long-horizon mode). The bitwise gates always use the PyTorch `F.rms_norm` path. The `eval_long_train.py` script sets `ENABLE_TRITON_RMSNORM_FWD=1`.
+
+3. **`rms_norm` signature updated**: Added `deterministic: bool = True` parameter to `forward.py:rms_norm`. When the fused kernel is enabled, the Triton path is used; otherwise, `F.rms_norm` is used.
+
+4. **All 11 call sites updated**: Both `_forward_with_cache` (forward pass) and `_static_backward` (backward recomputation) pass `deterministic=deterministic` to all `rms_norm` calls.
+
+### Gate results (long-train, 200 steps, DP=2)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| **MFU(standard)** | **22.5%** | — |
+| loss_rel(point) | 0.264% | < 2.50% ✅ |
+| signed_mean_rel | +0.264% | no drift ✅ |
+| pointwise_mean_rel | 0.264% | — |
+| max_rel_diff | 0.39% | — |
+| drift_warning | None | ✅ |
+| compared_steps | 100 | — |
+| ref_elapsed_s | 1563s | — |
+| **status** | **passed** | ✅ |
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 50 (Triton RMSNorm bwd) | 18.0% | −0.34pp | Different devspace |
+| Round 51 (Triton SwiGLU bwd) | 20.1% | **+2.1pp** | Same devspace |
+| Round 52 (Triton SwiGLU fwd) | 20.85% | **+2.5pp** | Same devspace |
+| Round 53 (CE opt, no CUDA graph) | 21.03% | **+2.69pp** | Same devspace |
+| Round 54 (.item() CUDA sync elimination) | 21.1% | **+2.76pp** | Same devspace |
+| **Round 55 (Triton RMSNorm fwd)** | **22.5%** | **+4.16pp** | Same devspace |
+
+### Regression gates
+
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **loss-gate-200 (200 steps, DP=2)**: PASS (no drift warning).
+
+### Next steps
+
+- Continue optimization: the profile shows `cudaStreamSynchronize` (2945ms) and `cudaLaunchKernel` (2616ms) are the dominant CUDA API overheads (nsys-inflated).
+- Candidate levers for next round:
+  1. **Fused cross-entropy (Triton)** — SoftMax forward is 226ms (3.7%). A fused Triton CE kernel could save ~100ms.
+  2. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2).
+  3. **RoPE fusion** — fuse the `apply_rope` computation into a single Triton kernel.
+- review R55 PASS: fused Triton RMSNorm forward is genuine in-process kernel, no proxy detected

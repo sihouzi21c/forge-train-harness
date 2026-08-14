@@ -488,7 +488,7 @@ def _forward_with_cache(
     for li, layer in enumerate(model.layers):
         hidden_before_attn = hidden
 
-        normed = rms_norm(hidden, layer.input_norm_weight)
+        normed = rms_norm(hidden, layer.input_norm_weight, deterministic=deterministic)
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.attention_norm", 0, normed)
 
@@ -512,7 +512,7 @@ def _forward_with_cache(
         hidden = hidden_after_attn
 
         # MLP sub-layer
-        normed2 = rms_norm(hidden, layer.pre_mlp_norm_weight)
+        normed2 = rms_norm(hidden, layer.pre_mlp_norm_weight, deterministic=deterministic)
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.ffn_norm", 0, normed2)
 
@@ -552,7 +552,7 @@ def _forward_with_cache(
         ))
 
     # ── Final norm ─────────────────────────────────────────────────────
-    hidden_normed = rms_norm(hidden, model.final_norm_weight)
+    hidden_normed = rms_norm(hidden, model.final_norm_weight, deterministic=deterministic)
     if capture_records is not None:
         _capture_forward(capture_records, capture_prefix, "norm", 0, hidden_normed)
 
@@ -574,8 +574,8 @@ def _forward_with_cache(
 
     if model.mtp is not None and mtp_input_ids is not None:
         mtp_emb = embedding_forward(mtp_input_ids, model.tok_embeddings_weight) * mup_emb_scale
-        a = rms_norm(mtp_emb, model.mtp.emb_input_norm_weight)
-        b = rms_norm(hidden_normed, model.mtp.hidden_input_norm_weight)
+        a = rms_norm(mtp_emb, model.mtp.emb_input_norm_weight, deterministic=deterministic)
+        b = rms_norm(hidden_normed, model.mtp.hidden_input_norm_weight, deterministic=deterministic)
 
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, "mtp.emb_input_layernorm", 0, a)
@@ -587,7 +587,7 @@ def _forward_with_cache(
 
         # MTP transformer layer
         mtp_hidden_before_attn = eagle_h
-        mtp_normed = rms_norm(eagle_h, model.mtp.layer.input_norm_weight)
+        mtp_normed = rms_norm(eagle_h, model.mtp.layer.input_norm_weight, deterministic=deterministic)
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, "mtp.layer.attention_norm", 0, mtp_normed)
 
@@ -603,7 +603,7 @@ def _forward_with_cache(
         mtp_hidden_after_attn = eagle_h + mtp_attn_out * depth_scale_mtp
         eagle_h = mtp_hidden_after_attn
 
-        mtp_normed2 = rms_norm(eagle_h, model.mtp.layer.pre_mlp_norm_weight)
+        mtp_normed2 = rms_norm(eagle_h, model.mtp.layer.pre_mlp_norm_weight, deterministic=deterministic)
         mtp_gate_up = torch.matmul(mtp_normed2, model.mtp.layer.mlp_fc1_weight.t())
         # Use fused Triton SwiGLU forward kernel for non-deterministic mode.
         _use_triton_swiglu_fwd_mtp = (
@@ -635,7 +635,7 @@ def _forward_with_cache(
             mlp_out=mtp_mlp_out,
         )
 
-        mtp_final = rms_norm(eagle_h, model.mtp.final_norm_weight)
+        mtp_final = rms_norm(eagle_h, model.mtp.final_norm_weight, deterministic=deterministic)
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, "mtp.final_layernorm", 0, mtp_final)
 
@@ -807,7 +807,7 @@ def _static_backward(
         # wfc1 backward: gate_up = normed2 @ wfc1.T
         # Recompute normed2 from hidden_after_attn (not stored in cache
         # to save activation memory).
-        _mtp_normed2 = rms_norm(mtp_lc.hidden_after_attn, model.mtp.layer.pre_mlp_norm_weight)
+        _mtp_normed2 = rms_norm(mtp_lc.hidden_after_attn, model.mtp.layer.pre_mlp_norm_weight, deterministic=deterministic)
         d_mtp_normed2, dw_mtp_fc1 = linear_backward(
             d_mtp_gate_up, _mtp_normed2, model.mtp.layer.mlp_fc1_weight
         )
@@ -853,7 +853,7 @@ def _static_backward(
         # QKV projection backward
         # Recompute normed from hidden_before_attn (not stored in cache
         # to save activation memory).
-        _mtp_normed = rms_norm(mtp_lc.hidden_before_attn, model.mtp.layer.input_norm_weight)
+        _mtp_normed = rms_norm(mtp_lc.hidden_before_attn, model.mtp.layer.input_norm_weight, deterministic=deterministic)
         d_mtp_normed, dw_mtp_qkv = project_qkv_backward(
             d_mtp_q, d_mtp_k, d_mtp_v,
             _mtp_normed, model.mtp.layer.qkv_weight,
@@ -975,7 +975,7 @@ def _static_backward(
         # wfc1 backward: gate_up = normed2 @ wfc1.T
         # Recompute normed2 from hidden_after_attn (not stored in cache
         # to save ~432 MB of activation memory per layer).
-        _normed2 = rms_norm(lc.hidden_after_attn, layer.pre_mlp_norm_weight)
+        _normed2 = rms_norm(lc.hidden_after_attn, layer.pre_mlp_norm_weight, deterministic=deterministic)
         d_normed2, dw_fc1 = linear_backward(
             d_gate_up, _normed2, layer.mlp_fc1_weight
         )
@@ -1020,7 +1020,7 @@ def _static_backward(
         # QKV projection backward
         # Recompute normed from hidden_before_attn (not stored in cache
         # to save ~432 MB of activation memory per layer).
-        _normed = rms_norm(lc.hidden_before_attn, layer.input_norm_weight)
+        _normed = rms_norm(lc.hidden_before_attn, layer.input_norm_weight, deterministic=deterministic)
         d_normed, dw_qkv = project_qkv_backward(
             d_q, d_k, d_v, _normed, layer.qkv_weight
         )
