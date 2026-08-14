@@ -72,6 +72,18 @@ from training_engine_tensor.zero_optimizer import (
     zero_save_checkpoint,
 )
 
+# Try to import the fused Triton SwiGLU forward kernel.
+# Falls back to the PyTorch path when Triton is not available (e.g. on Mac).
+# The Triton kernel is used only when BOTH:
+#   (a) deterministic=False (long-horizon performance mode), AND
+#   (b) ENABLE_TRITON_SWIGLU_FWD=1 (explicitly enabled — default 0).
+_HAS_TRITON_SWIGLU_FWD = False
+try:
+    from training_engine_tensor.triton_kernels import swiglu_forward_fused as _swiglu_fwd_fused
+    _HAS_TRITON_SWIGLU_FWD = True
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
+
 # ── H100 peak ────────────────────────────────────────────────────────────────
 H100_BF16_PEAK_FLOPS = 989.4e12
 
@@ -508,8 +520,19 @@ def _forward_with_cache(
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.wfc1", 0, gate_up)
 
-        y1, y2 = gate_up.chunk(2, dim=-1)
-        intermediate = (torch.nn.functional.silu(y1.float()) * y2.float()).to(y1.dtype)
+        # Use fused Triton SwiGLU forward kernel for non-deterministic (long-horizon) mode.
+        # gated by ENABLE_TRITON_SWIGLU_FWD=1 (default 0, checked at runtime).
+        _use_triton_swiglu_fwd = (
+            _HAS_TRITON_SWIGLU_FWD
+            and not deterministic
+            and gate_up.is_cuda
+            and int(os.environ.get('ENABLE_TRITON_SWIGLU_FWD', '0'))
+        )
+        if _use_triton_swiglu_fwd:
+            intermediate = _swiglu_fwd_fused(gate_up, C.FFN_HIDDEN_SIZE)
+        else:
+            y1, y2 = gate_up.chunk(2, dim=-1)
+            intermediate = (torch.nn.functional.silu(y1.float()) * y2.float()).to(y1.dtype)
         mlp_out = torch.matmul(intermediate, layer.mlp_fc2_weight.t())
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.w2", 0, mlp_out)
@@ -582,8 +605,18 @@ def _forward_with_cache(
 
         mtp_normed2 = rms_norm(eagle_h, model.mtp.layer.pre_mlp_norm_weight)
         mtp_gate_up = torch.matmul(mtp_normed2, model.mtp.layer.mlp_fc1_weight.t())
-        mtp_y1, mtp_y2 = mtp_gate_up.chunk(2, dim=-1)
-        mtp_intermediate = (torch.nn.functional.silu(mtp_y1.float()) * mtp_y2.float()).to(mtp_y1.dtype)
+        # Use fused Triton SwiGLU forward kernel for non-deterministic mode.
+        _use_triton_swiglu_fwd_mtp = (
+            _HAS_TRITON_SWIGLU_FWD
+            and not deterministic
+            and mtp_gate_up.is_cuda
+            and int(os.environ.get('ENABLE_TRITON_SWIGLU_FWD', '0'))
+        )
+        if _use_triton_swiglu_fwd_mtp:
+            mtp_intermediate = _swiglu_fwd_fused(mtp_gate_up, C.FFN_HIDDEN_SIZE)
+        else:
+            mtp_y1, mtp_y2 = mtp_gate_up.chunk(2, dim=-1)
+            mtp_intermediate = (torch.nn.functional.silu(mtp_y1.float()) * mtp_y2.float()).to(mtp_y1.dtype)
         mtp_mlp_out = torch.matmul(mtp_intermediate, model.mtp.layer.mlp_fc2_weight.t())
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, "mtp.layer.w2", 0, mtp_mlp_out)

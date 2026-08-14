@@ -82,6 +82,10 @@ def main() -> None:
     # performance.  Also gated by deterministic=False, so bitwise gates
     # always use the PyTorch closed-form.
     os.environ.setdefault("ENABLE_TRITON_SWIGLU_BWD", "1")
+    # Enable the fused Triton SwiGLU forward kernel for long-horizon
+    # performance.  Also gated by deterministic=False, so bitwise gates
+    # always use the PyTorch path.
+    os.environ.setdefault("ENABLE_TRITON_SWIGLU_FWD", "1")
     config = TrainLoopConfig(
         num_steps=int(_require("NUM_STEPS")),
         micro_batch_size=micro_batch_size,
