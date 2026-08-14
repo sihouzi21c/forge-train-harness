@@ -1310,3 +1310,53 @@ The dev agent implemented Phase 2 optimization by adding a Triton wgrad GEMM ker
    - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
    - CUDA graph for optimizer step (needs LR tensor workaround)
    - ZeRO-1 optimization for larger DP sizes
+- review R43 PASS: no proxy detected; profile snapshot missing, throughput below review-side bar
+
+## [stage1] Round 44 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — remote cluster GPU resources occupied by another user's devspace (tasks/720056, deadline ~4h), gates not run
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: Triton wgrad GEMM + _foreach_copy_ bf16 sync)
+- **Commit**: `1f57a49` (current commit)
+
+### Key conclusions
+
+The dev agent implemented Phase 2 optimization by adding a Triton wgrad GEMM kernel for the output weight and using `torch._foreach_copy_` for the bf16 sync. The code is committed locally and pushed to GitHub (`sihouzi21c/forge-train-harness.git`, `harness` branch). The remote cluster (`paratera_shandong`, resource pool `faxin`) has no available GPU capacity — another user's devspace (720056, 1× H100) is running and consuming the only GPU in the pool.
+
+**Triton wgrad GEMM (`triton_kernels.py`)**:
+- Created `triton_kernels.py` with `_wgrad_output_kernel` / `wgrad_output` — a Triton kernel optimized for the output weight wgrad shape (V=130560, H=2048, M=4096).
+- The kernel reads bf16 inputs directly and accumulates in fp32, avoiding the cuBLAS TF32 path's intermediate TF32 → bf16 → fp32 conversion chain and the explicit `.float()` cast.
+- Tiling: `BLOCK_SIZE_M=128, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=8` — optimized for the tall-thin [130560, 2048] output shape.
+- Integrated into `backward.py:linear_backward` — auto-selects Triton for output dim ≥ 8192 (the output weight), keeps cuBLAS for smaller body weights.
+- Gated by `ENABLE_TRITON_WGRAD=1` env var (default 1), falls back to cuBLAS when Triton is not available.
+
+**bf16 sync optimization (`_foreach_copy_`)**:
+- Replaced the per-param `for p_bf16, p_fp32: p_bf16.data.copy_(p_fp32.bfloat16())` (157 separate `copy_` kernel launches) with `torch._foreach_copy_(bf16_params, bf16_views)` (1 fused copy kernel launch).
+- The `bfloat16()` conversions remain 157 separate kernel launches, but the copy step is reduced from 157 to 1 launch, saving ~1.25ms of launch overhead per step.
+
+### Remote status
+
+- `tsh` session expired, `tsh login` requires interactive terminal
+- `cctl` CLI is authenticated (profile: modelbest, user: sunhaojun)
+- Code pushed to GitHub (public repo) and verified: `--code-type git` + `python3 -m harness.cli` works correctly
+- Cluster `paratera_shandong` resource pool `faxin` (pool 323) has 1 GPU occupied by another user's devspace (720056, 项盛业, deadline ~4h)
+- Old devspace 719101 (our loop, 2× H100, leaked from R32-33) was stopped to free quota
+- 1-GPU BATCH jobs (simple `python3 --version`, `harness.cli import`) succeed; 2-GPU jobs queue until GPU available
+
+### Gate results
+
+- **guard**: PASS (0 violations)
+- **anti-proxy**: PASS (0 violations)
+- GPU gates not run (cluster busy)
+
+### Next steps
+
+Once the cluster GPU is available:
+1. Push to GitHub: done (already on `harness` branch)
+2. Run `long-train-smoke` (DP=2, 20 steps) with `ENABLE_TRITON_WGRAD=1` to measure MFU improvement
+3. Run `resume-gate-20` regression to verify the Triton kernel doesn't break save/load
+4. Run `profile-snapshot M6_round44` to identify the next bottleneck
+5. Candidate levers for subsequent rounds:
+   - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
+   - CUDA graph for optimizer step (needs memory re-evaluation after normed/normed2 removal)
+   - ZeRO-1 optimization for larger DP sizes

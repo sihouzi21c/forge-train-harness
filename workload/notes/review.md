@@ -101,3 +101,19 @@ The commit is documentation-only — only `workload/notes/perf_log.md` was modif
 - Commit diff only touches `workload/notes/perf_log.md` — no engine code changes, no gate threshold tampering, no remote config edits
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 - Long-horizon throughput check: below review-side bar, no milestone override
+
+---
+
+## [stage1] Round 43 — 2026-08-14 09:28
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 1f57a49 — Perf: Triton wgrad GEMM for output weight + _foreach_copy_ bf16 sync
+
+### Key conclusions
+The commit adds a genuine Triton wgrad kernel (`triton_kernels.py:49-158`) for the output weight, reading bf16 inputs and accumulating in fp32, avoiding the cuBLAS TF32 round-trip. No shell-out to `ref/`, no import of reference-side helpers, no hardcoded synthetic metrics — all calculations are in-process. The commit does not modify any gate shape config, remote.toml, or eval thresholds. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message, and the four gate suites (long-train 200-step, resume-gate-20, resume-startup-90, perf-bitwise) have not been demonstrated green. The profile snapshot requirement is not met (no `workload/notes/profile/M*_round43/summary.md`), and the long-horizon throughput check is `BELOW_BAND` (1 sample).
+
+### Evidence highlights
+- `triton_kernels.py` — self-contained Triton GEMM kernel, no proxy references
+- `backward.py:86-89` — Triton wgrad integration with cuBLAS fallback, no forgery
+- `long-horizon` check: `MFU_GATE_VERDICT: FAIL — BELOW_BAND`, 1 sample, no milestone override
