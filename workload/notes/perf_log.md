@@ -2453,3 +2453,54 @@ The per-step savings are from eliminating the 6.18 GiB of temporary CUDA allocat
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute).
   2. **Residual-add + RMSNorm fusion** — fuse residual-add into the Triton RMSNorm forward kernel to eliminate the intermediate hidden tensor copy.
   3. **CUDA allocator tuning** — investigate `PYTORCH_CUDA_ALLOC_CONF` settings to reduce allocator fragmentation under the CUDA graph's private pools.
+
+### Gate results (long-train, 200 steps, DP=2)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| **MFU(standard)** | **31.1%** | — |
+| loss_rel(point) | 0.482% | < 2.50% ✅ |
+| signed_mean_rel | -0.345% | no drift ✅ |
+| pointwise_mean_rel | 0.48% | — |
+| max_rel_diff | 1.63% | — |
+| drift_warning | None | ✅ |
+| compared_steps | 100 | — |
+| ref_elapsed_s | 1604s | — |
+| **status** | **passed** | ✅ |
+
+### Regression gates
+
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 51 (Triton SwiGLU bwd) | 20.1% | **+1.76pp** | |
+| Round 52 (Triton SwiGLU fwd) | 20.85% | **+2.51pp** | |
+| Round 53 (CE opt, direct softmax) | 21.03% | **+2.69pp** | |
+| Round 55 (Triton RMSNorm fwd) | 22.5% | **+4.16pp** | |
+| Round 57 (Triton CE bwd) | 26.74% | **+8.40pp** | |
+| Round 58 (CUDA graph re-enable) | 27.1% | **+8.76pp** | |
+| Round 59 (Triton RoPE fwd+bwd) | 27.9% | **+9.56pp** | |
+| Round 60 (flat tensor grad norm) | 27.89% | **+9.55pp** | |
+| Round 61 (flat bf16 sync, profile fix) | 28.1% | **+9.76pp** | |
+| Round 62 (_foreach_copy_ unflatten) | 28.1% | **+9.76pp** | |
+| Round 63 (pre-alloc step accumulators) | 28.2% | **+9.86pp** | |
+| Round 65 (eliminate redundant SwiGLU cat) | 28.2% | **+9.86pp** | |
+| **Round 66 (pre-alloc flat BF16 sync)** | **31.1%** | **+12.76pp** | **Same devspace** |
+
+### Analysis
+
+The 6.18 GiB of pre-allocated flat buffers (flat_fp32 4.1 GiB + flat_bf16 2.08 GiB) eliminated the per-step CUDA allocator calls in `_sync_bf16_from_fp32`. These allocations were triggering internal `cudaStreamSynchronize` when the CUDA graph's private pools (~11 GiB) consumed most of the 79.32 GiB HBM. The step time dropped from ~4655ms to ~4218ms (-437ms, -9.4%), confirming the allocator synchronizations were the dominant GPU idle contributor.
+
+The CUDA graph's free memory dropped from 59.7 GiB to 53.4 GiB (the 6.18 GiB of pre-allocated buffers), but capture still succeeds with 11.3 GiB free after capture. The `torch.cat` with `out=` parameter for the loss scalar stats tensor also eliminates a per-step 32-byte allocation.
+
+### Next steps
+
+- Continue optimization: the remaining bottlenecks are flash attention (28.6% of GPU kernel) and cuBLAS GEMM (30.4%), both frozen. The GPU idle is now ~1800ms (38.3% of step time), dominated by CUDA API overhead and NCCL all-reduce synchronization.
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute, now that step time is 4.2s the all-reduce is more exposed).
+  2. **Residual-add + RMSNorm fusion** — fuse residual-add into the Triton RMSNorm forward kernel to eliminate the intermediate hidden tensor copy.
+  3. **CUDA allocator tuning** — investigate `PYTORCH_CUDA_ALLOC_CONF` settings to reduce allocator fragmentation under the CUDA graph's private pools.
