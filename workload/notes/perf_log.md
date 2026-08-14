@@ -1197,19 +1197,22 @@ The CUDA graph capture sequence (warmup forward+backward → `_foreach_zero_` �
 
 Expected MFU with CUDA graph enabled: **~18.8%** (matching the Round 25 baseline, with additional gains from closed-form backward + _foreach_* batching).
 
-### Gate results (expected)
+### Gate results (long-train-smoke, DP=2, 20 steps, cctl job 720222)
 
-- **long-train-smoke (20 steps, DP=2)**: PASS (CUDA graph enabled, no crash)
-- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (CUDA graph disabled for deterministic mode)
-- **long-train (200 steps, DP=2)**: PASS (loss_rel < 2.50%, MFU estimated ~18.8%)
+- **Verdict**: PASS (`status: "passed"`)
+- **loss_rel(point)**: 0.193% < 2.50% threshold
+- **signed_rel**: -0.1455% (no drift warning)
+- **MFU(standard)**: **18.3%** (up from 17.0% in Round 41, +1.3pp)
+- **CUDA graph**: `[debug] CUDA graph captured successfully` — no crash, no OOM, no NCCL error
+- **Optimizer graph**: removed (OOM risk at 25 MiB free after fwd+bwd graph's 20.96 GiB private pools)
+- **Ref time**: 232s (ref script baseline)
 
 ### Next steps
 
-1. Run `long-train-smoke` with `ENABLE_CUDA_GRAPH=1` to verify the CUDA graph crash is fixed
-2. Run `profile-snapshot M6_round42` to measure the MFU improvement
-3. Run `long-train` (200 steps) for the full gate
-4. Run `resume-gate-20` regression to verify CUDA graph doesn't break save/load
-5. Candidate levers:
+1. Run `profile-snapshot M6_round42` to measure the MFU improvement and identify the next bottleneck
+2. Run `long-train` (200 steps) for the full gate
+3. Run `resume-gate-20` regression to verify CUDA graph doesn't break save/load
+4. Candidate levers:
    - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion) — small MFU gain
    - ZeRO-1 optimization for DP=2 (reduce_scatter overhead > benefit at DP=2, but may help at larger scales)
    - Overlap improvements (gradient bucketing still regresses at DP=2)
