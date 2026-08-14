@@ -2161,3 +2161,4 @@ The profile snapshot is the eager path (nsys doesn't support CUDA graph). The Ro
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute).
   2. **Residual-add + RMSNorm fusion** — fuse the residual-add and RMSNorm into a single Triton kernel.
   3. **Fused grad norm** — fuse the `_foreach_norm` + `stack` + `vector_norm` into a single Triton kernel.
+- review R59 PASS: genuine fused Triton RoPE kernel, no proxy; stage in-progress
