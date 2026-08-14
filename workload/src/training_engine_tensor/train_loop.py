@@ -1120,12 +1120,20 @@ def _adamw_step(
     beta1: float,
     beta2: float,
     eps: float,
+    dummy_sq: torch.Tensor | None = None,  # pre-allocated 1-element fp32 tensor
 ) -> None:
     """Apply one AdamW step using the fused multi-tensor kernel.
 
     Reads gradients from ``p.grad`` on each ``fp32_master`` tensor (same
     as the ref's ``optim.step()`` which reads from ``.grad`` after
-    ``clip_grad_norm_`` sets it)."""
+    ``clip_grad_norm_`` sets it).
+
+    ``dummy_sq``: a pre-allocated 1-element fp32 tensor used as a
+    placeholder for ``max_exp_avg_sqs`` (``amsgrad=False`` means the
+    kernel never accesses it).  When ``None``, a new tensor is created
+    (the old per-step allocation fallback).  Pre-allocating once and
+    reusing avoids a CUDA allocator call per optimizer group per step
+    that can trigger an internal ``cudaStreamSynchronize``."""
     for group in optim_groups:
         params = group["params"]
         n = len(params)
@@ -1154,7 +1162,10 @@ def _adamw_step(
         # Use a single shared 1-element tensor for all entries (amsgrad=False
         # means the kernel never accesses max_exp_avg_sqs), saving 157
         # torch.zeros_like allocations (~628 MB) per step.
-        _dummy_sq = torch.zeros(1, device=params[0].device)
+        if dummy_sq is not None:
+            _dummy_sq = dummy_sq
+        else:
+            _dummy_sq = torch.zeros(1, device=params[0].device)
         torch._fused_adamw_(
             tuple(params),
             tuple(grads),
@@ -1629,6 +1640,14 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     _local_lm_n = torch.zeros(1, device=device, dtype=torch.float64)
     _local_mtp_sum = torch.zeros(1, device=device, dtype=torch.float64)
     _local_mtp_n = torch.zeros(1, device=device, dtype=torch.float64)
+
+    # Pre-allocate a 1-element fp32 tensor for the AdamW fused kernel's
+    # max_exp_avg_sqs placeholder (amsgrad=False means the kernel never
+    # accesses it).  Reusing across all optimizer groups and all steps
+    # avoids a CUDA allocator call per group per step, which can trigger
+    # an internal cudaStreamSynchronize (~1.77ms) when the allocator cache
+    # is empty after the CUDA graph's private pool consumption.
+    _opt_dummy_sq = torch.zeros(1, device=device, dtype=torch.float32)
 
     # ── CUDA graph capture for forward+backward of one microbatch ───────
     # Capturing the static forward+backward sequence as a CUDA graph
@@ -2214,6 +2233,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 optim_groups, fp32_master,
                 exp_avgs, exp_avg_sqs, opt_state_steps,
                 beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
+                dummy_sq=_opt_dummy_sq,
             )
             # ── Sync BF16 params from FP32 master ─────────────────────────
             _sync_bf16_from_fp32(bf16_params, fp32_master)

@@ -651,18 +651,18 @@ The semantic audit confirms the candidate engine is genuinely implementing forwa
 
 ---
 
-## [stage1] Round 62 — 2026-08-15 03:54
+## [stage1] Round 63 — 2026-08-15 04:23
 
 - **Verdict**: PASS
 - **Stage status**: in-progress
-- **Commit**: 96bbb45 — Perf: fuse all-reduce unflatten via _foreach_copy_ — reduce cudaMemcpyAsync calls 53%
+- **Commit**: 25bf69b — Perf: pre-allocate step-level loss accumulators — avoid 4 CUDA allocator calls per step
 
 ### Key conclusions
-The dev agent replaced the `buf.copy_(sub)` loop in the all-reduce unflatten path with `torch._foreach_copy_()`, reducing cudaMemcpyAsync calls by 53% (2084→986). The change is a genuine in-process CUDA optimization — no shell-out to `ref/`, no imports of reference helpers, and no hardcoded synthetic values. The anti-proxy guard passes. The long-horizon throughput check reports throughput below the review-side bar — no milestone advance. Stage 1 FINISH conditions not met: the commit message does not declare `STAGE_STATUS: finished`, and the latest perf_log.md section lacks `long-train` (200-step), `resume-startup-90`, and `perf-bitwise` gate evidence.
+The dev agent pre-allocated 4 step-level loss accumulators (`_local_lm_sum`, `_local_lm_n`, `_local_mtp_sum`, `_local_mtp_n`) outside the training loop, replacing per-step `torch.zeros()` calls with `zero_()` and fixing the all-reduce assignment to use `copy_()` instead of view reassignment. This is a genuine in-process CUDA optimization — no shell-out to `ref/`, no reference imports, no hardcoded synthetic values. The anti-proxy guard passes. Stage 1 FINISH conditions not met: the commit message does not declare `STAGE_STATUS: finished`, the latest perf_log.md section lacks `long-train` (200-step), `resume-startup-90`, and `perf-bitwise` gate evidence, and no profile snapshot was committed alongside the perf-touching change.
 
 ### Evidence highlights
-- `train_loop.py:2087-2090,2107-2110` — replaces `buf.copy_(sub)` with `torch._foreach_copy_()` in both gradient-bucketing and flat all-reduce paths
+- `train_loop.py:1624-1628` — pre-allocated `_local_lm_sum/_local_lm_n/_local_mtp_sum/_local_mtp_n` once before the step loop
+- `train_loop.py:1895-1898` — `zero_()` replaces `torch.zeros()` at each step start, avoiding CUDA allocator sync overhead
 - `bin/harness run anti-proxy`: PASS (0 violations)
-- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 
 ---

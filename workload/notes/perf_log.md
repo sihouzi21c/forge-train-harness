@@ -2359,10 +2359,33 @@ The dev agent implemented a pre-allocation optimization for the step-level loss 
 
 The `torch.zeros(1, ...)` calls are small allocations (~8 bytes each) that the CUDA allocator normally caches. However, the CUDA graph's private pools (~11 GiB for the fwd+bwd graph, ~16.3 GiB total after capture) consume most of the 79.32 GiB HBM, leaving limited room for the allocator's free list. In this memory-constrained environment, each `torch.zeros` call can trigger a CUDA allocator internal `cudaStreamSynchronize` (~40ms per sync). Eliminating up to 4 potential syncs per step could save ~160ms/step, for an estimated ~3.4% MFU improvement (from 28.1% to ~29.0%).
 
+### Profile results (long-horizon_round64 vs round62)
+
+| Metric | Round 62 | Round 64 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 4683.1 | 4655.8 | **-27.3ms** |
+| MFU (nsys) | 28.08% | 28.24% | **+0.17pp** |
+| GPU kernel (ms) | 2875.0 | 2873.9 | **-1.1ms** |
+| GPU idle (ms) | 1808.1 | 1781.8 | **-26.2ms** |
+| GPU memop H2D (ms) | 57.8 | 45.6 | **-12.1ms** |
+| cudaMemcpyAsync (ms) | 1637.8 | 1624.0 | **-13.9ms** |
+| cudaStreamSynchronize (ms) | 618.2 | 613.5 | **-4.7ms** |
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: `loss_rel 0.108% < 2.50%` PASS; `signed_rel +0.0417%` (no drift); MFU **28.2%**.
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **profile-snapshot (long-horizon_round64)**: step_time 4655.8ms, MFU 28.24%.
+
 ### Next steps
 
-- Run `long-train-smoke` (DP=2, 20 steps) to measure the MFU improvement.
+- The remaining bottlenecks are unchanged:
+  1. **Flash attention**: 821ms (28.6% of GPU kernel time) — flash_attn library, no room for optimization.
+  2. **cuBLAS GEMM**: 864ms (30.0% of GPU kernel time) — cuBLAS library, no room for optimization.
+  3. **GPU idle**: 1782ms (38.3% of step time) — CPU overhead from CUDA API calls (cudaMemcpyAsync 1624ms, cudaGraphLaunch 749ms, cudaStreamSynchronize 613ms).
+- The `_dummy_sq` pre-allocation optimization is exhausted. The remaining CUDA allocator syncs are from the CUDA graph's private pool management, not from per-step allocations.
 - Candidate levers for subsequent rounds:
   1. **NCCL overlap** — gradient bucketing with async NCCL on separate streams, overlapping all-reduce with the next step's forward pass.
   2. **H2D copy batching** — reduce cudaMemcpyAsync calls by concatenating input tensors into a single pinned buffer.
   3. **Residual-add + RMSNorm fusion** — fuse the residual-add and RMSNorm forward into a single Triton kernel to eliminate ~87ms of elementwise copy operations.
+- review R63 FAIL: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization
