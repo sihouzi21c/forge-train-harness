@@ -382,3 +382,26 @@ This commit is a documentation-only update (only `workload/notes/perf_log.md` an
 - `long-train` (200 steps, DP=2): PASS (loss_rel 0.44% < 2.50%, MFU 18.34%, no drift)
 - `resume-gate-20` (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---
+
+## [stage1] Round 49 — 2026-08-14 18:00
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused Triton RMSNorm backward, MFU +0.69pp to 17.98%)
+- **Commit**: 14329f7 — Perf: fuse RMSNorm backward via Triton kernel — reduce 12 kernel launches to 1, MFU +0.69pp
+
+### Key conclusions
+
+The dev agent implemented a fused Triton RMSNorm backward kernel (`triton_kernels.py:_rms_norm_bwd_kernel`) that fuses 12 PyTorch kernel launches into a single Triton kernel per (B, S) row. The kernel reads bf16 inputs, computes d_hidden in fp32, and writes bf16 output. The grad_weight sum remains in PyTorch (cross-row reduction). The kernel is gated by `ENABLE_TRITON_RMSNORM_BWD=1` (set in `eval_long_train.py` for long-horizon) and `deterministic=False`; bitwise gates always use the PyTorch closed-form to preserve bitwise alignment. The engine is genuinely implementing the backward pass in-process — no proxy, no shell-out to ref, no hardcoded synthetic metrics. Stage 1 remains in-progress: no `STAGE_STATUS:finished` in commit message, gate evidence incomplete (no `long-train` 200-step, no `resume-startup-90`, `perf-bitwise` FAIL), and profile snapshot missing from this commit.
+
+### Evidence highlights
+
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `_rms_norm_bwd_kernel` at `triton_kernels.py:162` — genuine Triton `@triton.jit` kernel
+- `rms_norm_backward_fused` at `triton_kernels.py:218` — wraps the Triton kernel with PyTorch grad_weight sum
+- `rms_norm_backward` at `backward.py:148` — routes to fused kernel or PyTorch closed-form based on `deterministic` flag
+- `eval_long_train.py:79` — sets `ENABLE_TRITON_RMSNORM_BWD=1` for long-horizon gates only
+
+---

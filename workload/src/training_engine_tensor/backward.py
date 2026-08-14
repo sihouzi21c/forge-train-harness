@@ -185,14 +185,38 @@ def rms_norm_backward(
 # ── SwiGLU intermediate backward (silu(gate) * up) ─────────────────────────
 
 
+# Try to import the fused Triton SwiGLU backward kernel.
+# Falls back to the pure-PyTorch closed-form when Triton is not available
+# (e.g. on Mac).  The Triton kernel is used only when BOTH:
+#   (a) deterministic=False (long-horizon performance mode), AND
+#   (b) ENABLE_TRITON_SWIGLU_BWD=1 (explicitly enabled — default 0).
+# This ensures the bitwise gates always use the PyTorch closed-form.
+_HAS_TRITON_SWIGLU_BWD = False
+try:
+    from training_engine_tensor.triton_kernels import swiglu_backward_fused as _swiglu_bwd_fused
+    _HAS_TRITON_SWIGLU_BWD = True
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
+
+
 def silu_swiglu_intermediate_backward(
     grad_out: torch.Tensor,
     gate: torch.Tensor,
     up: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    gate_up: torch.Tensor | None = None,
+    ffn_half: int | None = None,
+    deterministic: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
     """Backward of ``silu(gate) * up`` using closed-form (no autograd replay).
 
-    Uses the closed-form SiLU derivative:
+    When ``deterministic=True`` (default, bitwise-safe mode), uses the
+    pure-PyTorch closed-form that is bitwise-identical to the ref's
+    ``F.silu`` autograd backward.  When ``deterministic=False`` and
+    ``gate_up`` is provided (long-horizon performance mode), uses the
+    fused Triton kernel which reads bf16 inputs directly, computes in
+    fp32, and writes bf16 output, eliminating the .float() copy overhead.
+
+    The closed-form math is:
 
         sigmoid(x) = 1 / (1 + exp(-x))
         dsilu/dx = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
@@ -200,9 +224,25 @@ def silu_swiglu_intermediate_backward(
         d_up = grad_out * silu(gate)
 
     All computation is in fp32 for precision, matching the ref's ``F.silu``
-    autograd backward at the numerical level.  The closed-form avoids the
-    autograd engine's intermediate tensor overhead (kernel launches, copies).
+    autograd backward at the numerical level.
+
+    When ``gate_up`` is provided (fused Triton path), returns a single
+    ``[B, S, 2*ffn_half]`` tensor ``d_gate_up``.  When ``gate_up`` is
+    ``None`` (PyTorch closed-form), returns ``(d_gate, d_up)``.
     """
+    # Use fused Triton kernel for non-deterministic (long-horizon) mode.
+    if (gate_up is not None and ffn_half is not
+            None and _HAS_TRITON_SWIGLU_BWD
+            and not deterministic
+            and gate.is_cuda
+            and int(__import__('os').environ.get('ENABLE_TRITON_SWIGLU_BWD', '0'))):
+        d_gate_up = _swiglu_bwd_fused(grad_out, gate_up, ffn_half)
+        # Return views into the fused output so the caller's
+        # ``torch.cat([d_y1, d_y2], dim=-1)`` is a no-op (both views
+        # already point into the same buffer).
+        return d_gate_up[..., :ffn_half], d_gate_up[..., ffn_half:]
+
+    # Pure-PyTorch closed-form (bitwise-safe, used for deterministic mode).
     # Compute in fp32 for precision
     gate_f = gate.float()
     up_f = up.float()

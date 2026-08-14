@@ -259,3 +259,197 @@ def rms_norm_backward_fused(
     grad_weight = (grad_out.float() * normed).reshape(-1, H).sum(0)
 
     return d_hidden, grad_weight
+
+
+# ── Fused SwiGLU forward ────────────────────────────────────────────────────
+#
+# Fuses the SwiGLU forward computation:
+#   intermediate = silu(gate) * up
+#
+# into a single Triton kernel.  The current PyTorch implementation
+# (forward.py:mlp_swiglu) launches 4 separate kernel launches (2 .float()
+# copies + 1 silu + 1 multiply + 1 .to(bf16)) per call.  This fused kernel
+# does it in 1 launch, reading bf16 inputs, computing in fp32, and writing
+# bf16 output.
+#
+# Each program handles one BLOCK_SIZE-sized chunk of one (B, S) row's
+# ffn_half elements.  Grid = (B * S, ceil(ffn_half / BLOCK_SIZE)).
+
+
+@triton.jit
+def _swiglu_fwd_kernel(
+    gate_up_ptr, intermediate_ptr,
+    stride_gu_row,  # 2 * ffn_half
+    stride_int_row,  # ffn_half
+    ffn_half,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused SwiGLU forward: intermediate = silu(gate) * up.
+
+    One program per (row, ffn_block) in a 2D grid.
+    """
+    pid_b = tl.program_id(0)  # row in B*S
+    pid_f = tl.program_id(1)  # block index in ffn_half
+
+    offs = pid_f * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < ffn_half
+
+    # Load gate and up from gate_up: gate = gate_up[..., :ffn_half],
+    # up = gate_up[..., ffn_half:].
+    gate = tl.load(
+        gate_up_ptr + pid_b * stride_gu_row + offs,
+        mask=mask, other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        gate_up_ptr + pid_b * stride_gu_row + ffn_half + offs,
+        mask=mask, other=0.0,
+    ).to(tl.float32)
+
+    # silu(gate) = gate * sigmoid(gate)
+    sig = tl.sigmoid(gate)
+    intermediate = gate * sig * up
+
+    # Store bf16 intermediate.
+    tl.store(
+        intermediate_ptr + pid_b * stride_int_row + offs,
+        intermediate.to(tl.bfloat16),
+        mask=mask,
+    )
+
+
+def swiglu_forward_fused(
+    gate_up: torch.Tensor,  # [B, S, 2*ffn_half] bf16
+    ffn_half: int,          # FFN_HIDDEN_SIZE
+) -> torch.Tensor:          # [B, S, ffn_half] bf16
+    """Fused SwiGLU forward: returns intermediate = silu(gate) * up.
+
+    Reads bf16 inputs from ``gate_up``, computes in fp32, and writes
+    bf16 ``intermediate``.  Numerically equivalent to the PyTorch
+    ``F.silu(gate.float()) * up.float()`` path.
+    """
+    B, S, _ = gate_up.shape
+    # Allocate intermediate output (bf16).
+    intermediate = torch.empty(B, S, ffn_half, dtype=torch.bfloat16, device=gate_up.device)
+
+    BLOCK_SIZE = min(2048, 1 << (ffn_half - 1).bit_length())
+    grid = (B * S, triton.cdiv(ffn_half, BLOCK_SIZE))
+
+    _swiglu_fwd_kernel[grid](
+        gate_up, intermediate,
+        gate_up.stride(1),  # stride_gu_row = S * 2*ffn_half
+        intermediate.stride(1),  # stride_int_row = S * ffn_half
+        ffn_half,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return intermediate
+
+
+# ── Fused SwiGLU backward ───────────────────────────────────────────────────
+#
+# Fuses the SwiGLU backward computation:
+#   sig = sigmoid(gate)
+#   silu_val = gate * sig
+#   d_silu = sig * (1 + gate * (1 - sig))
+#   d_gate = grad_out * up * d_silu
+#   d_up = grad_out * silu_val
+#
+# into a single Triton kernel.  The current PyTorch implementation
+# (backward.py:silu_swiglu_intermediate_backward) launches 3 .float() copies
+# + 8 element-wise operations per call.  This fused kernel reads bf16 inputs
+# directly, computes in fp32, and writes bf16 d_gate / d_up.
+#
+# Each program handles one BLOCK_SIZE-sized chunk of one (B, S) row's
+# ffn_half elements.  Grid = (B * S, ceil(ffn_half / BLOCK_SIZE)).
+
+
+@triton.jit
+def _swiglu_bwd_kernel(
+    grad_out_ptr, gate_up_ptr, d_gate_up_ptr,
+    stride_go_row,   # ffn_half
+    stride_gu_row,   # 2 * ffn_half
+    stride_dgu_row,  # 2 * ffn_half
+    ffn_half,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused SwiGLU backward: d_gate, d_up from grad_out, gate, up.
+
+    One program per (row, ffn_block) in a 2D grid.
+    """
+    pid_b = tl.program_id(0)  # row in B*S
+    pid_f = tl.program_id(1)  # block index in ffn_half
+
+    offs = pid_f * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < ffn_half
+
+    # Load gate (bf16 → fp32) from gate_up[..., :ffn_half].
+    gate = tl.load(
+        gate_up_ptr + pid_b * stride_gu_row + offs,
+        mask=mask, other=0.0,
+    ).to(tl.float32)
+    # Load up (bf16 → fp32) from gate_up[..., ffn_half:].
+    up = tl.load(
+        gate_up_ptr + pid_b * stride_gu_row + ffn_half + offs,
+        mask=mask, other=0.0,
+    ).to(tl.float32)
+    # Load grad_out (bf16 → fp32).
+    go = tl.load(
+        grad_out_ptr + pid_b * stride_go_row + offs,
+        mask=mask, other=0.0,
+    ).to(tl.float32)
+
+    # sig = sigmoid(gate)
+    sig = tl.sigmoid(gate)
+    # silu(gate) = gate * sig
+    silu_val = gate * sig
+    # dsilu/dgate = sig * (1 + gate * (1 - sig))
+    d_silu = sig * (1.0 + gate * (1.0 - sig))
+
+    # d_gate = grad_out * up * dsilu/dgate
+    d_gate = go * up * d_silu
+    # d_up = grad_out * silu(gate)
+    d_up = go * silu_val
+
+    # Store d_gate (bf16).
+    tl.store(
+        d_gate_up_ptr + pid_b * stride_dgu_row + offs,
+        d_gate.to(tl.bfloat16),
+        mask=mask,
+    )
+    # Store d_up (bf16).
+    tl.store(
+        d_gate_up_ptr + pid_b * stride_dgu_row + ffn_half + offs,
+        d_up.to(tl.bfloat16),
+        mask=mask,
+    )
+
+
+def swiglu_backward_fused(
+    grad_out: torch.Tensor,  # [B, S, ffn_half] bf16 - gradient w.r.t. intermediate
+    gate_up: torch.Tensor,   # [B, S, 2*ffn_half] bf16 - forward input
+    ffn_half: int,           # FFN_HIDDEN_SIZE
+) -> torch.Tensor:           # [B, S, 2*ffn_half] bf16 - d_gate_up
+    """Fused SwiGLU backward: returns d_gate_up from grad_out and gate_up.
+
+    Reads bf16 inputs from ``grad_out`` and ``gate_up``, computes in fp32,
+    and writes bf16 ``d_gate_up``.  Numerically equivalent to:
+
+        _y1, _y2 = gate_up.chunk(2, dim=-1)
+        d_y1, d_y2 = silu_swiglu_intermediate_backward(grad_out, _y1, _y2)
+        d_gate_up = torch.cat([d_y1, d_y2], dim=-1)
+    """
+    B, S, _ = gate_up.shape
+    # Allocate d_gate_up output (bf16, same shape as gate_up).
+    d_gate_up = torch.empty_like(gate_up, dtype=torch.bfloat16)
+
+    BLOCK_SIZE = min(2048, 1 << (ffn_half - 1).bit_length())
+    grid = (B * S, triton.cdiv(ffn_half, BLOCK_SIZE))
+
+    _swiglu_bwd_kernel[grid](
+        grad_out, gate_up, d_gate_up,
+        grad_out.stride(1),   # stride_go_row = S * ffn_half
+        gate_up.stride(1),    # stride_gu_row = S * 2*ffn_half
+        d_gate_up.stride(1),  # stride_dgu_row = S * 2*ffn_half
+        ffn_half,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return d_gate_up

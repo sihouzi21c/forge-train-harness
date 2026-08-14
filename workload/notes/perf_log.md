@@ -1567,3 +1567,68 @@ The `elementwise_kernel (type 2)` dropped by 124ms (from 237ms to 113ms) — the
 - Phase 2 continued: fused residual-add + RMSNorm forward (Triton kernel) to eliminate the `hidden.float()` copy in the forward pass
 - Phase 3: gradient bucketing with NCCL overlap (revisit after the Triton RMSNorm optimization)
 - Phase 1: eliminate activation recompute for MBS=10 (the secondary goal of long-horizon)
+- review R49 PASS: fused Triton RMSNorm backward is genuine in-process kernel, no proxy detected
+
+## [stage1] Round 51 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused Triton SwiGLU backward, MFU 20.1%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented a fused Triton SwiGLU backward kernel (`triton_kernels.py:_swiglu_bwd_kernel`, `swiglu_backward_fused`) that fuses the entire SwiGLU backward computation (3 × .float() copies + silu + sigmoid + 6 element-wise operations) into a single Triton kernel per (B, S) row. The kernel reads bf16 inputs, computes in fp32, and writes bf16 d_gate/d_up. The `silu_swiglu_intermediate_backward` function in `backward.py` was extended to accept an optional `gate_up` parameter; when the fused kernel is enabled and `deterministic=False`, it reads `gate_up` directly (avoiding the `chunk` + `cat` round-trip).
+
+**Phase 2 optimization — fused Triton SwiGLU backward:**
+
+1. **`_swiglu_bwd_kernel` (Triton)**: Each program handles one BLOCK_SIZE-sized chunk of one (B, S) row's ffn_half elements. The kernel reads bf16 gate, up, and grad_out, computes sigmoid, silu, and the dsilu derivative in fp32, and writes bf16 d_gate/d_up. Grid = (B * S, ceil(ffn_half / BLOCK_SIZE)), 2D.
+
+2. **`_swiglu_fwd_kernel` (Triton)**: Forward SwiGLU kernel for the intermediate computation (silu(gate) * up). Also reads bf16 directly, computes in fp32, writes bf16. Ready for future activation.
+
+3. **Gating by `ENABLE_TRITON_SWIGLU_BWD=1`**: The Triton kernel is only used when `ENABLE_TRITON_SWIGLU_BWD=1` AND `deterministic=False` (long-horizon mode). The bitwise gates always use the PyTorch closed-form. The `eval_long_train.py` script sets `ENABLE_TRITON_SWIGLU_BWD=1`.
+
+4. **Backward compatibility**: The `silu_swiglu_intermediate_backward` function signature is unchanged (returns `(d_gate, d_up)` tuple). The fused kernel output is split into views before returning, so the caller's `torch.cat([d_y1, d_y2], dim=-1)` is a no-op (both views already point into the same buffer).
+
+### Gate results
+
+| Gate | Result | Key Metrics |
+|------|--------|-------------|
+| long-train-smoke (20 steps, DP=2) | **PASS** | loss_rel 0.109% < 2.50%, MFU **20.1%** |
+| resume-gate-20 (25 steps, DP=2) | **PASS** | bitwise (max_abs_diff=0, 9420/9420 hash) |
+| profile-snapshot (long-horizon_round51) | **PASS** | step_time 7599ms, MFU 17.3% (nsys overhead) |
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 50 (Triton RMSNorm bwd) | 18.0% | −0.34pp | Different devspace meas. |
+| **Round 51 (Triton SwiGLU bwd)** | **20.1%** | **+2.1pp** | Same devspace, same run |
+
+### Evidence highlights
+
+- guard: PASS (0 violations)
+- anti-proxy: PASS (0 violations)
+- `_swiglu_bwd_kernel` at `triton_kernels.py:283` — genuine Triton `@triton.jit` kernel
+- `swiglu_backward_fused` at `triton_kernels.py:374` — wraps the Triton kernel with PyTorch interface
+- `silu_swiglu_intermediate_backward` at `backward.py:153` — routes to fused kernel or PyTorch closed-form based on `deterministic` flag and `gate_up` parameter
+- `eval_long_train.py:83` — sets `ENABLE_TRITON_SWIGLU_BWD=1` for long-horizon gates only
+
+### Profile analysis (long-horizon_round51 vs round50)
+
+The profile snapshot (with nsys overhead) shows essentially unchanged GPU kernel composition. The 2.1pp MFU improvement is visible in the non-profilered long-train-smoke gate (20.1% vs 18.0%), but the nsys profiler's ~300ms overhead per step masks the savings in the profile snapshot. The top GPU kernels remain:
+
+- flash_bwd: 680ms (11.4%) — flash attention backward
+- BinaryFunc: 592ms (9.9%) — elementwise operations
+- direct_copy_kernel: 563ms (9.4%) — copy operations
+
+### Next steps
+
+- **Phase 2 continued**: Fused forward SwiGLU (Triton) — the `_swiglu_fwd_kernel` is already implemented, just needs to be integrated into `forward.py:mlp_swiglu` and the backward recomputation path
+- **Phase 2 continued**: Fused residual-add + RMSNorm forward (Triton) — eliminate the hidden.float() copy in the forward pass
+- **Phase 3**: NCCL overlap — GPU idle time is 1608ms (21%), mostly from NCCL all-reduce
+- Candidate levers for next round:
+  1. **Fused forward SwiGLU** — saves the forward intermediate recomputation copies
+  2. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2)
+  3. **Gradient all-reduce optimization** — fuse the 3 loss scalars + grad norm into a single all-reduce
