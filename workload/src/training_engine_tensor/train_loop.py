@@ -1151,12 +1151,16 @@ def _adamw_step(
         # Call fused AdamW kernel (same underlying op as ref's fused=True).
         # max_exp_avg_sqs must be a tuple of tensors (not None) — the
         # remote PyTorch version rejects NoneType for this parameter.
+        # Use a single shared 1-element tensor for all entries (amsgrad=False
+        # means the kernel never accesses max_exp_avg_sqs), saving 157
+        # torch.zeros_like allocations (~628 MB) per step.
+        _dummy_sq = torch.zeros(1, device=params[0].device)
         torch._fused_adamw_(
             tuple(params),
             tuple(grads),
             tuple(eas),
             tuple(eass),
-            tuple(torch.zeros_like(p) for p in params),
+            tuple(_dummy_sq for _ in params),
             tuple(steps),
             amsgrad=False,
             lr=lr,

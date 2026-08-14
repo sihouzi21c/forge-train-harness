@@ -1927,4 +1927,62 @@ The dev agent implemented a fused Triton RMSNorm forward kernel (`triton_kernels
   1. **Fused cross-entropy (Triton)** — SoftMax forward is 226ms (3.7%). A fused Triton CE kernel could save ~100ms.
   2. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2).
   3. **RoPE fusion** — fuse the `apply_rope` computation into a single Triton kernel.
-- review R55 PASS: fused Triton RMSNorm forward is genuine in-process kernel, no proxy detected
+- review R55 PASS: genuine Triton RMSNorm forward kernel, no proxy; long-horizon throughput below bar, keep optimizing
+
+## [stage1] Round 56 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: _fused_adamw_ max_exp_avg_sqs memory optimization)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent ran the profile-snapshot for long-horizon_round55 (the last perf-touching round that was missing a profile per the review methodology violation). The profile confirms the optimization trajectory is correct — GPU kernel time dropped by 611ms vs round54, but GPU idle increased by 601ms, keeping the step time essentially flat.
+
+**Profile analysis (long-horizon_round55 vs round54)**:
+- Δ step_time_ms = -10.8 (flat)
+- Δ gpu_kernel_per_step_ms = -611.7 (large drop)
+- Δ gpu_idle_per_step_ms = +600.9 (large increase)
+- Δ cuda_api_per_step_ms = -717.9
+- Δ os_runtime_per_step_ms = -1644.4
+
+The GPU idle is now 2319.6ms (30.7% of step time), up from 1718.7ms — the RMSNorm forward fusion accelerated compute so much that the CPU-side overhead (NCCL all-reduce + `cudaStreamSynchronize` + Python loop overhead) is now the dominant bottleneck.
+
+**Optimization: `_fused_adamw_` `max_exp_avg_sqs` shared tensor**:
+- The `max_exp_avg_sqs` parameter is never accessed when `amsgrad=False`, but the `_fused_adamw_` function requires a tuple of tensors (rejects `None`).
+- Changed from 157 separate `torch.zeros_like(p)` allocations (~628 MB total) to a single 1-element shared tensor repeated for all entries.
+- Verified via remote test: the shared tensor is not modified by the kernel, confirming it's safe.
+- MFU impact: negligible (saves ~1.5ms of fill kernel launches), but saves 628 MB of GPU memory allocation per step.
+
+### Profile results (long-horizon_round55)
+
+| Metric | Value |
+|--------|-------|
+| step_time_ms | 7557.16 |
+| MFU (nsys) | 17.40% |
+| GPU kernel time (ms) | 5237.53 |
+| GPU idle (ms) | 2319.63 |
+| Top kernel | BinaryFunc (604.6ms, 11.5%) |
+| Top copy kernel | direct_copy_kernel (434.2ms, 8.3%) |
+| Top bf16 kernel | bfloat16_copy (273.1ms, 5.2%) |
+
+### Gate results (long-train-smoke, DP=2, 20 steps)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| loss_rel(point) | 0.028% | < 2.50% ✅ |
+| signed_rel | +0.0277% | no drift ✅ |
+| MFU(standard) | 22.5% | — |
+| pointwise_mean_rel | 0.028% | — |
+| max_rel_diff | 0.044% | — |
+| ref_elapsed_s | 178.8s | — |
+| loss_pass | True | — |
+
+### Next steps
+
+- The GPU idle (30.7%) is now the dominant bottleneck. Candidate levers:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 now that compute is faster, NCCL may be more exposed)
+  2. **Fused cross-entropy (Triton)** — SoftMax forward is 290.4ms (5.5%). A Triton CE kernel could save ~100ms.
+  3. **RoPE fusion** — fuse the `apply_rope` computation into a single Triton kernel.
+- The profile snapshot is now committed in `workload/notes/profile/long-horizon_round55/`.
