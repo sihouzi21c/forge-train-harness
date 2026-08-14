@@ -299,7 +299,7 @@ class _BackgroundPrefetcher:
     ``deque``.  The main thread calls ``get()`` to retrieve the next batch
     without blocking on the dataloader's shard refill (which can take seconds
     on the first call).  The queue depth is controlled by ``max_size`` (default
-    4 — enough headroom to absorb dataloader latency across 10-microbatch
+    8 — enough headroom to absorb dataloader latency across 10-microbatch
     steps).
 
     Producer-consumer synchronization uses a ``threading.Semaphore`` to avoid
@@ -318,7 +318,7 @@ class _BackgroundPrefetcher:
     (``non_blocking=True`` copies) hides the GPU-side H2D transfer latency.
     """
 
-    def __init__(self, dl, max_size: int = 4, B: int = 4, S: int = 4096):
+    def __init__(self, dl, max_size: int = 8, B: int = 4, S: int = 4096):
         self._dl = dl
         self._queue: deque = deque()
         self._max_size = max_size
@@ -1636,7 +1636,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     dl_prefetcher: _BackgroundPrefetcher | None = None
     if int(os.environ.get("ENABLE_DL_PREFETCH", "1")):
         dl_prefetcher = _BackgroundPrefetcher(
-            iter_dl, max_size=4,
+            iter_dl, max_size=8,
             B=config.micro_batch_size, S=C.MAX_SEQ_LEN,
         )
         dl_prefetcher.start()
