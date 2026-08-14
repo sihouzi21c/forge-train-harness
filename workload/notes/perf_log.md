@@ -1758,3 +1758,67 @@ Once the cluster GPU is available:
    - **Optimizer step CUDA graph** — capture AdamW + bf16 sync into the graph (now feasible with freed memory)
    - **Fused cross-entropy (Triton)** — if the PyTorch CE optimization frees enough memory, a full Triton CE kernel could further reduce compute time
    - **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2)
+
+## [stage1] Round 53 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: CE forward .float() removed; Phase 2: CE backward direct softmax; MFU 21.0%)
+- **Commit**: d9e8e24
+
+### Key conclusions
+
+The dev agent tested the CE optimization (gated behind `deterministic` flag from Round 53) on the remote devspace (ds-722156, SSH re-enabled after tsh session renewal). The eager path achieves **MFU 21.0%** on the full 200-step long-train, up from 20.85% in Round 52 (+0.18pp improvement from the CE backward direct softmath formula).
+
+**CUDA graph OOM issue**:
+- The CUDA graph capture (fwd+bwd) OOMs on the new devspace (ds-722156) with only 784 MiB free after warmup allocations.
+- The CE optimization was supposed to free ~21 GiB by skipping the `.float()` materialization of [B*S, V] fp32 logits, but the graph capture still fails because the LM head matmul (`torch.matmul`) needs 3.98 GiB of temporary workspace that can't be allocated with only 784 MiB free.
+- **Fix applied**: Changed `ENABLE_CUDA_GRAPH` default from `"1"` to `"0"`. The eager path with CE optimization is now faster (21.1% vs 18.3% MFU) than the old CUDA graph path.
+- **Additional fix**: Added `torch.cuda.empty_cache()` + `gc.collect()` after warmup (before graph capture) to fix the OOM for anyone who enables CUDA graph manually.
+
+### Profile analysis (long-horizon_round53 vs round52)
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Step time (ms) | 7605 | 7565 | **-39ms** |
+| MFU (standard, nsys) | 17.29% | 17.38% | **+0.09pp** |
+| GPU kernel time (ms) | 5991 | 5252 | **-739ms** |
+| GPU idle (ms) | 1614 | 2313 | +699ms |
+
+The nsys-profiled MFU is 17.38% (vs 21.03% in the clean gate, due to nsys overhead). The **GPU kernel time dropped by 739ms**, confirming the CE backward direct softmath formula eliminates the autograd replay overhead (SoftMaxBackward and flash_bwd dropped from the top 15 kernel ranking entirely).
+
+### Gate results (long-train, 200 steps, DP=2, ENABLE_CUDA_GRAPH=0)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| **MFU(standard)** | **21.03%** | — |
+| loss_rel(point) | 0.357% | < 2.50% ✅ |
+| signed_mean_rel | +0.358% | no drift ✅ |
+| pointwise_mean_rel | 0.357% | — |
+| max_rel_diff | 0.95% | — |
+| drift_warning | None | ✅ |
+| compared_steps | 100 | — |
+| ref_elapsed_s | 1563s | — |
+| **status** | **passed** | ✅ |
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 50 (Triton RMSNorm bwd) | 18.0% | −0.34pp | Different devspace |
+| Round 51 (Triton SwiGLU bwd) | 20.1% | **+2.1pp** | Same devspace |
+| Round 52 (Triton SwiGLU fwd) | 20.85% | **+2.5pp** | Same devspace |
+| **Round 53 (CE opt, no CUDA graph)** | **21.03%** | **+2.69pp** | Same devspace |
+
+### Resume gate regression
+
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+
+### Next steps
+
+- Continue optimization: the profile shows `cudaStreamSynchronize` (2540ms) and `cudaLaunchKernel` (2237ms) are the dominant overheads. The CUDA graph was the primary lever for these, but it's OOMing on the current devspace.
+- Candidate levers for next round:
+  1. **Reduce cudaStreamSynchronize** — identify and eliminate unnecessary synchronize calls in the hot path (2540ms/step is the largest single overhead).
+  2. **Operator fusion** — residual-add + RMSNorm forward (Triton) to reduce copy operations.
+  3. **Optimizer step CUDA graph** — revisit if memory situation improves.
