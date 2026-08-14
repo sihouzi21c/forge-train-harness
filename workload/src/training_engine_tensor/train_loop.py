@@ -1184,6 +1184,8 @@ def _adamw_step(
 def _sync_bf16_from_fp32(
     bf16_params: list[torch.Tensor],
     fp32_master: list[torch.Tensor],
+    flat_fp32_buf: torch.Tensor | None = None,
+    flat_bf16_buf: torch.Tensor | None = None,
 ) -> None:
     """Copy FP32 master weights back to BF16 params using a flat fused approach.
 
@@ -1193,14 +1195,26 @@ def _sync_bf16_from_fp32(
     (one per param) to a single fused kernel launch, saving ~1.25ms of launch
     overhead per step.
 
-    The flat approach needs 4.1 GiB of contiguous memory for the flattened
-    fp32 + 2.08 GiB for the bf16 copy = 6.18 GiB total.  With the CE
-    optimization (Round 57) freeing ~21 GiB of logits memory, the CUDA graph's
-    private pools are now ~11 GiB (down from ~20.96 GiB in Round 25), leaving
-    enough contiguous memory for the flat allocation.  Fall back to the
-    per-parameter approach if the flat allocation fails (fragmentation).
+    When ``flat_fp32_buf`` and ``flat_bf16_buf`` are provided (pre-allocated
+    contiguous tensors), the function uses ``torch.cat(..., out=flat_fp32_buf)``
+    to write directly to the pre-allocated buffers, avoiding the 6.18 GiB of
+    temporary CUDA allocations per step that can trigger internal
+    ``cudaStreamSynchronize`` when the allocator cache is under memory pressure
+    from the CUDA graph's private pools.
     """
-    # Flatten all FP32 master weights into one contiguous tensor.
+    if flat_fp32_buf is not None and flat_bf16_buf is not None:
+        # Pre-allocated path: write directly into the pre-allocated buffers.
+        # torch.cat with out= writes the concatenated data into the contiguous
+        # buffer — same operation as _flatten_dense_tensors but without the
+        # per-step allocation.  The reshape(-1) creates views (no allocation).
+        torch.cat([t.reshape(-1) for t in fp32_master], out=flat_fp32_buf)
+        flat_bf16_buf.copy_(flat_fp32_buf)
+        unflattened = torch._utils._unflatten_dense_tensors(flat_bf16_buf, bf16_params)
+        torch._foreach_copy_(bf16_params, unflattened)
+        return
+
+    # Fallback: allocate flat buffers per-step (e.g. when pre-allocated
+    # buffers are not available, such as the checkpoint-load sync call).
     try:
         flat_fp32 = torch._utils._flatten_dense_tensors(fp32_master)
         flat_bf16 = flat_fp32.bfloat16()
@@ -1464,6 +1478,21 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
     # ── FP32 gradient buffers ──────────────────────────────────────────
     fp32_grad_bufs = [torch.zeros_like(p_) for p_ in fp32_master]
+
+    # ── Pre-allocate flat buffers for BF16 sync ────────────────────────
+    # Pre-allocate contiguous flat buffers for _sync_bf16_from_fp32 to
+    # avoid 6.18 GiB of temporary CUDA allocations per step (flat_fp32
+    # 4.1 GiB + flat_bf16 2.08 GiB).  These allocations can trigger
+    # internal cudaStreamSynchronize when the CUDA allocator cache is
+    # under memory pressure from the CUDA graph's private pools.
+    _f32_numel = sum(p.numel() for p in fp32_master)
+    _flat_fp32_buf = torch.empty(_f32_numel, dtype=torch.float32, device=device)
+    _flat_bf16_buf = torch.empty(_f32_numel, dtype=torch.bfloat16, device=device)
+
+    # Pre-allocate a 4-element fp64 tensor for the loss scalar all-reduce.
+    # The torch.cat for [lm_sum, lm_n, mtp_sum, mtp_n] creates a 32-byte tensor
+    # every step.  Pre-allocating avoids the per-step CUDA allocator call.
+    _stats_buf = torch.empty(4, dtype=torch.float64, device=device)
 
     # ── Optimizer state (AdamW) ────────────────────────────────────────
     opt_beta1 = float(os.environ.get("ADAM_BETA1", "0.9"))
@@ -2038,19 +2067,22 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # cudaStreamSynchronize).
         if config.world_size > 1:
             if use_mtp:
-                # Match the ref's reduce_loss_scalar: concatenate all scalars
-                # into one tensor and do a single all-reduce.
-                stats = torch.cat([_local_lm_sum, _local_lm_n, _local_mtp_sum, _local_mtp_n])
-                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                _local_lm_sum.copy_(stats[0:1])
-                _local_lm_n.copy_(stats[1:2])
-                _local_mtp_sum.copy_(stats[2:3])
-                _local_mtp_n.copy_(stats[3:4])
+                # Pre-allocated stats buffer: use torch.cat with out= to avoid
+                # the per-step CUDA allocator call for the 32-byte tensor.
+                torch.cat([_local_lm_sum, _local_lm_n, _local_mtp_sum, _local_mtp_n],
+                          out=_stats_buf)
+                dist.all_reduce(_stats_buf, op=dist.ReduceOp.SUM)
+                _local_lm_sum.copy_(_stats_buf[0:1])
+                _local_lm_n.copy_(_stats_buf[1:2])
+                _local_mtp_sum.copy_(_stats_buf[2:3])
+                _local_mtp_n.copy_(_stats_buf[3:4])
             else:
-                stats = torch.cat([_local_lm_sum, _local_lm_n])
-                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                _local_lm_sum.copy_(stats[0:1])
-                _local_lm_n.copy_(stats[1:2])
+                # Only first 2 elements used (lm_sum, lm_n).
+                torch.cat([_local_lm_sum, _local_lm_n],
+                          out=_stats_buf[:2])
+                dist.all_reduce(_stats_buf[:2], op=dist.ReduceOp.SUM)
+                _local_lm_sum.copy_(_stats_buf[0:1])
+                _local_lm_n.copy_(_stats_buf[1:2])
 
         # Keep as GPU tensors — defer .item() to after timing to avoid
         # CUDA stream sync inside the timed region.
@@ -2234,7 +2266,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 dummy_sq=_opt_dummy_sq,
             )
             # ── Sync BF16 params from FP32 master ─────────────────────────
-            _sync_bf16_from_fp32(bf16_params, fp32_master)
+            _sync_bf16_from_fp32(bf16_params, fp32_master,
+                                 flat_fp32_buf=_flat_fp32_buf,
+                                 flat_bf16_buf=_flat_bf16_buf)
 
         # ── Per-step logging ──────────────────────────────────────────
         step_end_event.record()

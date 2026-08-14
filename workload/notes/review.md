@@ -700,3 +700,20 @@ The dev agent eliminated the redundant `torch.cat` calls in the SwiGLU backward 
 - `bin/harness run guard`: PASS (0 violations)
 
 ---
+
+## [stage1] Round 65 — 2026-08-15 05:03
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: aaa719d — Perf: eliminate redundant SwiGLU backward torch.cat — always return single d_gate_up tensor
+
+### Key conclusions
+The dev agent eliminated the redundant `torch.cat` calls in the SwiGLU backward path by making `silu_swiglu_intermediate_backward` return a single `[B, S, 2*ffn_half]` tensor directly. This is a genuine in-process optimization — no shell-out to `ref/`, no reference imports, no hardcoded synthetic values. The anti-proxy guard passes (0 violations). Stage 1 FINISH conditions not met: the commit does not declare `STAGE_STATUS: finished`; perf_log.md lacks `long-train` (200-step), `resume-startup-90`, and `perf-bitwise` gate evidence; and the profile snapshot is missing for this perf-touching round.
+
+### Evidence highlights
+- `backward.py:237-238` — fused Triton path returns `_swiglu_bwd_fused(...)` directly (no view split)
+- `backward.py:261-263` — PyTorch path now returns `torch.cat([d_gate, d_up], dim=-1)` (the cat moved inside the function)
+- `train_loop.py:799-801, 966-968` — call sites use the single returned tensor, no `d_y1, d_y2 = ...` unpacking or `torch.cat`
+- `bin/harness run anti-proxy`: PASS (0 violations)
+
+---

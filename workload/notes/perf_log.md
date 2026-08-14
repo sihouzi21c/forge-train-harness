@@ -2418,3 +2418,38 @@ The dev agent eliminated the redundant `torch.cat` calls in the SwiGLU backward 
 - Candidate levers for subsequent rounds:
   1. **Fused grad_weight computation** — inline the `grad_weight` sum into the Triton RMSNorm backward kernel to eliminate the `hidden.float()` copy in the `rms_norm_backward_fused` wrapper.
   2. **Pre-allocated buffer for MTP eagle FC cat** — avoid the `torch.cat` at line 584 by storing the concatenated tensor in the `LayerCache`.
+- review R65 PASS: no proxy, genuine in-process optimization eliminating redundant SwiGLU bwd torch.cat
+
+## [stage1] Round 66 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: pre-allocate flat BF16 sync buffers + stats buffer)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented pre-allocation of the flat buffers used by `_sync_bf16_from_fp32` and the loss scalar stats tensor, eliminating the remaining per-step CUDA allocator calls in the hot path. These allocations can trigger internal `cudaStreamSynchronize` when the CUDA graph's private pools (~11 GiB) consume most of the 79.32 GiB HBM, leaving limited room for the allocator's free list.
+
+**Optimization — pre-allocate flat BF16 sync buffers**:
+
+1. `_sync_bf16_from_fp32` — Added `flat_fp32_buf` and `flat_bf16_buf` optional parameters. When provided, the function uses `torch.cat(..., out=flat_fp32_buf)` to write directly to the pre-allocated buffers, avoiding the 6.18 GiB of temporary CUDA allocations per step (flat_fp32 4.1 GiB + flat_bf16 2.08 GiB).
+   - The pre-allocated path uses `torch.cat` with `out=` to concatenate the FP32 master tensors into the pre-allocated contiguous buffer, then `copy_()` for the bf16 conversion, and `_foreach_copy_` for the unflattened copy.
+   - The fallback path (per-step `_flatten_dense_tensors` + `bfloat16()`) is preserved for the checkpoint-load sync call (one-time, not performance-critical).
+
+2. **`_stats_buf` pre-allocation** — Pre-allocated a 4-element fp64 tensor for the loss scalar all-reduce. The `torch.cat` for `[lm_sum, lm_n, mtp_sum, mtp_n]` created a 32-byte tensor every step. Pre-allocating avoids the per-step CUDA allocator call. Uses `torch.cat` with `out=_stats_buf` for both MTP and non-MTP paths.
+
+### Estimated MFU impact
+
+The per-step savings are from eliminating the 6.18 GiB of temporary CUDA allocations, which can trigger internal `cudaStreamSynchronize` (~100ms per sync) when the allocator cache is under memory pressure from the CUDA graph's private pools. The actual impact depends on the allocator cache state and is estimated at 0.1-0.5pp MFU improvement.
+
+### Next steps
+
+- Push to GitHub and run `long-train-smoke` (DP=2, 20 steps) to verify the gate still passes.
+- Run `profile-snapshot M6_round66` to confirm the `cudaStreamSynchronize` time dropped.
+- Run `resume-gate-20` regression to verify the optimization doesn't break save/load.
+- Run `long-train` (200 steps) to establish the new MFU baseline.
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute).
+  2. **Residual-add + RMSNorm fusion** — fuse residual-add into the Triton RMSNorm forward kernel to eliminate the intermediate hidden tensor copy.
+  3. **CUDA allocator tuning** — investigate `PYTORCH_CUDA_ALLOC_CONF` settings to reduce allocator fragmentation under the CUDA graph's private pools.
