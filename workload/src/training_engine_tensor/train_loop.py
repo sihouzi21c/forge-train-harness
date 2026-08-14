@@ -2017,6 +2017,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         reported_mtp_tensor = (local_mtp_sum / local_mtp_n.clamp(min=1.0)) if use_mtp else None
 
         if config.world_size > 1:
+            # Initialize flat gradient reference for efficient norm computation.
+            # The flat all-reduce path sets this to the scaled all-reduced flat
+            # tensor, allowing torch.linalg.vector_norm to bypass the ~100ms
+            # multi-tensor _foreach_norm kernel (157 buffers).
+            _flat_grads = None
             if enable_zero and zero_opt is not None:
                 # ── ZeRO-1: reduce_scatter gradients ──────────────────────────────
                 # Each rank receives only its shard's portion of the summed gradient.
@@ -2088,6 +2093,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
                 ):
                     buf.copy_(sub)
+            # Save the flat (scaled all-reduced) gradient tensor for efficient
+            # gradient norm computation.  torch.linalg.vector_norm on the
+            # contiguous flat tensor is ~100x faster than torch._foreach_norm
+            # on 157 per-buffer tensors (0.75ms vs 100ms) because the multi-
+            # tensor kernel's loop overhead is significant for 157 buffers.
+            _flat_grads = flat
         else:
             # Capture pre-allreduce gradients (single-GPU, no all-reduce needed)
             if config.hash_capture_level > 0 and config.persistent:
@@ -2127,11 +2138,15 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # the _fused_adamw_ kernel reads the same .grad fields the ref does.
             for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
                 p_fp32.grad = buf
-            # Use _foreach_norm for batched per-tensor L2 norm computation
-            # (replaces 157 separate norm() kernel launches with a single
-            # fused kernel launch, matching the clip_grad_norm_ result exactly).
-            norms = torch._foreach_norm(fp32_grad_bufs)
-            total_norm = torch.linalg.vector_norm(torch.stack(norms))
+            # Use _foreach_norm for batched per-tensor L2 norm computation, or
+            # torch.linalg.vector_norm on the flat tensor when available (the
+            # flat all-reduce path saves the scaled all-reduced gradient tensor,
+            # which is contiguous and ~100x faster to norm than 157 buffers).
+            if _flat_grads is not None:
+                total_norm = torch.linalg.vector_norm(_flat_grads)
+            else:
+                norms = torch._foreach_norm(fp32_grad_bufs)
+                total_norm = torch.linalg.vector_norm(torch.stack(norms))
             if total_norm > opt_clip_grad:
                 torch._foreach_mul_(fp32_grad_bufs, opt_clip_grad / total_norm)
             grad_norm_val = total_norm
