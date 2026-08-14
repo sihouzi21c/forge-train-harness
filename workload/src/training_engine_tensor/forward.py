@@ -45,12 +45,20 @@ def precompute_rope_freqs(max_seq_len: int = 4096,
     return torch.cat((freqs, freqs), dim=-1)  # [S, D]
 
 
-def apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def apply_rope(t: torch.Tensor, freqs: torch.Tensor,
+               deterministic: bool = True) -> torch.Tensor:
     """Apply rotary position embedding.
 
     ``t`` shape ``[B, S, H, D]``, ``freqs`` shape ``[S, D]``.
     Returns rotated tensor of the same shape and dtype as ``t``.
+
+    When ``deterministic=False`` and ``ENABLE_TRITON_ROPE_FWD=1``, uses
+    a fused Triton kernel that reads bf16 directly and computes in fp32,
+    eliminating the intermediate dtype round-trips.
     """
+    if not deterministic and int(os.environ.get("ENABLE_TRITON_ROPE_FWD", "0")):
+        from training_engine_tensor.triton_kernels import rope_forward_fused
+        return rope_forward_fused(t, freqs)
     cos_ = torch.cos(freqs).to(t.dtype)[None, :, None, :]
     sin_ = torch.sin(freqs).to(t.dtype)[None, :, None, :]
     half = t.shape[-1] // 2

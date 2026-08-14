@@ -98,6 +98,16 @@ def main() -> None:
     # operations.  Also gated by deterministic=False, so bitwise gates always
     # use the PyTorch path.
     os.environ.setdefault("ENABLE_TRITON_CE_BWD", "1")
+    # Enable the fused Triton RoPE forward kernel for long-horizon
+    # performance.  Fuses cos/sin computation, dtype conversion, and
+    # the rotary operation into a single kernel, reading bf16 directly
+    # and computing in fp32.  Also gated by deterministic=False, so
+    # bitwise gates always use the PyTorch path.
+    os.environ.setdefault("ENABLE_TRITON_ROPE_FWD", "1")
+    # Enable the fused Triton RoPE backward kernel for long-horizon
+    # performance.  Also gated by deterministic=False, so bitwise gates
+    # always use the PyTorch path.
+    os.environ.setdefault("ENABLE_TRITON_ROPE_BWD", "1")
     config = TrainLoopConfig(
         num_steps=int(_require("NUM_STEPS")),
         micro_batch_size=micro_batch_size,

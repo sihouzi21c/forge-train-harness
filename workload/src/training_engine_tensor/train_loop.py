@@ -497,8 +497,8 @@ def _forward_with_cache(
             qkv_proj = torch.matmul(normed, layer.qkv_weight.t())
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.wqkv", 0, qkv_proj)
 
-        q_rot = apply_rope(q, rope_freqs)
-        k_rot = apply_rope(k, rope_freqs)
+        q_rot = apply_rope(q, rope_freqs, deterministic=deterministic)
+        k_rot = apply_rope(k, rope_freqs, deterministic=deterministic)
         # Use flash_attn_func to match the ref's attention implementation
         # exactly.  The ref's TransformerLayer.forward calls:
         #   from flash_attn import flash_attn_func
@@ -593,8 +593,8 @@ def _forward_with_cache(
 
         mtp_qkv_proj = torch.matmul(mtp_normed, model.mtp.layer.qkv_weight.t())
         mtp_q, mtp_k, mtp_v = project_qkv(mtp_normed, model.mtp.layer.qkv_weight)
-        mtp_q_rot = apply_rope(mtp_q, rope_freqs)
-        mtp_k_rot = apply_rope(mtp_k, rope_freqs)
+        mtp_q_rot = apply_rope(mtp_q, rope_freqs, deterministic=deterministic)
+        mtp_k_rot = apply_rope(mtp_k, rope_freqs, deterministic=deterministic)
         mtp_attn, mtp_softmax_lse = _gqa_attention(mtp_q_rot, mtp_k_rot, mtp_v, allow_math_fallback=True, deterministic=deterministic)
         mtp_attn_flat = mtp_attn.reshape(B, S, C.NUM_HEADS * C.HEAD_DIM)
         mtp_attn_out = torch.matmul(mtp_attn_flat, model.mtp.layer.attention_proj_weight.t())
@@ -847,8 +847,8 @@ def _static_backward(
         )
 
         # RoPE backward
-        d_mtp_q = apply_rope_backward(d_mtp_q_rot, rope_freqs)
-        d_mtp_k = apply_rope_backward(d_mtp_k_rot, rope_freqs)
+        d_mtp_q = apply_rope_backward(d_mtp_q_rot, rope_freqs, deterministic=deterministic)
+        d_mtp_k = apply_rope_backward(d_mtp_k_rot, rope_freqs, deterministic=deterministic)
 
         # QKV projection backward
         # Recompute normed from hidden_before_attn (not stored in cache
@@ -1014,8 +1014,8 @@ def _static_backward(
         )
 
         # RoPE backward
-        d_q = apply_rope_backward(d_q_rot, rope_freqs)
-        d_k = apply_rope_backward(d_k_rot, rope_freqs)
+        d_q = apply_rope_backward(d_q_rot, rope_freqs, deterministic=deterministic)
+        d_k = apply_rope_backward(d_k_rot, rope_freqs, deterministic=deterministic)
 
         # QKV projection backward
         # Recompute normed from hidden_before_attn (not stored in cache

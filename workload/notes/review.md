@@ -589,3 +589,23 @@ The semantic audit confirms the candidate engine is genuinely implementing forwa
 - `bin/harness run guard`: PASS (0 violations)
 
 ---
+
+## [stage1] Round 58 — 2026-08-14 23:57
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: f6a1d5a — Perf: re-enable CUDA graph for fwd+bwd pass (default ENABLE_CUDA_GRAPH=1) — CE optimization freed ~21 GiB memory, graph capture now viable
+
+### Key conclusions
+The semantic audit confirms the candidate engine is genuinely implementing forward/backward/optimizer/loss/metric in-process. This round re-enables CUDA graph for the forward+backward pass (ENABLE_CUDA_GRAPH default changed from "0" to "1") with a memory guard (skip if <8 GiB free) and debug logging. The CE backward Triton kernel (Round 57) eliminated the logits.float() materialization, freeing ~21 GiB of memory, making the graph capture viable again. The implementation uses standard PyTorch CUDA graph API (`torch.cuda.CUDAGraph`, `torch.cuda.mem_get_info`) with no shell-out to ref, no hardcoded synthetic metrics, no gate threshold tampering, and no run-shape editing. The anti-proxy guard passes (0 violations). However, the stage FINISH conditions are not met: no `STAGE_STATUS: finished` declaration in the commit message, the latest perf_log.md section lacks gate evidence (no long-train/resume-startup-90/perf-bitwise results), and the profile snapshot is missing for this perf-touching round (train_loop.py modified but no profile directory committed). The long-horizon throughput remains below the review-side bar.
+
+### Violations (fill in only on FAIL)
+(none)
+
+### Evidence highlights
+- `train_loop.py:1639-1640` — ENABLE_CUDA_GRAPH default changed to "1"
+- `train_loop.py:1676-1685` — memory guard: skip graph capture if <8 GiB free
+- `train_loop.py:1776-1780` — debug logging of free GiB after warmup cleanup
+- `bin/harness run anti-proxy`: PASS (0 violations)
+
+---

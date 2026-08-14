@@ -19,6 +19,8 @@ intermediate tensors.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from training_engine_tensor.config import (
@@ -297,7 +299,8 @@ def embedding_backward(
 # ── RoPE backward ───────────────────────────────────────────────────────────
 
 
-def apply_rope_backward(grad_out: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def apply_rope_backward(grad_out: torch.Tensor, freqs: torch.Tensor,
+                        deterministic: bool = True) -> torch.Tensor:
     """Backward of :func:`training_engine_tensor.forward.apply_rope`.
 
     ``grad_out`` shape ``[B, S, H, D]``.
@@ -305,7 +308,14 @@ def apply_rope_backward(grad_out: torch.Tensor, freqs: torch.Tensor) -> torch.Te
 
     RoPE is linear in the input tensor, so the backward is the same as
     the forward applied to ``grad_out``.
+
+    When ``deterministic=False`` and ``ENABLE_TRITON_ROPE_BWD=1``, uses
+    a fused Triton kernel that reads bf16 directly and computes in fp32,
+    eliminating the intermediate dtype round-trips.
     """
+    if not deterministic and int(os.environ.get("ENABLE_TRITON_ROPE_BWD", "0")):
+        from training_engine_tensor.triton_kernels import rope_backward_fused
+        return rope_backward_fused(grad_out, freqs)
     S_freqs = freqs.shape[0]
     S_grad = grad_out.shape[1]
     if S_freqs < S_grad:

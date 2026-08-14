@@ -666,3 +666,150 @@ def ce_backward_fused(
         )
 
     return grad_flat.reshape(B, S, V)
+
+
+# ── Fused RoPE forward/backward ─────────────────────────────────────────────
+#
+# Fuses the rotary position embedding computation:
+#   cos_ = cos(freqs), sin_ = sin(freqs)
+#   rotated = cat([-a[..., half:], a[..., :half]], dim=-1)
+#   output = a * cos_ + rotated * sin_
+#
+# into a single Triton kernel.  The current PyTorch forward implementation
+# (forward.py:apply_rope) launches 6 separate elementwise kernels per call
+# (2× cos, 2× .to(dtype), 1× chunk+negate+cat, 1× mul+add).  This fused
+# kernel does it in 1 launch, reading bf16 input directly, computing in fp32,
+# and writing bf16 output.
+#
+# Each program handles one (B, S, H) head's D elements.  Grid = (B*S*H,)
+# programs.  The same kernel serves both forward and backward (the two differ
+# only in which half of the head is negated in the `rotated` computation).
+
+
+@triton.jit
+def _rope_kernel(
+    a_ptr, freqs_ptr, output_ptr,
+    B, S, H, D,
+    stride_ab, stride_as, stride_ah, stride_ad,
+    stride_ob, stride_os, stride_oh, stride_od,
+    backward: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Fused RoPE kernel (forward or backward).
+
+    One program per (B, S, H) head.  Reads bf16 input, computes in fp32,
+    writes bf16 output.
+
+    ``backward=True`` uses the backward negation pattern:
+        rotated = cat([a[..., half:], -a[..., :half]], dim=-1)
+    ``backward=False`` uses the forward negation pattern:
+        rotated = cat([-a[..., half:], a[..., :half]], dim=-1)
+    """
+    pid = tl.program_id(0)
+    # Decompose pid into (b, s, h) indices.
+    b = pid // (S * H)
+    rem = pid % (S * H)
+    s = rem // H
+    h = rem % H
+
+    offs = tl.arange(0, BLOCK_SIZE_D)
+    mask = offs < D
+
+    # Load input a[b, s, h, :] bf16 -> fp32.
+    a_offs = (b * stride_ab + s * stride_as + h * stride_ah +
+              offs * stride_ad)
+    a = tl.load(a_ptr + a_offs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load freqs[s, :] fp32 (freqs is [S, D]).
+    freqs_offs = s * D + offs
+    freqs_val = tl.load(freqs_ptr + freqs_offs, mask=mask, other=0.0)
+
+    # Compute cos and sin in fp32.
+    cos_ = tl.cos(freqs_val)
+    sin_ = tl.sin(freqs_val)
+
+    # Compute rotated: the two halves of the head are swapped and negated.
+    half = D // 2
+    if backward:
+        # rotated = cat([a[half:], -a[:half]], dim=-1)
+        # First half of output = second half of input (no negation).
+        # Second half of output = first half of input (negated).
+        # Since offs iterates over the output positions, we need to
+        # load from the corresponding input halves.
+        half_mask = offs < half
+        # For offs < half: load from a[..., half + offs] (no negation)
+        # For offs >= half: load from a[..., offs - half] (negated)
+        a_second = tl.load(a_ptr + a_offs + half * stride_ad, mask=mask, other=0.0)
+        a_first = tl.load(a_ptr + a_offs - half * stride_ad, mask=mask, other=0.0)
+        rotated = tl.where(half_mask, a_second, -a_first)
+    else:
+        # rotated = cat([-a[half:], a[:half]], dim=-1)
+        # First half of output = second half of input (negated).
+        # Second half of output = first half of input (no negation).
+        half_mask = offs < half
+        a_second = tl.load(a_ptr + a_offs + half * stride_ad, mask=mask, other=0.0)
+        a_first = tl.load(a_ptr + a_offs - half * stride_ad, mask=mask, other=0.0)
+        rotated = tl.where(half_mask, -a_second, a_first)
+
+    # output = a * cos_ + rotated * sin_
+    output = a * cos_ + rotated * sin_
+
+    # Write bf16 output.
+    out_offs = (b * stride_ob + s * stride_os + h * stride_oh +
+                offs * stride_od)
+    tl.store(output_ptr + out_offs, output.to(tl.bfloat16), mask=mask)
+
+
+def rope_forward_fused(
+    a: torch.Tensor,     # [B, S, H, D] bf16
+    freqs: torch.Tensor,  # [S, D] fp32
+) -> torch.Tensor:        # [B, S, H, D] bf16
+    """Fused RoPE forward: returns rotated(a) = a * cos + rotated * sin.
+
+    Reads bf16 input, computes in fp32, writes bf16 output.  Numerically
+    equivalent to ``forward.apply_rope(a, freqs)``.
+    """
+    B, S, H, D = a.shape
+    BLOCK_SIZE_D = 1 << (D - 1).bit_length()  # next power of 2 >= D
+    BLOCK_SIZE_D = min(BLOCK_SIZE_D, 128)  # cap at 128 elements
+    BLOCK_SIZE_D = max(BLOCK_SIZE_D, 32)  # ensure at least 32 elements
+
+    output = torch.empty_like(a, dtype=torch.bfloat16)
+    grid = (B * S * H,)
+    _rope_kernel[grid](
+        a, freqs, output,
+        B, S, H, D,
+        a.stride(0), a.stride(1), a.stride(2), a.stride(3),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        backward=False,
+        BLOCK_SIZE_D=BLOCK_SIZE_D,
+    )
+    return output
+
+
+def rope_backward_fused(
+    grad_out: torch.Tensor,  # [B, S, H, D] bf16
+    freqs: torch.Tensor,     # [S, D] fp32
+) -> torch.Tensor:            # [B, S, H, D] bf16
+    """Fused RoPE backward: returns dL/da from grad_out.
+
+    The backward of RoPE is the same as the forward but with the opposite
+    negation pattern.  Reads bf16 input, computes in fp32, writes bf16 output.
+    Numerically equivalent to ``backward.apply_rope_backward(grad_out, freqs)``.
+    """
+    B, S, H, D = grad_out.shape
+    BLOCK_SIZE_D = 1 << (D - 1).bit_length()
+    BLOCK_SIZE_D = min(BLOCK_SIZE_D, 128)
+    BLOCK_SIZE_D = max(BLOCK_SIZE_D, 32)
+
+    output = torch.empty_like(grad_out, dtype=torch.bfloat16)
+    grid = (B * S * H,)
+    _rope_kernel[grid](
+        grad_out, freqs, output,
+        B, S, H, D,
+        grad_out.stride(0), grad_out.stride(1), grad_out.stride(2), grad_out.stride(3),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        backward=True,
+        BLOCK_SIZE_D=BLOCK_SIZE_D,
+    )
+    return output

@@ -2086,3 +2086,78 @@ The CUDA graph eliminates the ``cudaLaunchKernel`` overhead (2241ms in the nsys 
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute).
   2. **RoPE fusion** — fuse the ``apply_rope`` computation into a single Triton kernel.
   3. **Optimizer step CUDA graph** — re-evaluate if the fwd+bwd graph succeeds (more free memory available for the optimizer graph capture).
+- review R58 PASS: genuine CUDA graph re-enable, no proxy; stage in-progress — missing gate evidence and profile snapshot
+
+## [stage1] Round 59 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused Triton RoPE forward+backward, MFU 27.9%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented a fused Triton RoPE kernel (`triton_kernels.py:_rope_kernel`, `rope_forward_fused`, `rope_backward_fused`) that fuses the cos/sin computation, dtype conversion, and the rotary operation into a single Triton kernel per (B, S, H) head. The kernel reads bf16 input directly, computes cos/sin in fp32, and writes bf16 output — eliminating the intermediate dtype round-trips and multiple elementwise kernels.
+
+**Phase 2 optimization — fused Triton RoPE forward+backward:**
+
+1. **`_rope_kernel` (Triton)**: Each program handles one (B, S, H) head's D elements. The kernel loads bf16 input, computes cos/sin from fp32 freqs, applies the rotary operation (swap + negate the two halves), and writes bf16 output. A single kernel serves both forward and backward via a `backward` constexpr flag that controls the negation pattern.
+
+2. **`rope_forward_fused`/`rope_backward_fused`**: PyTorch wrappers that allocate the output buffer and launch the Triton kernel with a grid of (B*S*H,) programs.
+
+3. **Gating by `ENABLE_TRITON_ROPE_FWD=1`/`ENABLE_TRITON_ROPE_BWD=1`**: The Triton kernel is only used when `deterministic=False` (long-horizon mode). The bitwise gates always use the PyTorch path. The `eval_long_train.py` script sets both env vars to `1`.
+
+4. **All 8 call sites updated**: 4 forward calls (q_rot, k_rot × main + MTP) and 4 backward calls (d_q, d_k × main + MTP) pass `deterministic=deterministic` to conditionally route to the fused kernel.
+
+### Gate results (long-train, 200 steps, DP=2, ENABLE_CUDA_GRAPH=1)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| **MFU(standard)** | **27.9%** | — |
+| loss_rel(point) | 0.400% | < 2.50% ✅ |
+| signed_mean_rel | +0.199% | no drift ✅ |
+| pointwise_mean_rel | 0.400% | — |
+| max_rel_diff | 1.74% | — |
+| drift_warning | None | ✅ |
+| compared_steps | 100 | — |
+| ref_elapsed_s | 1563s | — |
+| **status** | **passed** | ✅ |
+
+### Regression gates
+
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **profile-snapshot (long-horizon_round59)**: PASS (step_time 7556ms, MFU 17.4% nsys).
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 51 (Triton SwiGLU bwd) | 20.1% | **+1.76pp** | |
+| Round 52 (Triton SwiGLU fwd) | 20.85% | **+2.51pp** | |
+| Round 53 (CE opt, direct softmax) | 21.03% | **+2.69pp** | |
+| Round 55 (Triton RMSNorm fwd) | 22.5% | **+4.16pp** | |
+| Round 57 (Triton CE bwd) | 26.74% | **+8.40pp** | |
+| Round 58 (CUDA graph re-enable) | 27.1% | **+8.76pp** | Same devspace |
+| **Round 59 (Triton RoPE fwd+bwd)** | **27.9%** | **+9.56pp** | Same devspace |
+
+### CUDA graph verification
+
+The CUDA graph is confirmed working (from the long-train run's ours.log):
+```
+[debug] CUDA graph: 59.7 GiB free, attempting capture
+[debug] CUDA graph captured successfully (59.7 GiB free before, 59.6 GiB after warmup, 16.3 GiB after capture)
+[debug] CUDA graph replay active (10 microbatch replays/step)
+```
+
+### Profile analysis
+
+The profile snapshot is the eager path (nsys doesn't support CUDA graph). The RoPE fusion's benefit is visible in the clean gate (+0.8pp MFU from 27.1% to 27.9%) but is masked by nsys overhead in the profile snapshot. The top GPU kernels remain: BinaryFunc (607ms, 11.6%), direct_copy_kernel (436ms, 8.3%), elementwise ops (370ms, 344ms).
+
+### Next steps
+
+- Continue optimization: the GPU kernel time is dominated by elementwise/copy operations (38.7%) and frozen operators (GEMM 16.6%, attention 19.5%).
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute).
+  2. **Residual-add + RMSNorm fusion** — fuse the residual-add and RMSNorm into a single Triton kernel.
+  3. **Fused grad norm** — fuse the `_foreach_norm` + `stack` + `vector_norm` into a single Triton kernel.
