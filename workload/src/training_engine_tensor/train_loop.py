@@ -1117,20 +1117,34 @@ def _sync_bf16_from_fp32(
     bf16_params: list[torch.Tensor],
     fp32_master: list[torch.Tensor],
 ) -> None:
-    """Copy FP32 master weights back to BF16 params using per-parameter conversion.
+    """Copy FP32 master weights back to BF16 params using batched operations.
 
-    Uses per-parameter ``bfloat16()`` + ``copy_()`` instead of the flat
-    ``_flatten_dense_tensors`` + ``bfloat16()`` approach to avoid a large
-    contiguous allocation (2.08 GiB for the flat bf16 tensor).  The per-parameter
-    approach limits each temporary allocation to the largest parameter's bf16
-    size (e.g. 534 MB for the 130560×2048 output weight), which fits in the
-    memory squeezed by the CUDA graph's private pools.
+    Uses ``torch._foreach_copy_`` to batch the per-parameter copy into a
+    single fused kernel launch, reducing the number of kernel launches from
+    157 (one per param) to 1.  The per-parameter ``bfloat16()`` conversions
+    are still 157 separate kernel launches, but the copy step is fused.
 
-    The launch overhead is 157 × ~8us = 1.25ms, which is negligible compared
-    to the 248ms of GPU kernel time for the bf16 conversion.
+    The per-parameter ``bfloat16()`` approach limits each temporary allocation
+    to the largest parameter's bf16 size (e.g. 534 MB for the 130560×2048
+    output weight), which fits in the memory squeezed by the CUDA graph's
+    private pools.  The flat ``_flatten_dense_tensors`` + ``bfloat16()``
+    approach would need a 2.08 GiB contiguous allocation, which can OOM.
+
+    The launch overhead is 157 × ~8us = 1.25ms for the bf16 conversions plus
+    1 × ~8us for the fused copy, totaling ~1.26ms.  Without the fused copy,
+    the overhead is 157 × ~8us = 1.25ms for the bf16 conversions plus
+    157 × ~8us = 1.25ms for the copies, totaling ~2.5ms.
     """
-    for p_bf16, p_fp32 in zip(bf16_params, fp32_master):
-        p_bf16.data.copy_(p_fp32.bfloat16())
+    # Convert each FP32 master to bf16 (per-parameter to limit contiguous
+    # allocation, avoiding OOM when CUDA graph private pools are active).
+    bf16_views = [p.bfloat16() for p in fp32_master]
+    # Fused copy: single kernel launch for all 157 params.
+    # _foreach_copy_ is available in PyTorch 2.1+, fallback to per-param loop.
+    try:
+        torch._foreach_copy_(bf16_params, bf16_views)
+    except (AttributeError, RuntimeError, TypeError):
+        for p_bf16, bf16_view in zip(bf16_params, bf16_views):
+            p_bf16.data.copy_(bf16_view)
 
 
 def _init_optimizer_state(

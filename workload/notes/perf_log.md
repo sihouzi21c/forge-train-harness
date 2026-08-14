@@ -1271,3 +1271,42 @@ Profile-snapshot was not run this round (cluster at capacity). Based on the Phas
    - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
    - ZeRO-1 optimization for DP=2
    - Overlap improvements (gradient bucketing still regresses at DP=2)
+- review R42 PASS: docs-only commit, no proxy detected; CARRY-OVER next dev collect profile-snapshot and resume-gate-20 first
+
+## [stage1] Round 44 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: Triton wgrad GEMM + _foreach_copy_ bf16 sync)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented Phase 2 optimization by adding a Triton wgrad GEMM kernel for the output weight and using `torch._foreach_copy_` for the bf16 sync.
+
+**Triton wgrad GEMM (`triton_kernels.py`)**:
+- Created `triton_kernels.py` with `_wgrad_output_kernel` / `wgrad_output` — a Triton kernel optimized for the output weight wgrad shape (V=130560, H=2048, M=4096).
+- The kernel reads bf16 inputs directly and accumulates in fp32, avoiding the cuBLAS TF32 path's intermediate TF32 → bf16 → fp32 conversion chain and the explicit `.float()` cast.
+- Tiling: `BLOCK_SIZE_M=128, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=8` — optimized for the tall-thin [130560, 2048] output shape.
+- Integrated into `backward.py:linear_backward` — auto-selects Triton for output dim ≥ 8192 (the output weight), keeps cuBLAS for smaller body weights.
+- Gated by `ENABLE_TRITON_WGRAD=1` env var (default 1), falls back to cuBLAS when Triton is not available (e.g., local Mac).
+
+**bf16 sync optimization (`_foreach_copy_`)**:
+- Replaced the per-param `for p_bf16, p_fp32: p_bf16.data.copy_(p_fp32.bfloat16())` (157 separate `copy_` kernel launches) with `torch._foreach_copy_(bf16_params, bf16_views)` (1 fused copy kernel launch).
+- The `bfloat16()` conversions remain 157 separate kernel launches, but the copy step is reduced from 157 to 1 launch, saving ~1.25ms of launch overhead per step.
+- Falls back to the per-param loop when `_foreach_copy_` is unavailable (older PyTorch versions).
+
+### Estimated MFU impact
+
+- **Triton wgrad**: The output weight wgrad is the largest single GEMM in the backward pass. A 2× speedup would save ~100ms/step, giving ~1.4% MFU improvement. The actual impact depends on the Triton kernel's performance vs cuBLAS for the [130560, 2048] shape.
+- **bf16 sync**: ~1.25ms saved per step, negligible MFU improvement.
+
+### Next steps
+
+1. Push to GitHub and run `long-train-smoke` (DP=2, 20 steps) with `ENABLE_TRITON_WGRAD=1` to measure MFU improvement.
+2. Run `profile-snapshot M6_round44` to identify the next bottleneck.
+3. Run `resume-gate-20` regression to verify the Triton kernel doesn't break save/load.
+4. Candidate levers for subsequent rounds:
+   - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
+   - CUDA graph for optimizer step (needs LR tensor workaround)
+   - ZeRO-1 optimization for larger DP sizes

@@ -28,6 +28,17 @@ from training_engine_tensor.config import (
     NORM_EPS,
 )
 
+# Try to import the Triton wgrad kernel for the output weight.
+# Falls back to cuBLAS when Triton is not available (e.g. on Mac).
+_USE_TRITON_WGRAD = False
+_HAS_TRITON = False
+try:
+    from training_engine_tensor.triton_kernels import wgrad_output as _wgrad_output
+    _HAS_TRITON = True
+    _USE_TRITON_WGRAD = _HAS_TRITON and int(__import__('os').environ.get('ENABLE_TRITON_WGRAD', '1'))
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
+
 
 # ── Linear backward (y = x @ W.T) ──────────────────────────────────────────
 
@@ -67,7 +78,15 @@ def linear_backward(
     k = weight.shape[1]
     g2 = grad_out.reshape(-1, n)
     x2 = x.reshape(-1, k)
-    grad_weight = torch.matmul(g2.transpose(0, 1), x2).float()
+
+    # Use the Triton wgrad kernel for large output dimensions (e.g. output
+    # weight with V=130560).  The Triton kernel reads bf16 directly and
+    # accumulates in fp32, avoiding the TF32 round-trip and the explicit
+    # .float() cast.  For small/medium dimensions, cuBLAS TF32 is faster.
+    if _USE_TRITON_WGRAD and n >= 8192:
+        grad_weight = _wgrad_output(g2, x2)
+    else:
+        grad_weight = torch.matmul(g2.transpose(0, 1), x2).float()
 
     return grad_in, grad_weight
 

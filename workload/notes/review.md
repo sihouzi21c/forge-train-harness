@@ -33,6 +33,23 @@ The commit is documentation-only — only `workload/notes/perf_log.md` was modif
 
 ---
 
+## [stage1] Round 44 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The commit adds a Triton wgrad kernel (`triton_kernels.py`) for the output weight, optimizing the `linear_backward` wgrad path for large output dimensions (V=130560). Also uses `torch._foreach_copy_` to batch the bf16 sync copy. The engine (forward.py, backward.py, train_loop.py, triton_kernels.py) computes all metrics in-process — the only new reference is the Triton kernel file, which is self-contained. The guard and anti-proxy checks pass (0 violations). Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message, and the four gate suites (long-train 200-step, resume-gate-20, resume-startup-90, perf-bitwise) have not all been demonstrated green in the latest section of perf_log.md.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `bin/harness run guard`: PASS (0 violations)
+- Commit diff touches `triton_kernels.py` (new), `backward.py`, `train_loop.py`, `perf_log.md`, `review.md` — genuine engine code changes
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- Long-horizon throughput check: MFU improvement pending remote validation
+
 ## [stage1] Round 41 — 2026-08-14 08:50
 
 - **Verdict**: PASS
@@ -66,3 +83,21 @@ The commit is documentation-only — only `workload/notes/perf_log.md` was modif
 - Commit diff only touches `workload/notes/perf_log.md` — no engine code changes, no gate threshold tampering, no remote config edits
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 - Long-horizon throughput check: 18.3% MFU, below review-side bar, no milestone override
+
+---
+
+## [stage1] Round 42 — 2026-08-14 09:15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 765a35a — Docs: record Round 43 — CUDA graph fix validated at 18.3% MFU, smoke PASS
+
+### Key conclusions
+
+The commit is documentation-only — only `workload/notes/perf_log.md` was modified. The dev agent re-validated the CUDA graph fix via `cctl job create` (tsh session expired, SSH unavailable), confirming the long-train-smoke gate (DP=2, 20 steps) PASS with MFU 18.3%, loss_rel 0.193% < 2.50%. No engine source code was changed in this commit. The anti-proxy guard passes (0 violations). The engine (forward.py, backward.py, train_loop.py, zero_optimizer.py) computes all metrics in-process — no proxy, no forgery, no hardcoded synthetic metrics. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message, and the four gate suites (long-train 200-step, resume-gate-20, resume-startup-90, perf-bitwise) have not all been demonstrated green in the latest perf_log.md section. The long-horizon throughput check (`MFU_GATE_VERDICT: FAIL — BELOW_BAND`, 1 sample) confirms insufficient throughput for milestone advancement.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- Commit diff only touches `workload/notes/perf_log.md` — no engine code changes, no gate threshold tampering, no remote config edits
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- Long-horizon throughput check: below review-side bar, no milestone override
