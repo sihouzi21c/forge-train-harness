@@ -634,18 +634,19 @@ The semantic audit confirms the candidate engine is genuinely implementing forwa
 
 ---
 
-## [stage1] Round 60 — 2026-08-15
+## [stage1] Round 61 — 2026-08-15 03:13
 
 - **Verdict**: PASS
 - **Stage status**: in-progress
-- **Commit**: b01925b — Perf: gradient norm via flat tensor vector_norm — bypass _foreach_norm multi-tensor overhead, MFU +0.03pp
+- **Commit**: 01fcba0 — Docs: record Round 61 — flat bf16 sync, profile-snapshot fixed, MFU 28.1%, long-train PASS
 
 ### Key conclusions
-The dev agent optimized the gradient norm computation by saving the flat all-reduced gradient tensor (`_flat_grads`, 4.1 GiB, contiguous) and computing `torch.linalg.vector_norm` on it directly, bypassing the `torch._foreach_norm` multi-tensor kernel loop over 157 buffers. The implementation is genuine in-process computation — no shell-out to ref/, no imports of reference helpers, no hardcoded synthetic values. Stage 1 is not finished: the commit does not declare STAGE_STATUS: finished, the latest perf_log section lacks resume-startup-90 and perf-bitwise gate evidence, and the profile snapshot requirement is unmet for this perf-touching round.
+The semantic audit confirms the candidate engine is genuinely implementing forward/backward/optimizer/loss/metric in-process. This is a docs-only commit (only `workload/notes/perf_log.md`, `workload/notes/profile/long-horizon_round61/`). The engine source files are unchanged from Round 60. The anti-proxy guard passes (0 violations). No proxy patterns, no shell-out to `ref/`, no `ref/` imports outside of docstrings, and no hardcoded synthetic metrics detected. The `mfu_e2e_standard`, `global_loss`, and `grad_norm` values in `train_loop.py` and `zero_optimizer.py` are computed from actual runtime values, not hardcoded literals. Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` in the commit message, and the latest perf_log.md section lacks `long-train` (200-step), `resume-startup-90`, and `perf-bitwise` gate evidence. The long-horizon throughput check reports throughput below the review-side bar — no milestone advance.
 
 ### Evidence highlights
-- `train_loop.py:2098` — `_flat_grads = flat` saves the flat tensor after all-reduce
-- `train_loop.py:2143` — `total_norm = torch.linalg.vector_norm(_flat_grads)` uses the flat tensor for norm computation
-- `train_loop.py:2145-2147` — fallback to `torch._foreach_norm(fp32_grad_bufs)` when `_flat_grads is None`
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- Commit diff only touches `workload/notes/` — no engine code changes
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- Long-horizon throughput check: throughput below the review-side bar, no milestone advance
 
 ---

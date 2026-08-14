@@ -2278,3 +2278,61 @@ The dev agent implemented the flat bf16 sync optimization and fixed the profile-
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute)
   2. **Residual-add + RMSNorm fusion** — small kernel count reduction
   3. **H2D copy batching** — reduce CPU overhead by concatenating input tensors before H2D copy
+- review R61 PASS: docs-only, no proxy; stage in-progress — missing long-train-200, resume-startup-90, perf-bitwise
+
+## [stage1] Round 62 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: _foreach_copy_ for all-reduce unflatten, cudaMemcpyAsync -53%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent replaced the `buf.copy_(sub)` loop in the all-reduce unflatten path with `torch._foreach_copy_`, reducing the number of `cudaMemcpyAsync` calls from 2084 to 986 per step (53% reduction). The D2D GPU memory time decreased from 2.5ms to 0.3ms (88% reduction). However, the MFU improvement is negligible (28.08% vs 28.05%) because the `cudaMemcpyAsync` calls overlap with GPU work.
+
+The `torch._foreach_copy_` was already used in the `_sync_bf16_from_fp32` function (implemented in Round 44). The all-reduce unflatten path was the only remaining place using the per-tensor `copy_` loop.
+
+### Profile results (long-horizon_round62 vs round61)
+
+| Metric | Round 61 | Round 62 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 4687 | 4683 | **-4ms** |
+| MFU (nsys) | 28.05% | 28.08% | **+0.03pp** |
+| GPU kernel (ms) | 2868 | 2875 | **+7ms** |
+| GPU idle (ms) | 1819 | 1808 | **-11ms** |
+| cudaMemcpyAsync calls | 2084 | 986 | **-1098 (53%↓)** |
+| cudaMemcpyAsync (ms) | 1672 | 1638 | **-34ms** |
+| D2D memcpy (ms) | 2.5 | 0.3 | **-2.2ms (88%↓)** |
+| cudaStreamSynchronize (ms) | 500 | 618 | **+118ms** |
+
+### Top GPU kernels (round 62)
+
+| Kernel | Time (ms) | % |
+|--------|-----------|---|
+| flash_bwd | 548 | 19.0% |
+| flash_fwd | 274 | 9.5% |
+| cuBLAS GEMMs (total) | 872 | 30.4% |
+| direct_copy_kernel | 109 | 3.8% |
+| elementwise_kernel | 90 | 3.1% |
+| BinaryFunc | 86 | 3.0% |
+| _rope_kernel | 83 | 2.9% |
+| _ce_bwd_kernel | 62 | 2.1% |
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: `loss_rel 0.108% < 2.50%` PASS; `signed_rel +0.0417%` (no drift); MFU **28.1%**.
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **profile-snapshot (long-horizon_round62)**: step_time 4683ms, MFU 28.08%.
+
+### Next steps
+
+- The remaining bottlenecks are unchanged:
+  1. **Flash attention**: 820ms (28.6% of GPU kernel time) — flash_attn library, no room for optimization.
+  2. **cuBLAS GEMM**: 872ms (30.4% of GPU kernel time) — cuBLAS library, no room for optimization.
+  3. **GPU idle**: 1808ms (38.6% of step time) — CPU overhead from CUDA API calls (cudaMemcpyAsync 1638ms, cudaGraphLaunch 750ms, cudaStreamSynchronize 618ms).
+- The `_foreach_copy_` optimization is exhausted. The `cudaMemcpyAsync` calls are now at the minimum (H2D copies only). The remaining GPU idle is from the `cudaGraphLaunch` (750ms) and `cudaStreamSynchronize` (618ms) overhead.
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL on separate streams, overlapping all-reduce with the next step's forward pass
+  2. **CUDA allocator synchronization reduction** — investigate `cudaStreamSynchronize` sources (618ms/step, 349 calls) and reduce via pre-allocation or allocator tuning
+  3. **H2D copy batching into single pinned buffer** — reduce CPU overhead of 800 H2D copies/step by concatenating input tensors before H2D

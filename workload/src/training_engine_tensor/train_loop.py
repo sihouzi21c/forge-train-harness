@@ -2082,12 +2082,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # Copy the bucketed results back into the flat tensor.
                 for b_start_off, b_end_off, bucket_flat in bucket_results:
                     flat[b_start_off:b_end_off].copy_(bucket_flat)
-                # Unflatten back into per-parameter gradient buffers.
-                for buf, sub in zip(
+                # Fused unflatten: single _foreach_copy_ for all 157 params
+                # instead of 157 separate cudaMemcpyAsync calls.
+                torch._foreach_copy_(
                     fp32_grad_bufs,
                     torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
-                ):
-                    buf.copy_(sub)
+                )
             else:
                 # ── Flatten + single all-reduce (matching ref's reduce_grads) ──
                 # The ref's harness_dp.reduce_grads flattens all grad buffers into
@@ -2102,11 +2102,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 dist.all_reduce(flat, op=dist.ReduceOp.SUM)
                 norm_factor = (1.0 / local_lm_n.clamp(min=1.0))
                 flat.mul_(norm_factor)
-                for buf, sub in zip(
+                # Fused unflatten: single _foreach_copy_ for all 157 params
+                # instead of 157 separate cudaMemcpyAsync calls.
+                torch._foreach_copy_(
                     fp32_grad_bufs,
                     torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
-                ):
-                    buf.copy_(sub)
+                )
             # Save the flat (scaled all-reduced) gradient tensor for efficient
             # gradient norm computation.  torch.linalg.vector_norm on the
             # contiguous flat tensor is ~100x faster than torch._foreach_norm
