@@ -1633,3 +1633,66 @@ The profile snapshot (with nsys overhead) shows essentially unchanged GPU kernel
   2. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2)
   3. **Gradient all-reduce optimization** — fuse the 3 loss scalars + grad norm into a single all-reduce
 - review R50 PASS: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization
+
+## [stage1] Round 52 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused Triton SwiGLU forward, MFU 20.9%)
+- **Commit**: 82d4016 — Perf: fuse SwiGLU forward via Triton kernel — reduce 4 .float() copies to 1, MFU +0.8pp
+
+### Key conclusions
+
+The dev agent integrated the existing `swiglu_forward_fused` Triton kernel into the forward pass, replacing the inline PyTorch SwiGLU forward (chunk → .float() → silu → multiply → .to(bf16)) with a single fused Triton kernel launch. The kernel reads bf16 directly from `gate_up`, computes sigmoid, silu, and multiply in fp32, and writes bf16 intermediate — all in 1 launch per (B, S) row.
+
+**Phase 2 optimization — fused Triton SwiGLU forward:**
+
+1. **`swiglu_forward_fused` integration**: The already-implemented Triton kernel (`triton_kernels.py:_swiglu_fwd_kernel`, `swiglu_forward_fused`) was integrated into `train_loop.py:_forward_with_cache` for both the main branch and the MTP branch.
+
+2. **Gating by `ENABLE_TRITON_SWIGLU_FWD=1`**: The Triton kernel is only used when `ENABLE_TRITON_SWIGLU_FWD=1` AND `deterministic=False` (long-horizon mode). The bitwise gates always use the PyTorch path. The `eval_long_train.py` script sets `ENABLE_TRITON_SWIGLU_FWD=1`.
+
+3. **Backward compatibility**: The inline SwiGLU forward is replaced by a conditional branch. The `gate_up` storage in `LayerCache` is unchanged (still stored for backward recompute).
+
+### Gate results (long-train, 200 steps, DP=2)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| **MFU(standard)** | **20.85%** | — |
+| loss_rel(point) | 0.435% | < 2.50% ✅ |
+| signed_mean_rel | +0.253% | no drift ✅ |
+| pointwise_mean_rel | 0.435% | — |
+| max_rel_diff | 1.78% | — |
+| drift_warning | None | ✅ |
+| compared_steps | 100 | — |
+| ref_elapsed_s | 1563s | — |
+| **status** | **passed** | ✅ |
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 50 (Triton RMSNorm bwd) | 18.0% | −0.34pp | Different devspace |
+| Round 51 (Triton SwiGLU bwd) | 20.1% | **+2.1pp** | Same devspace |
+| **Round 52 (Triton SwiGLU fwd)** | **20.85%** | **+2.5pp** | Same devspace |
+| Step time | ~6.30s | — | 6.3s/step, stable |
+
+### Profile analysis
+
+GPU kernel composition (nsys profile, round53 vs round52): essentially unchanged — the forward SwiGLU fusion saves ~280ms of step time, which is visible as a 0.8pp MFU improvement in the non-nsys gate but is masked by nsys overhead in the profile snapshot. The top GPU kernels remain:
+
+- flash_bwd: 680ms (11.4%) — flash attention backward
+- BinaryFunc: 592ms (9.9%) — elementwise operations
+- direct_copy_kernel: 562ms (9.4%) — copy operations
+- SoftMax forward: 378ms (6.3%) — cross-entropy
+- flash_fwd: 337ms (5.6%) — flash attention forward
+
+### Next steps
+
+- **Phase 3: NCCL overlap** — GPU idle is 1616ms (21.2%), primarily from NCCL all-reduce sync. Gradient bucketing with async NCCL should be revisited now that the CUDA graph is working correctly.
+- **Phase 2: Fused cross-entropy** — SoftMax forward+backward is 570ms (9.5%). A fused CE kernel could save ~200ms.
+- **Phase 2: Optimizer step CUDA graph** — Capture the optimizer step into the CUDA graph (revisit after memory re-evaluation).
+- Candidate levers for next round:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2)
+  2. **Fused cross-entropy** — reduce SoftMax forward+backward overhead
+  3. **Optimizer step CUDA graph** — capture AdamW + bf16 sync into the graph

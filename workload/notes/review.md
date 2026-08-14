@@ -423,3 +423,20 @@ The dev agent implemented a fused Triton SwiGLU backward kernel (`_swiglu_bwd_ke
 - `train_loop.py:768,935` — passes `gate_up` and `ffn_half` to the backward function at both call sites
 
 ---
+
+## [stage1] Round 52 — 2026-08-14 11:45
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 82d4016 — Perf: fuse SwiGLU forward via Triton kernel — reduce 4 .float() copies to 1, MFU +0.8pp
+
+### Key conclusions
+The dev agent integrated the existing `swiglu_forward_fused` Triton kernel into the forward pass, replacing the inline PyTorch SwiGLU forward (chunk → .float() → silu → multiply → .to(bf16)) with a single fused Triton kernel launch. The kernel reads bf16 directly from `gate_up`, computes sigmoid, silu, and multiply in fp32, and writes bf16 intermediate — all in 1 launch per (B, S) row. The optimization is gated by `ENABLE_TRITON_SWIGLU_FWD=1` and `deterministic=False`, ensuring bitwise gates always use the PyTorch path. The engine is genuinely implementing the forward pass in-process — no proxy, no shell-out to ref, no hardcoded synthetic metrics. Stage 1 remains in-progress because the commit message does not declare `STAGE_STATUS: finished`, and the review-side throughput bar (long-horizon milestone check) has not been met.
+
+### Evidence highlights
+- guard: PASS (0 violations)
+- anti-proxy: PASS (0 violations)
+- long-train (200 steps, DP=2): PASS (loss_rel 0.435% < 2.50%, MFU **20.85%**)
+- resume-gate-20 (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
+- profile-snapshot (long-horizon_round53): PASS
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
