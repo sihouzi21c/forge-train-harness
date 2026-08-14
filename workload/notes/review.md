@@ -650,3 +650,19 @@ The semantic audit confirms the candidate engine is genuinely implementing forwa
 - Long-horizon throughput check: throughput below the review-side bar, no milestone advance
 
 ---
+
+## [stage1] Round 62 — 2026-08-15 03:54
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 96bbb45 — Perf: fuse all-reduce unflatten via _foreach_copy_ — reduce cudaMemcpyAsync calls 53%
+
+### Key conclusions
+The dev agent replaced the `buf.copy_(sub)` loop in the all-reduce unflatten path with `torch._foreach_copy_()`, reducing cudaMemcpyAsync calls by 53% (2084→986). The change is a genuine in-process CUDA optimization — no shell-out to `ref/`, no imports of reference helpers, and no hardcoded synthetic values. The anti-proxy guard passes. The long-horizon throughput check reports throughput below the review-side bar — no milestone advance. Stage 1 FINISH conditions not met: the commit message does not declare `STAGE_STATUS: finished`, and the latest perf_log.md section lacks `long-train` (200-step), `resume-startup-90`, and `perf-bitwise` gate evidence.
+
+### Evidence highlights
+- `train_loop.py:2087-2090,2107-2110` — replaces `buf.copy_(sub)` with `torch._foreach_copy_()` in both gradient-bucketing and flat all-reduce paths
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---

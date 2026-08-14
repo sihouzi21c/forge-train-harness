@@ -1621,6 +1621,15 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     step_start_event = torch.cuda.Event(enable_timing=True)
     step_end_event = torch.cuda.Event(enable_timing=True)
 
+    # Pre-allocate step-level accumulators (1-element fp64 GPU tensors).
+    # Re-allocating these every step (4 × torch.zeros) triggers 4 CUDA allocator
+    # calls that can each cause an internal cudaStreamSynchronize.  Pre-allocate
+    # once and use zero_() to reset.
+    _local_lm_sum = torch.zeros(1, device=device, dtype=torch.float64)
+    _local_lm_n = torch.zeros(1, device=device, dtype=torch.float64)
+    _local_mtp_sum = torch.zeros(1, device=device, dtype=torch.float64)
+    _local_mtp_n = torch.zeros(1, device=device, dtype=torch.float64)
+
     # ── CUDA graph capture for forward+backward of one microbatch ───────
     # Capturing the static forward+backward sequence as a CUDA graph
     # eliminates the per-kernel launch overhead (cudaLaunchKernel ~3814ms/step
@@ -1883,10 +1892,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # Zero gradients (fused multi-tensor for fewer kernel launches)
         torch._foreach_zero_(fp32_grad_bufs)
 
-        local_lm_sum = torch.zeros(1, device=device, dtype=torch.float64)
-        local_lm_n = torch.zeros(1, device=device, dtype=torch.float64)
-        local_mtp_sum = torch.zeros(1, device=device, dtype=torch.float64)
-        local_mtp_n = torch.zeros(1, device=device, dtype=torch.float64)
+        # Reset step-level accumulators (zero_() avoids 4 CUDA allocator calls).
+        _local_lm_sum.zero_()
+        _local_lm_n.zero_()
+        _local_mtp_sum.zero_()
+        _local_mtp_n.zero_()
 
         # Grad accumulation loop
         if use_cuda_graph and cuda_graph is not None:
@@ -1925,11 +1935,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     _prefetch_ids, _prefetch_lab, _prefetch_mask = _get_batch_cpu()
 
                 # Read the updated loss values from the captured tensor addresses.
-                local_lm_sum += _cached_lm_sum.detach().double()
-                local_lm_n += _cached_lm_n.detach().double()
+                _local_lm_sum += _cached_lm_sum.detach().double()
+                _local_lm_n += _cached_lm_n.detach().double()
                 if use_mtp:
-                    local_mtp_sum += _cached_mtp_sum.detach().double()
-                    local_mtp_n += _cached_mtp_n.detach().double()
+                    _local_mtp_sum += _cached_mtp_sum.detach().double()
+                    _local_mtp_n += _cached_mtp_n.detach().double()
         else:
             # Eager path (no CUDA graph capture) — prefetch H2D with non_blocking.
             # Pre-allocate input buffers so we can use non_blocking copy_ for H2D.
@@ -1964,8 +1974,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     )
                     lm_sum, lm_n = masked_cross_entropy(cache.main_logits, _eager_lab, _eager_mask, deterministic=deterministic)
                     mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, _eager_mtp_lab, _eager_mtp_mask, deterministic=deterministic)
-                    local_mtp_sum += mtp_sum_v.detach().double()
-                    local_mtp_n += mtp_n_v.detach().double()
+                    _local_mtp_sum += mtp_sum_v.detach().double()
+                    _local_mtp_n += mtp_n_v.detach().double()
                 else:
                     cache = _forward_with_cache(
                         model, _eager_ids, _eager_lab, _eager_mask,
@@ -1991,8 +2001,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # grad_accum=10 would OOM 80 GB H100).
                 del cache
 
-                local_lm_sum += lm_sum.detach().double()
-                local_lm_n += lm_n.detach().double()
+                _local_lm_sum += lm_sum.detach().double()
+                _local_lm_n += lm_n.detach().double()
 
                 # While the GPU runs the current microbatch, prefetch the next
                 # microbatch's data on the CPU (no H2D yet).  The next iteration's
@@ -2013,22 +2023,22 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             if use_mtp:
                 # Match the ref's reduce_loss_scalar: concatenate all scalars
                 # into one tensor and do a single all-reduce.
-                stats = torch.cat([local_lm_sum, local_lm_n, local_mtp_sum, local_mtp_n])
+                stats = torch.cat([_local_lm_sum, _local_lm_n, _local_mtp_sum, _local_mtp_n])
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                local_lm_sum = stats[0:1]
-                local_lm_n = stats[1:2]
-                local_mtp_sum = stats[2:3]
-                local_mtp_n = stats[3:4]
+                _local_lm_sum.copy_(stats[0:1])
+                _local_lm_n.copy_(stats[1:2])
+                _local_mtp_sum.copy_(stats[2:3])
+                _local_mtp_n.copy_(stats[3:4])
             else:
-                stats = torch.cat([local_lm_sum, local_lm_n])
+                stats = torch.cat([_local_lm_sum, _local_lm_n])
                 dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                local_lm_sum = stats[0:1]
-                local_lm_n = stats[1:2]
+                _local_lm_sum.copy_(stats[0:1])
+                _local_lm_n.copy_(stats[1:2])
 
         # Keep as GPU tensors — defer .item() to after timing to avoid
         # CUDA stream sync inside the timed region.
-        reported_lm_tensor = local_lm_sum / local_lm_n.clamp(min=1.0)
-        reported_mtp_tensor = (local_mtp_sum / local_mtp_n.clamp(min=1.0)) if use_mtp else None
+        reported_lm_tensor = _local_lm_sum / _local_lm_n.clamp(min=1.0)
+        reported_mtp_tensor = (_local_mtp_sum / _local_mtp_n.clamp(min=1.0)) if use_mtp else None
 
         if config.world_size > 1:
             # Initialize flat gradient reference for efficient norm computation.
@@ -2042,7 +2052,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # The shard's gradient buffers are updated in-place.
                 if config.hash_capture_level > 0 and config.persistent:
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
-                norm_factor = (1.0 / local_lm_n.clamp(min=1.0))
+                norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 reduce_scatter_grads(zero_opt, fp32_grad_bufs, bf16_params, norm_factor)
             elif enable_grad_bucketing:
                 # ── Gradient bucketed all-reduce ──────────────────────────────
@@ -2055,7 +2065,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
                 # Flatten full gradient for bucketing (same as single all-reduce).
                 flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
-                norm_factor = (1.0 / local_lm_n.clamp(min=1.0))
+                norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 # Split the flat tensor into buckets and all-reduce each on a separate stream.
                 # The flat tensor is contiguous, so the bucketed slices are views.
                 bucket_results = []
@@ -2100,7 +2110,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
                 flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
                 dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-                norm_factor = (1.0 / local_lm_n.clamp(min=1.0))
+                norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 flat.mul_(norm_factor)
                 # Fused unflatten: single _foreach_copy_ for all 157 params
                 # instead of 157 separate cudaMemcpyAsync calls.
@@ -2118,7 +2128,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # Capture pre-allreduce gradients (single-GPU, no all-reduce needed)
             if config.hash_capture_level > 0 and config.persistent:
                 _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
-            norm_factor = (1.0 / local_lm_n.clamp(min=1.0))
+            norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
             # Use _foreach_mul_ for a single fused kernel launch instead of
             # 157 separate per-buffer mul_ calls.
             torch._foreach_mul_(fp32_grad_bufs, norm_factor)
