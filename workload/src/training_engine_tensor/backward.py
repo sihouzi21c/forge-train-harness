@@ -588,7 +588,18 @@ def cross_entropy_backward(
         grad = (scale * grad_logits.reshape(B, S, V)).to(logits.dtype)
         return grad
     else:
-        # Long-horizon path: direct softmax formula avoids autograd overhead.
+        # Long-horizon path: when the Triton CE kernel is enabled, use the
+        # fused kernel; otherwise fall back to the direct softmax formula.
+        _use_triton_ce = bool(
+            int(__import__('os').environ.get('ENABLE_TRITON_CE_BWD', '0'))
+        )
+        if _use_triton_ce:
+            from training_engine_tensor.triton_kernels import ce_backward_fused as _ce_bwd_fused
+            return _ce_bwd_fused(
+                logits, labels, loss_mask, scale,
+                chunk_size=chunk_size,
+            )
+        # PyTorch fallback: direct softmax formula avoids autograd overhead.
         for i in range(0, total_tokens, chunk_size):
             end = min(i + chunk_size, total_tokens)
             # Compute softmax in fp32 from bf16 logits chunk.

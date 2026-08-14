@@ -92,6 +92,12 @@ def main() -> None:
     # Also gated by deterministic=False, so bitwise gates always use the
     # PyTorch F.rms_norm path.
     os.environ.setdefault("ENABLE_TRITON_RMSNORM_FWD", "1")
+    # Enable the fused Triton cross-entropy backward kernel for long-horizon
+    # performance.  Fuses the softmax forward + gradient backward into a
+    # single kernel, eliminating the one_hot allocation and elementwise
+    # operations.  Also gated by deterministic=False, so bitwise gates always
+    # use the PyTorch path.
+    os.environ.setdefault("ENABLE_TRITON_CE_BWD", "1")
     config = TrainLoopConfig(
         num_steps=int(_require("NUM_STEPS")),
         micro_batch_size=micro_batch_size,

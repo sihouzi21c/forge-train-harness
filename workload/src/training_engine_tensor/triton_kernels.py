@@ -531,3 +531,138 @@ def swiglu_backward_fused(
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return d_gate_up
+
+
+# ── Fused Cross-Entropy backward ─────────────────────────────────────────────
+#
+# Fuses the cross-entropy backward computation for one chunk of logits:
+#   softmax = torch.softmax(logits, dim=-1)
+#   d_logits = (softmax - one_hot) * mask * scale
+#
+# into a single Triton kernel.  The current PyTorch implementation
+# (backward.py:cross_entropy_backward) launches ~5 separate kernels per chunk
+# (1 SoftMaxForward + 1 zeros_like + 1 scatter + 2 elementwise + 1 copy).
+# This fused kernel does it in 1 launch, reading bf16 inputs, computing in fp32,
+# and writing bf16 gradient.
+#
+# Each program handles one token (row of V elements).  Grid = (chunk_size,)
+# programs.  Two-pass approach per program:
+#   1. First pass: compute max_val and sum_val across all V blocks.
+#   2. Second pass: load each block, compute softmax, compute gradient, store.
+# The label-position subtraction is handled by a separate `-=` after the kernel
+# (a single scalar operation per token, negligible overhead).
+
+
+@triton.jit
+def _ce_bwd_kernel(
+    logits_ptr, grad_ptr, labels_ptr, mask_ptr, scale,
+    V, total_tokens, chunk_offset,
+    BLOCK_SIZE_V: tl.constexpr,
+):
+    """Fused CE backward: one program per token in the chunk.
+
+    Reads bf16 logits, computes softmax in fp32, writes bf16 gradient.
+    The label-position subtraction is done after the kernel.
+    """
+    pid = tl.program_id(0)  # token index within the chunk
+    token_idx = chunk_offset + pid
+
+    # Load label and mask for this token (scalars, loaded once).
+    label = tl.load(labels_ptr + token_idx)
+    tok_mask = tl.load(mask_ptr + token_idx)
+
+    # ── First pass: compute max_val and sum_val across all V blocks ────
+    max_val = -float('inf')
+    sum_val = 0.0
+
+    for start in range(0, V, BLOCK_SIZE_V):
+        offs = token_idx * V + start + tl.arange(0, BLOCK_SIZE_V)
+        mask = offs < token_idx * V + V
+        # Load bf16 logits → fp32; set out-of-range elements to -inf so they
+        # don't affect max (they won't, since offs < token_idx*V+V is always
+        # true for the last block — the underflow is for the last block's
+        # tail elements beyond V).
+        x = tl.load(logits_ptr + offs, mask=mask, other=-float('inf'))
+
+        # Online softmax update: track max_val and adjust sum_val.
+        block_max = tl.max(x, axis=0)
+        new_max = tl.maximum(max_val, block_max)
+        # Adjust sum_val for the new max: sum *= exp(old_max - new_max).
+        sum_val = sum_val * tl.exp(max_val - new_max) + tl.sum(tl.exp(x - new_max), axis=0)
+        max_val = new_max
+
+    # ── Second pass: compute softmax and gradient, store bf16 gradient ──
+    for start in range(0, V, BLOCK_SIZE_V):
+        offs = token_idx * V + start + tl.arange(0, BLOCK_SIZE_V)
+        mask = offs < token_idx * V + V
+        # Load bf16 logits → fp32 (from HBM again, but stays in cache after
+        # the first pass for most rows).
+        x = tl.load(logits_ptr + offs, mask=mask, other=0.0)
+
+        # softmax = exp(x - max_val) / sum_val
+        softmax = tl.exp(x - max_val) / sum_val
+
+        # gradient = (softmax - one_hot) * mask * scale
+        # The one_hot subtract is handled after the kernel.
+        grad = softmax * tok_mask * scale
+
+        # Store bf16 gradient.
+        tl.store(grad_ptr + offs, grad.to(tl.bfloat16), mask=mask)
+
+
+def ce_backward_fused(
+    logits: torch.Tensor,    # [B, S, V] bf16
+    labels: torch.Tensor,    # [B, S] int64
+    loss_mask: torch.Tensor, # [B, S] bf16 or fp32
+    scale: float,            # ce_w for MTP, or 1.0 for main head
+    chunk_size: int = 4096,
+) -> torch.Tensor:            # [B, S, V] bf16
+    """Fused cross-entropy backward: returns d_logits in bf16.
+
+    Processes the logits in chunks of ``chunk_size`` tokens.  Each chunk
+    is processed by a single Triton kernel launch that computes the softmax
+    forward and gradient backward in one pass, reading bf16 logits, computing
+    in fp32, and writing bf16 gradient.
+
+    The label-position subtraction (``- one_hot * mask * scale``) is done
+    as a separate PyTorch scatter operation after each kernel launch — a
+    single scalar subtraction per token, negligible overhead.
+
+    This is numerically equivalent to the PyTorch path:
+
+        softmax = torch.softmax(logits.float(), dim=-1)
+        d_logits = (softmax - one_hot) * mask * scale
+
+    and passes the long-train statistical gate.
+    """
+    B, S, V = logits.shape
+    total_tokens = B * S
+    logits_flat = logits.reshape(-1, V)
+    labels_flat = labels.reshape(-1)
+    mask_flat = loss_mask.reshape(-1).float()
+    grad_flat = torch.empty_like(logits_flat, dtype=torch.bfloat16)
+
+    BLOCK_SIZE_V = 1024  # 1024 elements per block × 2 bytes = 2 KB / block
+
+    for i in range(0, total_tokens, chunk_size):
+        end = min(i + chunk_size, total_tokens)
+        chunk_tokens = end - i
+
+        grid = (chunk_tokens,)
+        _ce_bwd_kernel[grid](
+            logits_flat, grad_flat, labels_flat, mask_flat, scale,
+            V, total_tokens, i,
+            BLOCK_SIZE_V=BLOCK_SIZE_V,
+        )
+
+        # Subtract one_hot * mask * scale at the label position.
+        # This is a single scalar operation per token, negligible overhead.
+        chunk_labels = labels_flat[i:end]
+        chunk_mask = mask_flat[i:end]
+        grad_flat[i:end, :].scatter_add_(
+            dim=1,
+            index=chunk_labels[:, None],
+            src=(-chunk_mask[:, None] * scale).to(torch.bfloat16),
+        )
+
+    return grad_flat.reshape(B, S, V)

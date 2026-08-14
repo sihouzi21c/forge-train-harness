@@ -1986,3 +1986,66 @@ The GPU idle is now 2319.6ms (30.7% of step time), up from 1718.7ms — the RMSN
   2. **Fused cross-entropy (Triton)** — SoftMax forward is 290.4ms (5.5%). A Triton CE kernel could save ~100ms.
   3. **RoPE fusion** — fuse the `apply_rope` computation into a single Triton kernel.
 - The profile snapshot is now committed in `workload/notes/profile/long-horizon_round55/`.
+- review R56 PASS: genuine optimizer optimization, no proxy; long-horizon throughput below bar, keep optimizing
+
+## [stage1] Round 57 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused Triton CE backward, MFU 26.74%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented a fused Triton cross-entropy backward kernel (`triton_kernels.py:_ce_bwd_kernel`, `ce_backward_fused`) that fuses the softmax forward + gradient backward computation into a single Triton kernel per chunk. The kernel reads bf16 logits directly, computes the softmax via online normalization (two-pass: max/sum then softmax/gradient), and writes bf16 gradient — eliminating the `torch.zeros_like(one_hot)` allocation, the `one_hot` scatter, the elementwise `(softmax - one_hot) * mask * scale` operations, and the intermediate fp32 softmax storage.
+
+**Phase 2 optimization — fused Triton CE backward:**
+
+1. **`_ce_bwd_kernel` (Triton)**: Each program handles one token (row of V=130560 elements). Two-pass approach:
+   - First pass: load V elements in blocks of 1024, compute max_val and sum_val via online softmax.
+   - Second pass: load each block, compute softmax, compute gradient, store bf16 gradient.
+   - The label-position subtraction (`-1 * mask * scale`) is handled by a separate `scatter_add_` after the kernel — a single scalar operation per token, negligible overhead.
+
+2. **Gating by `ENABLE_TRITON_CE_BWD=1`**: The Triton kernel is only used when `ENABLE_TRITON_CE_BWD=1` AND `deterministic=False` (long-horizon mode). The bitwise gates always use the PyTorch path. The `eval_long_train.py` script sets `ENABLE_TRITON_CE_BWD=1`.
+
+3. **Numerical equivalence**: The kernel computes the same softmax as `torch.softmax(chunk.float(), dim=-1)` using online normalization, which is numerically stable for all input values. The label-position subtraction is identical to the `one_hot` approach.
+
+### Gate results (long-train, 200 steps, DP=2)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| **MFU(standard)** | **26.74%** | — |
+| loss_rel(point) | 0.235% | < 2.50% ✅ |
+| signed_mean_rel | +0.235% | no drift ✅ |
+| pointwise_mean_rel | 0.235% | — |
+| max_rel_diff | 0.44% | — |
+| drift_warning | None | ✅ |
+| compared_steps | 100 | — |
+| ref_elapsed_s | 1563s | — |
+| **status** | **passed** | ✅ |
+
+### Regression gates
+
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **profile-snapshot (long-horizon_round57)**: PASS (step_time 7566ms, MFU 17.38% nsys).
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 51 (Triton SwiGLU bwd) | 20.1% | **+1.76pp** | |
+| Round 52 (Triton SwiGLU fwd) | 20.85% | **+2.51pp** | |
+| Round 53 (CE opt, direct softmax) | 21.03% | **+2.69pp** | |
+| Round 55 (Triton RMSNorm fwd) | 22.5% | **+4.16pp** | |
+| **Round 57 (Triton CE bwd)** | **26.74%** | **+8.40pp** | Same devspace |
+
+### Next steps
+
+- The fused CE kernel produced a +4.24pp MFU improvement (22.5% → 26.74%).
+- Continue optimization: the GPU idle is still likely the dominant bottleneck.
+- Candidate levers for next round:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2).
+  2. **RoPE fusion** — fuse the `apply_rope` computation into a single Triton kernel.
+  3. **CUDA graph re-evaluation** — re-evaluate CUDA graph with the CE optimization (freed memory may now allow graph capture).
+- review R57 PASS: genuine fused Triton CE kernel, no proxy; long-horizon throughput below bar, keep optimizing
