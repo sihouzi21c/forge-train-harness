@@ -1636,7 +1636,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     _opt_cuda_graph = None
     use_cuda_graph = (
         config.hash_capture_level == 0  # no hash capture during graph capture
-        and int(os.environ.get("ENABLE_CUDA_GRAPH", "0"))  # default 0: eager path with CE optimization is faster (21.1% vs 18.3% MFU); enable via env for debugging
+        and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))  # default 1: CE optimization freed ~21 GiB, graph capture now viable
         and not enable_zero  # ZeRO-1 uses a sharded optimizer step, not compatible with the full optimizer graph
     )
 
@@ -1672,7 +1672,19 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                   f"{num_grad_buckets} total", file=sys.stderr, flush=True)
 
     if use_cuda_graph:
-        # Evict CUDA allocator cache before warmup to avoid memory instability
+        # Check available memory before graph capture.  The CE optimization freed
+        # ~21 GiB of fp32 logits, but the LM head matmul still needs ~4 GiB of
+        # temporary workspace.  If the free memory is too low, skip graph capture.
+        _free_before, _total_before = torch.cuda.mem_get_info(device)
+        _free_gib = _free_before / (1024**3)
+        if _free_gib < 8.0:
+            if rank == 0:
+                print(f"[debug] CUDA graph: insufficient free memory ({_free_gib:.1f} GiB < 8 GiB), skipping capture", flush=True)
+            use_cuda_graph = False
+        else:
+            if rank == 0:
+                print(f"[debug] CUDA graph: {_free_gib:.1f} GiB free, attempting capture", flush=True)
+            # Evict CUDA allocator cache before warmup to avoid memory instability
         # between warmup and graph capture.  Doing this *after* warmup (between
         # del _fw_cache and capture) can cause captured tensor addresses to shift.
         torch.cuda.synchronize()
@@ -1761,6 +1773,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # would happen on every replay instead of once per step).
         torch.cuda.synchronize()
 
+        # Debug: print free memory after warmup cleanup.
+        _free_after, _total_after = torch.cuda.mem_get_info(device)
+        _free_gib_after = _free_after / (1024**3)
+        if rank == 0:
+            print(f"[debug] CUDA graph: {_free_gib_after:.1f} GiB free after warmup cleanup", flush=True)
+
         # Capture the CUDA graph for one microbatch.
         # The graph records the forward+backward CUDA operations.  During replay,
         # the same tensor addresses are used, so the cache and lm_* tensors from
@@ -1815,7 +1833,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             torch._foreach_zero_(fp32_grad_bufs)
 
             if rank == 0:
-                print("[debug] CUDA graph captured successfully", file=sys.stderr, flush=True)
+                _free_after_cap, _ = torch.cuda.mem_get_info(device)
+                print(f"[debug] CUDA graph captured successfully ({_free_gib:.1f} GiB free before, {_free_gib_after:.1f} GiB after warmup, {_free_after_cap/(1024**3):.1f} GiB after capture)", file=sys.stderr, flush=True)
 
             # NOTE: Optimizer step CUDA graph capture is intentionally skipped.
             # The forward+backward graph's private pools (~20.96 GiB) consume
@@ -1829,7 +1848,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
         except Exception as e:
             if rank == 0:
-                print(f"[debug] CUDA graph capture failed, falling back to eager: {e}",
+                _free_on_fail, _ = torch.cuda.mem_get_info(device)
+                print(f"[debug] CUDA graph capture failed ({_free_on_fail/(1024**3):.1f} GiB free), falling back to eager: {e}",
                       file=sys.stderr, flush=True)
                 print(f"[debug] CUDA graph capture failed, falling back to eager: {e}", flush=True)
             cuda_graph = None
@@ -1856,6 +1876,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
         # Grad accumulation loop
         if use_cuda_graph and cuda_graph is not None:
+            # One-time debug: confirm CUDA graph is active.
+            if rank == 0 and step == 0:
+                print(f"[debug] CUDA graph replay active ({config.grad_accum_steps} microbatch replays/step)", flush=True)
             # CUDA graph replay path: replay the captured graph for each microbatch.
             # The graph records the forward+backward.  Input data is copied into
             # pre-allocated buffers (stable addresses) before each replay.

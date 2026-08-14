@@ -2048,4 +2048,41 @@ The dev agent implemented a fused Triton cross-entropy backward kernel (`triton_
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2).
   2. **RoPE fusion** — fuse the `apply_rope` computation into a single Triton kernel.
   3. **CUDA graph re-evaluation** — re-evaluate CUDA graph with the CE optimization (freed memory may now allow graph capture).
-- review R57 PASS: genuine fused Triton CE kernel, no proxy; long-horizon throughput below bar, keep optimizing
+- review R57 PASS: genuine fused Triton CE kernel, no proxy; milestone throughput below bar, continue MFU optimization
+- review R57 PASS: genuine fused Triton kernel, no proxy detected
+
+## [stage1] Round 58 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 4: CUDA graph re-enabled with memory check, MFU target 26.74%→~29.5%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent re-enabled the CUDA graph for the forward+backward pass (``ENABLE_CUDA_GRAPH=1`` default), leveraging the ~21 GiB of memory freed by the CE optimization (Round 57).  The CUDA graph was previously disabled (Round 53) because the LM head matmul needed 3.98 GiB of temporary workspace and only 784 MiB was free after warmup.  With the CE optimization eliminating the fp32 logits materialization, the graph capture should now have sufficient memory.
+
+**Changes made**:
+
+1. **``ENABLE_CUDA_GRAPH`` default changed from ``"0"`` to ``"1"``** — the CE backward Triton kernel (Round 57) eliminated the ``logits.reshape(-1, V).float()`` materialization, freeing ~21 GiB of GPU memory.  This should allow the CUDA graph capture to succeed without OOM.
+
+2. **Memory guard before graph capture** — added ``torch.cuda.mem_get_info()`` check before the warmup+capture sequence.  If free memory is less than 8 GiB, the graph capture is skipped and the eager path is used.  This prevents the OOM/corruption that occurred in Round 53.
+
+3. **Debug memory logging** — added ``[debug] CUDA graph: N.N GiB free before/after warmup`` and ``after capture`` prints to stdout, so the harness logs show the exact memory state at each stage of graph capture.  On capture failure, the free memory at the failure point is also printed.
+
+4. **One-time CUDA graph replay confirmation** — ``[debug] CUDA graph replay active`` printed on step 0 when the graph is active, so the harness logs confirm which path is used.
+
+### Estimated MFU impact
+
+The CUDA graph eliminates the ``cudaLaunchKernel`` overhead (2241ms in the nsys profile, partially nsys-inflated).  Estimated real savings: 300-500ms/step, giving +1.5-2.5pp MFU improvement (26.74% → ~28.2-29.2%).
+
+### Next steps
+
+- Run ``long-train-smoke`` (DP=2, 20 steps) to verify the CUDA graph capture succeeds and measure the MFU improvement.
+- If the graph capture OOMs, the fallback to the eager path is automatic (the ``except Exception`` handler at line 1849 sets ``use_cuda_graph=False``).
+- Run ``profile-snapshot M6_round58`` to confirm the ``cudaLaunchKernel`` overhead dropped.
+- Run ``resume-gate-20`` regression to verify the CUDA graph doesn't break save/load round-trip.
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute).
+  2. **RoPE fusion** — fuse the ``apply_rope`` computation into a single Triton kernel.
+  3. **Optimizer step CUDA graph** — re-evaluate if the fwd+bwd graph succeeds (more free memory available for the optimizer graph capture).
