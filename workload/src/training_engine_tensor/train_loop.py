@@ -302,11 +302,13 @@ class _BackgroundPrefetcher:
     4 — enough headroom to absorb dataloader latency across 10-microbatch
     steps).
 
-    The ``get()`` method notifies the background thread after popping a batch,
-    so the producer resumes immediately instead of waiting for the 0.1s poll
-    interval.  Without this notification the background thread is idle for
-    100ms after each batch consumption, which directly causes GPU idle
-    (~630ms/step from ``pthread_cond_wait`` in the profiler).
+    Producer-consumer synchronization uses a ``threading.Semaphore`` to avoid
+    the lost-notify problem with ``Condition.wait(0.1)``: the background thread
+    acquires a semaphore permit before calling ``next(dl)``, and the main thread
+    releases a permit via ``get()`` after consuming a batch.  This ensures the
+    producer is woken up immediately when the queue has room, eliminating the
+    ~968ms/step of ``pthread_cond_timedwait`` that occurred with the 0.1s poll
+    interval.
 
     The background thread is started by ``start()`` and must be stopped by
     ``stop()`` during teardown to avoid a dangling thread.
@@ -322,6 +324,12 @@ class _BackgroundPrefetcher:
         self._max_size = max_size
         self._lock = threading.Lock()
         self._not_empty = threading.Condition(self._lock)
+        # Semaphore for producer-consumer flow control: the producer
+        # acquires a permit before calling next(dl); the consumer releases
+        # a permit via get() after consuming a batch.  Initialized with
+        # max_size permits so the producer can queue up to max_size batches
+        # before blocking.
+        self._free_slots = threading.Semaphore(max_size)
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True, name="dl-prefetcher")
         # Pre-allocate pinned CPU buffers for the entire queue depth.
@@ -341,8 +349,10 @@ class _BackgroundPrefetcher:
         self._thread.start()
 
     def stop(self):
+        self._running = False
+        # Release all permits so the background thread can exit.
+        self._free_slots.release(self._max_size)
         with self._lock:
-            self._running = False
             self._not_empty.notify_all()
 
     def get(self):
@@ -351,20 +361,22 @@ class _BackgroundPrefetcher:
             while len(self._queue) == 0:
                 self._not_empty.wait()
             result = self._queue.popleft()
-            # Notify the background thread that the queue has room, so it
-            # can start the next _next_batch call immediately instead of
-            # waiting for the 0.1s timeout.  Without this notification the
-            # background thread is idle for 100ms after each batch
-            # consumption, which directly causes GPU idle (~630ms/step
-            # from pthread_cond_wait in the profiler).
-            self._not_empty.notify()
-            return result
+        # Release a permit so the producer can start the next next(dl) call.
+        self._free_slots.release()
+        return result
 
     def _run(self):
         """Background thread: fetch batches from the dataloader, copy to
         pre-allocated pinned buffers, and enqueue them."""
         buf_idx = 0
         while True:
+            # Acquire a permit — blocks if the queue is full (max_size
+            # unconsumed batches).  This avoids the lost-notify problem
+            # with Condition.wait(0.1): the semaphore internally tracks
+            # the release count, so the notify from get() is never lost.
+            self._free_slots.acquire()
+            if not self._running:
+                return
             data = next(self._dl)
             while (data["loss_mask"] == 0).all().item():
                 data = next(self._dl)
@@ -376,14 +388,6 @@ class _BackgroundPrefetcher:
             buf[2].copy_(data["loss_mask"].float())
             buf_idx += 1
             with self._lock:
-                if not self._running:
-                    return
-                # Block if the queue is full — the main thread must consume
-                # before we can prefetch more.
-                while len(self._queue) >= self._max_size:
-                    self._not_empty.wait(0.1)
-                    if not self._running:
-                        return
                 self._queue.append(buf)
                 self._not_empty.notify()
 
