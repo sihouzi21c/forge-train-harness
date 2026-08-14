@@ -666,3 +666,37 @@ The dev agent pre-allocated 4 step-level loss accumulators (`_local_lm_sum`, `_l
 - `bin/harness run anti-proxy`: PASS (0 violations)
 
 ---
+
+## [stage1] Round 64 — 2026-08-15 04:53
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 0b77777 — Perf: pre-allocate AdamW dummy_sq tensor — avoid 2 CUDA allocator calls per step
+
+### Key conclusions
+The dev agent pre-allocated a single `_opt_dummy_sq` tensor (1-element fp32) before the training loop and passes it to `_adamw_step()` as a placeholder for `max_exp_avg_sqs` (amsgrad=False means the kernel never accesses it), eliminating 2 per-step `torch.zeros(1, ...)` calls that could trigger CUDA allocator `cudaStreamSynchronize`. This is a genuine in-process CUDA optimization — no shell-out to `ref/`, no reference imports, no hardcoded synthetic values. The anti-proxy guard passes. Stage 1 FINISH conditions not met: the commit message does not declare `STAGE_STATUS: finished`, and the latest perf_log.md section lacks `long-train` (200-step), `resume-startup-90`, and `perf-bitwise` gate evidence.
+
+### Evidence highlights
+- `train_loop.py:1644-1648` — pre-allocated `_opt_dummy_sq` once before the training loop
+- `train_loop.py:1126-1165` — `_adamw_step()` accepts optional `dummy_sq` parameter with fallback to `torch.zeros(1, ...)` when None
+- `bin/harness run anti-proxy`: PASS (0 violations)
+
+---
+
+## [stage1] Round 65 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+The dev agent eliminated the redundant `torch.cat` calls in the SwiGLU backward path by changing `silu_swiglu_intermediate_backward` to return a single `[B, S, 2*ffn_half]` tensor. The fused Triton kernel already returns a contiguous `d_gate_up` tensor, but the wrapper was unnecessarily splitting it into two views that the caller immediately concatenated back. This is a genuine in-process optimization — no shell-out to `ref/`, no reference imports, no hardcoded synthetic values. The anti-proxy guard passes. Stage 1 FINISH conditions not met: the commit message does not declare `STAGE_STATUS: finished`, and the latest perf_log.md section lacks `long-train` (200-step), `resume-startup-90`, and `perf-bitwise` gate evidence.
+
+### Evidence highlights
+- `backward.py:204-244` — `silu_swiglu_intermediate_backward` now returns a single `torch.Tensor` instead of `tuple[torch.Tensor, torch.Tensor] | torch.Tensor`
+- `train_loop.py:800-805` — MTP SwiGLU backward: `d_mtp_gate_up = silu_swiglu_intermediate_backward(...)` (no `torch.cat`)
+- `train_loop.py:967-973` — Main SwiGLU backward: `d_gate_up = silu_swiglu_intermediate_backward(...)` (no `torch.cat`)
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `bin/harness run guard`: PASS (0 violations)
+
+---

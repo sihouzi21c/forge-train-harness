@@ -2389,3 +2389,32 @@ The `torch.zeros(1, ...)` calls are small allocations (~8 bytes each) that the C
   2. **H2D copy batching** — reduce cudaMemcpyAsync calls by concatenating input tensors into a single pinned buffer.
   3. **Residual-add + RMSNorm fusion** — fuse the residual-add and RMSNorm forward into a single Triton kernel to eliminate ~87ms of elementwise copy operations.
 - review R63 FAIL: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization
+- review R64 FAIL: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization
+
+## [stage1] Round 65 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: eliminate redundant SwiGLU backward torch.cat — save ~10ms/step)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent eliminated the redundant `torch.cat` calls in the SwiGLU backward path by changing `silu_swiglu_intermediate_backward` to always return a single `[B, S, 2*ffn_half]` tensor instead of returning two views that the caller immediately concatenated back.
+
+**Root cause**: The fused Triton SwiGLU backward kernel (`swiglu_backward_fused`) returns a single contiguous `d_gate_up` tensor. The `silu_swiglu_intermediate_backward` wrapper was splitting it into two views (`d_gate_up[..., :ffn_half], d_gate_up[..., ffn_half:]`), and the call sites in `train_loop.py` immediately concatenated them back with `torch.cat([d_y1, d_y2], dim=-1)`. Each `torch.cat` launched a `CatArrayBatchedCopy` GPU kernel (~38.5us per call).
+
+**Optimization — eliminate the round-trip**:
+1. `backward.py:silu_swiglu_intermediate_backward` — return type changed from `tuple[torch.Tensor, torch.Tensor] | torch.Tensor` to `torch.Tensor`. The fused Triton path returns `d_gate_up` directly; the PyTorch path now returns `torch.cat([d_gate, d_up], dim=-1)`.
+2. `train_loop.py` call sites (lines 800-805, 968-973) — use the returned tensor directly, removing the `d_y1, d_y2 = ...` unpacking and the `torch.cat` call.
+
+**Estimated MFU improvement**: ~0.2% (saves ~10ms of `CatArrayBatchedCopy` GPU kernel time per step, from 260 eliminated instances out of 2025).
+
+### Next steps
+
+- Push to GitHub and run `long-train-smoke` (DP=2, 20 steps) to verify the gate still passes.
+- Run `profile-snapshot M6_round65` to confirm the `CatArrayBatchedCopy` time dropped.
+- Run `resume-gate-20` regression to verify the optimization doesn't break save/load.
+- Candidate levers for subsequent rounds:
+  1. **Fused grad_weight computation** — inline the `grad_weight` sum into the Triton RMSNorm backward kernel to eliminate the `hidden.float()` copy in the `rms_norm_backward_fused` wrapper.
+  2. **Pre-allocated buffer for MTP eagle FC cat** — avoid the `torch.cat` at line 584 by storing the concatenated tensor in the `LayerCache`.

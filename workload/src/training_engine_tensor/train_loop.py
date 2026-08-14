@@ -796,13 +796,12 @@ def _static_backward(
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.mlp_fc2_weight, dw_mtp_w2)
 
-        # SwiGLU backward
-        d_mtp_y1, d_mtp_y2 = silu_swiglu_intermediate_backward(
+        # SwiGLU backward (returns d_gate_up directly — no torch.cat needed)
+        d_mtp_gate_up = silu_swiglu_intermediate_backward(
             d_intermediate, _mtp_y1, _mtp_y2,
             gate_up=mtp_lc.gate_up, ffn_half=C.FFN_HIDDEN_SIZE,
             deterministic=deterministic,
         )
-        d_mtp_gate_up = torch.cat([d_mtp_y1, d_mtp_y2], dim=-1)
 
         # wfc1 backward: gate_up = normed2 @ wfc1.T
         # Recompute normed2 from hidden_after_attn (not stored in cache
@@ -964,13 +963,12 @@ def _static_backward(
         )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.mlp_fc2_weight, dw_w2)
 
-        # SwiGLU backward: intermediate = silu(y1) * y2
-        d_y1, d_y2 = silu_swiglu_intermediate_backward(
+        # SwiGLU backward (returns d_gate_up directly — no torch.cat needed)
+        d_gate_up = silu_swiglu_intermediate_backward(
             d_intermediate, _y1, _y2,
             gate_up=lc.gate_up, ffn_half=C.FFN_HIDDEN_SIZE,
             deterministic=deterministic,
         )
-        d_gate_up = torch.cat([d_y1, d_y2], dim=-1)
 
         # wfc1 backward: gate_up = normed2 @ wfc1.T
         # Recompute normed2 from hidden_after_attn (not stored in cache

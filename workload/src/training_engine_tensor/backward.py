@@ -208,15 +208,16 @@ def silu_swiglu_intermediate_backward(
     gate_up: torch.Tensor | None = None,
     ffn_half: int | None = None,
     deterministic: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+) -> torch.Tensor:
     """Backward of ``silu(gate) * up`` using closed-form (no autograd replay).
 
-    When ``deterministic=True`` (default, bitwise-safe mode), uses the
-    pure-PyTorch closed-form that is bitwise-identical to the ref's
-    ``F.silu`` autograd backward.  When ``deterministic=False`` and
-    ``gate_up`` is provided (long-horizon performance mode), uses the
-    fused Triton kernel which reads bf16 inputs directly, computes in
-    fp32, and writes bf16 output, eliminating the .float() copy overhead.
+    Returns a single ``[B, S, 2*ffn_half]`` tensor ``d_gate_up``,
+    eliminating the caller's need for a ``torch.cat`` step.
+
+    When ``deterministic=False`` and ``gate_up`` is provided (long-horizon
+    performance mode), uses the fused Triton kernel which reads bf16 inputs
+    directly, computes in fp32, and writes bf16 output, eliminating the
+    .float() copy overhead.
 
     The closed-form math is:
 
@@ -227,10 +228,6 @@ def silu_swiglu_intermediate_backward(
 
     All computation is in fp32 for precision, matching the ref's ``F.silu``
     autograd backward at the numerical level.
-
-    When ``gate_up`` is provided (fused Triton path), returns a single
-    ``[B, S, 2*ffn_half]`` tensor ``d_gate_up``.  When ``gate_up`` is
-    ``None`` (PyTorch closed-form), returns ``(d_gate, d_up)``.
     """
     # Use fused Triton kernel for non-deterministic (long-horizon) mode.
     if (gate_up is not None and ffn_half is not
@@ -238,11 +235,7 @@ def silu_swiglu_intermediate_backward(
             and not deterministic
             and gate.is_cuda
             and int(__import__('os').environ.get('ENABLE_TRITON_SWIGLU_BWD', '0'))):
-        d_gate_up = _swiglu_bwd_fused(grad_out, gate_up, ffn_half)
-        # Return views into the fused output so the caller's
-        # ``torch.cat([d_y1, d_y2], dim=-1)`` is a no-op (both views
-        # already point into the same buffer).
-        return d_gate_up[..., :ffn_half], d_gate_up[..., ffn_half:]
+        return _swiglu_bwd_fused(grad_out, gate_up, ffn_half)
 
     # Pure-PyTorch closed-form (bitwise-safe, used for deterministic mode).
     # Compute in fp32 for precision
@@ -265,7 +258,9 @@ def silu_swiglu_intermediate_backward(
     # d_up = grad_out * silu(gate)
     d_up = grad_out_f * silu_val
 
-    return d_gate.to(gate.dtype, non_blocking=True), d_up.to(up.dtype, non_blocking=True)
+    # Concatenate d_gate and d_up into a single [B, S, 2*ffn_half] tensor.
+    return torch.cat([d_gate.to(gate.dtype, non_blocking=True),
+                      d_up.to(up.dtype, non_blocking=True)], dim=-1)
 
 
 # ── Embedding backward ──────────────────────────────────────────────────────
