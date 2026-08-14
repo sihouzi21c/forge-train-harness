@@ -455,3 +455,18 @@ Documentation-only commit recording Round 52 results (SwiGLU forward fused Trito
 - Engine files (`workload/src/training_engine_tensor/`) all compute MFU, loss, and grad_norm from actual runtime values — no hardcoded constants
 
 ---
+## [stage1] Round 52 — 2026-08-14 19:59
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 531fab1 — Perf: gate CE forward .float() behind deterministic flag; CE backward direct softmax
+
+### Key conclusions
+The dev agent optimized the CE forward and backward paths by gating the explicit `.float()` and autograd replay behind a `deterministic` flag. The forward path (`forward.py:266`) now skips `logits.reshape(-1, V).float()` when `deterministic=False`, letting `F.cross_entropy` handle bf16→fp32 conversion internally. The backward path (`backward.py:587`) uses the direct softmax formula `(softmax - one_hot) * mask * scale` instead of autograd replay. Both are genuine in-process PyTorch computations — no proxy, no hardcoded metrics, no shell-outs to ref/. The `deterministic=True` branch preserves the original bitwise paths for gate compliance. The commit message does not declare `STAGE_STATUS: finished`, and the latest perf_log.md section has no GPU gate evidence (cluster busy — BATCH job queued). The review-side throughput check (long-horizon milestone) reports throughput below the review bar.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `bin/harness run guard`: PASS (0 violations)
+- No gate config, remote config, or run-shape key modifications detected
+
+---

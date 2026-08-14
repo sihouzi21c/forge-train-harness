@@ -1697,6 +1697,7 @@ GPU kernel composition (nsys profile, round53 vs round52): essentially unchanged
   2. **Fused cross-entropy** — reduce SoftMax forward+backward overhead
   3. **Optimizer step CUDA graph** — capture AdamW + bf16 sync into the graph
 - review R51 PASS: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization
+- review R52 PASS: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization
 
 ## [stage1] Round 53 — 2026-08-14
 

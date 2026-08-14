@@ -1632,7 +1632,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     _opt_cuda_graph = None
     use_cuda_graph = (
         config.hash_capture_level == 0  # no hash capture during graph capture
-        and int(os.environ.get("ENABLE_CUDA_GRAPH", "1"))  # default 1: reduce cudaLaunchKernel overhead (~3814ms/step); disable via env for debugging
+        and int(os.environ.get("ENABLE_CUDA_GRAPH", "0"))  # default 0: eager path with CE optimization is faster (21.1% vs 18.3% MFU); enable via env for debugging
         and not enable_zero  # ZeRO-1 uses a sharded optimizer step, not compatible with the full optimizer graph
     )
 
@@ -1740,6 +1740,14 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # memory for the captured operations, so we must free the cache first.
         # (empty_cache/gc.collect already done before warmup.)
         del _fw_cache
+
+        # Free the warmup's cached CUDA memory before graph capture.
+        # The warmup allocates tensors that stay in the CUDA allocator's
+        # cache even after del _fw_cache.  Without this, the graph capture's
+        # private pools may OOM (total memory + graph private pools > 80 GB).
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # Zero the grad bufs after warmup (the warmup accumulated gradients).
         torch._foreach_zero_(fp32_grad_bufs)
