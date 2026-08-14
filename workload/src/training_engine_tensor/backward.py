@@ -123,22 +123,28 @@ def rms_norm_backward(
     eps_val = eps if eps is not None else NORM_EPS
     H = hidden.shape[-1]
 
+    # Reuse grad_out_f32 to avoid a second .float() call for the wgrad.
+    # The weight is bf16; cast it to fp32 once so the d_normed multiply
+    # stays in fp32 (avoids a bf16 multiply + separate .float() cast).
+    grad_out_f32 = grad_out.float()
+    weight_f32 = weight.float()
+
     # r = rsqrt(mean(x^2) + eps) — compute in fp32 for precision
     x_f32 = hidden.float()
     r = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps_val)
     normed = x_f32 * r  # [B, S, H] fp32
 
-    # d_normed = grad_out * weight (bf16 → fp32)
-    d_normed = (grad_out * weight).float()
+    # d_normed = grad_out * weight in fp32
+    d_normed = grad_out_f32 * weight_f32
 
     # d_hidden = r * (d_normed - normed * mean(d_normed * normed, dim=-1))
     normed_dot = (d_normed * normed).mean(dim=-1, keepdim=True)
     d_hidden = r * (d_normed - normed * normed_dot)
 
-    # d_weight = sum(grad_out * normed, dim=0).float()
-    grad_weight = (grad_out.float() * normed).reshape(-1, H).sum(0)
+    # d_weight = sum(grad_out * normed, dim=0).float() — reuse grad_out_f32
+    grad_weight = (grad_out_f32 * normed).reshape(-1, H).sum(0)
 
-    return d_hidden.to(hidden.dtype), grad_weight
+    return d_hidden.to(hidden.dtype, non_blocking=True), grad_weight
 
 
 # ── SwiGLU intermediate backward (silu(gate) * up) ─────────────────────────
@@ -182,7 +188,7 @@ def silu_swiglu_intermediate_backward(
     # d_up = grad_out * silu(gate)
     d_up = grad_out_f * silu_val
 
-    return d_gate.to(gate.dtype), d_up.to(up.dtype)
+    return d_gate.to(gate.dtype, non_blocking=True), d_up.to(up.dtype, non_blocking=True)
 
 
 # ── Embedding backward ──────────────────────────────────────────────────────

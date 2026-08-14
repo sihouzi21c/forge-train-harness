@@ -165,3 +165,22 @@ The commit disables the Triton wgrad kernel (confirmed 6% MFU regression vs cuBL
 - profile-snapshot long-horizon_round47: PASS (step_time 7221ms, MFU 18.21%)
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 - `python3 tools/mfu_elastic_check.py`: `MFU_GATE_VERDICT: FAIL — BELOW_BAND`, no milestone override
+
+---
+
+## [stage1] Round 47 (docs-only follow-up) — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: daa7341 — Docs: record Round 47 — Triton wgrad disabled, nsys cuda-graph-trace flag, resume-gate-20 PASS
+
+### Key conclusions
+This commit is a documentation-only update (only `workload/notes/review.md` changed) recording the Round 47 results: Triton wgrad disabled (6% MFU regression confirmed), nsys `--cuda-graph-trace=node` flag added, resume-gate-20 bitwise PASS (9420/9420 hashes), long-train-smoke PASS (loss_rel 0.107%, MFU 18.3%), and devspace recovery (720930 → 721480). No engine source code was modified. No proxy, forgery, hardcoded metrics, or shell-out to ref detected. The commit does not declare `STAGE_STATUS: finished`. The review-side throughput check returns below the review bar, so no milestone override is issued.
+
+### Evidence highlights
+- `git diff HEAD~1 HEAD` — only `workload/notes/review.md` changed
+- `bin/harness run anti-proxy` would pass (no engine code to violate)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- review-side throughput check: below the review bar, no milestone override
+
+---
