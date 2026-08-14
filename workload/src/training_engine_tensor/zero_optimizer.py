@@ -153,7 +153,7 @@ def reduce_scatter_grads(
     zero: ZeroOptimizer,
     fp32_grad_bufs: list[torch.Tensor],
     bf16_params: list[torch.Tensor],
-    norm_factor: float,
+    norm_factor: torch.Tensor,
 ) -> None:
     """Replace ``all_reduce`` with ``reduce_scatter`` for gradients.
 
@@ -165,8 +165,8 @@ def reduce_scatter_grads(
         zero: The ZeRO-1 optimizer state.
         fp32_grad_bufs: Full list of FP32 gradient buffers (all ranks).
         bf16_params: Full list of BF16 parameter tensors (for flattening).
-        norm_factor: ``1.0 / token_count`` — the scaling factor applied after
-            all-reduce in the non-ZeRO path.
+        norm_factor: ``1.0 / token_count`` — GPU scalar tensor (no .item() to
+            avoid CUDA stream sync).
     """
     # Flatten the full gradient buffer.
     flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)

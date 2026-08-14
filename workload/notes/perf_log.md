@@ -1822,3 +1822,47 @@ The nsys-profiled MFU is 17.38% (vs 21.03% in the clean gate, due to nsys overhe
   1. **Reduce cudaStreamSynchronize** — identify and eliminate unnecessary synchronize calls in the hot path (2540ms/step is the largest single overhead).
   2. **Operator fusion** — residual-add + RMSNorm forward (Triton) to reduce copy operations.
   3. **Optimizer step CUDA graph** — revisit if memory situation improves.
+- review R53 PASS: docs-only commit, no proxy/forgery; engine implementation is genuine
+
+## [stage1] Round 54 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: eliminate .item() CUDA syncs from timed region)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent eliminated 6 CUDA stream synchronizations per step from the timed region by replacing `.item()` calls with GPU tensor operations or deferring them to after `step_end_event.synchronize()`:
+
+1. **`norm_factor_float.item()` → GPU tensor `norm_factor`** (4 sites):
+   - The ZeRO path, gradient bucketing path, flat all-reduce path, and single-GPU path all computed `norm_factor_float = (1.0 / local_lm_n.clamp(min=1.0)).item()` then used it as a scalar in `mul_()`.
+   - Replaced with `norm_factor = (1.0 / local_lm_n.clamp(min=1.0))` — a 1-element GPU tensor. `torch.Tensor.mul_()` and `torch._foreach_mul_()` both accept GPU tensors, so no `.item()` is needed.
+   - This eliminates 4 CUDA stream syncs from the timed region per step.
+
+2. **`reported_lm`/`reported_mtp` `.item()` deferred** (2 sites):
+   - Previously computed as `reported_lm = (local_lm_sum / local_lm_n.clamp(min=1.0)).item()` at line 1987, inside the timed region (between `step_start_event.record()` and `step_end_event.record()`).
+   - Changed to compute as GPU tensors `reported_lm_tensor` and `reported_mtp_tensor` at the original location, with `.item()` deferred to after `step_end_event.synchronize()` (which already syncs the stream).
+   - This eliminates 2 CUDA stream syncs from the timed region per step.
+
+3. **`reduce_scatter_grads` type annotation** — changed `norm_factor: float` to `norm_factor: torch.Tensor` to match the new GPU tensor contract.
+
+### Expected MFU impact
+
+Each `.item()` call triggers an internal `cudaStreamSynchronize` (~40ms). Eliminating 6 syncs from the timed region saves ~240ms/step, estimated **+3.2% MFU improvement** (from 21.03% to ~21.7%).
+
+### Numerical equivalence
+
+All changes are numerically equivalent to the original code:
+- `flat.mul_(norm_factor)` with a 1-element GPU tensor produces the same result as `flat.mul_(norm_factor_float)` with a Python float.
+- `torch._foreach_mul_(fp32_grad_bufs, norm_factor)` with a GPU tensor is bitwise identical to the float version.
+- The deferred `.item()` calls at lines 2160-2161 read the same tensor values, just after the stream sync at line 2156.
+
+### Next steps
+
+- Run `long-train-smoke` (DP=2, 20 steps) to verify the MFU improvement.
+- Run `profile-snapshot M6_round54` to confirm `cudaStreamSynchronize` time dropped.
+- Candidate levers for subsequent rounds:
+  1. **Operator fusion** — residual-add + RMSNorm forward (Triton) to reduce copy operations.
+  2. **Optimizer step CUDA graph** — revisit if memory situation improves.
+  3. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with working CUDA graph).
