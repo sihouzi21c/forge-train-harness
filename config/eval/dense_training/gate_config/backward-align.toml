@@ -2,8 +2,8 @@
 [shared]
 world_size_override        = 1
 num_steps_override         = 1
-micro_batch_size_override  = 4
-global_batch_size_override = 4
+micro_batch_size_override  = 2
+global_batch_size_override = 2
 gate_window                = [0, 1]
 
 [shared.gate]

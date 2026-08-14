@@ -1360,3 +1360,4 @@ Once the cluster GPU is available:
    - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
    - CUDA graph for optimizer step (needs memory re-evaluation after normed/normed2 removal)
    - ZeRO-1 optimization for larger DP sizes
+- review R44 PASS: docs-only commit, no proxy detected; gates not run (cluster busy)

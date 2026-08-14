@@ -1,10 +1,10 @@
 # resume-gate-20.toml — resume 单一源(两段 checkpoint resume bitwise)
 [shared]
 world_size_override        = 2
-num_steps_override         = 20
-micro_batch_size_override  = 4
-global_batch_size_override = 80
-gate_window                = [10, 20]
+num_steps_override         = 25
+micro_batch_size_override  = 2
+global_batch_size_override = 32
+gate_window                = [10, 25]
 resume_save_step           = 10
 
 [shared.gate]

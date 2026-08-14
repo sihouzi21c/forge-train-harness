@@ -117,3 +117,20 @@ The commit adds a genuine Triton wgrad kernel (`triton_kernels.py:49-158`) for t
 - `triton_kernels.py` — self-contained Triton GEMM kernel, no proxy references
 - `backward.py:86-89` — Triton wgrad integration with cuBLAS fallback, no forgery
 - `long-horizon` check: `MFU_GATE_VERDICT: FAIL — BELOW_BAND`, 1 sample, no milestone override
+
+---
+
+## [stage1] Round 44 — 2026-08-14 09:55
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 1e76b8f — Docs: record Round 44 — Triton wgrad GEMM + _foreach_copy_ bf16 sync; gates not run (cluster busy)
+
+### Key conclusions
+This commit is documentation-only — only `workload/notes/perf_log.md` and `workload/notes/review.md` were modified from the previous round. No engine code was changed, no gate thresholds were tampered with, and no remote config was edited. The Triton wgrad kernel and `_foreach_copy_` bf16 sync were implemented in the prior commit (1f57a49) and remain genuine in-process implementations. Remote cluster GPU resources (`paratera_shandong/faxin`) were occupied by another user's devspace, so 2-GPU gates (long-train, resume-gate-20, perf-bitwise) could not be run this round. Anti-proxy guard passes cleanly. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message and no green gate evidence for the four required suites.
+
+### Evidence highlights
+- `git diff HEAD~1 HEAD` — only `workload/notes/perf_log.md` and `workload/notes/review.md` changed
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- `python3 tools/mfu_elastic_check.py`: `MFU_GATE_VERDICT: FAIL — BELOW_BAND`, no milestone override

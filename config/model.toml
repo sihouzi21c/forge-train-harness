@@ -1,1 +1,46 @@
-/Users/sunhj/Downloads/hjsun/ForgeInference/.artifacts/forge_train/77459cccb4da/config/model.toml
+# Model architecture + identity: MiniCPM5 1B.
+#
+# To use: cp config/model/minicpm5_1b.toml config/model.toml
+#
+# This is the [model] axis: it owns model architecture, identity,
+# initialization, muP, and MTP — orthogonal to [ref] (backend / source
+# code), [data] (training corpus), [remote] (where to run), [agent]
+# (loop tunables), and [eval] (gates / suites). Switching to a
+# different model size means swapping this file only.
+#
+# Geometry / vocab / kv-channels are taken from the MiniCPM 0.9B
+# from-scratch pretrain baseline (train_0.9b.sh MODEL_ARGS).
+# rotary_base and init_method_std align to that script. The muP triple
+# is kept ON (carried over from 0.5B unchanged) and MTP follows the
+# harness convention.
+
+[model]
+name = "minicpm5_1b"
+
+# Backbone architecture.
+num_layers = 24
+hidden_size = 1536
+ffn_hidden_size = 4608
+num_attention_heads = 16
+num_query_groups = 2
+# Independent head dimension. 1536/16 = 96, but the model uses 128 —
+# this is exactly why head_dim must be an explicit knob (0.5B happened
+# to satisfy hidden//heads == head_dim, hiding the coupling).
+head_dim = 128
+seq_length = 4096
+max_position_embeddings = 4096
+padded_vocab_size = 130560
+rotary_base = 10000
+norm_epsilon = 1e-6
+
+# Initialization (aligned to train_0.9b.sh).
+init_method_std = 0.02
+
+# muP (Maximal Update Parameterization). Kept ON — same triple as 0.5B.
+mup_base_hidden_size = 256
+mup_emb_scale = 12.0
+mup_depth_scale = 1.4
+
+# MTP / Eagle (Multi-Token Prediction). Always on for MiniCPM models.
+mtp_num_layers = 1
+mtp_loss_weight = 0.3

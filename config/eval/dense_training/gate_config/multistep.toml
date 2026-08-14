@@ -1,11 +1,11 @@
 # multistep.toml — bitwise-multicard 单一源(DP=2 多步 bitwise;WS=2 / GBS=40)
-# GBS 统一钉死为 40(全 suite 一致,与 1B 相同):MBS 4 × WS 2 → grad_accum = 40/8 = 5,
-# hash_capture_level=2 下每次尝试的 ref+ours 成本减半。GBS 由 launch 时冻结的
-# ref 产物单点供给(dispatcher 只从 ref 侧读 GBS),dev agent 不可改。
+# GBS 40(非 80):MBS 固定 2(涨到 4 会 OOM),grad_accum = 40/(2×2) = 10。
+# 目的是把 grad_accum 从 20 砍到 10,让 ref+ours 两侧 8 步 bitwise(每 micro-batch
+# 还要写 per-FQN hash,hash_capture_level=2,很重)都能在 timeout_s=1100 内跑完。
 [shared]
 world_size_override        = 2
 num_steps_override         = 8
-micro_batch_size_override  = 4
+micro_batch_size_override  = 2
 global_batch_size_override = 40
 gate_window                = [1, 9]
 

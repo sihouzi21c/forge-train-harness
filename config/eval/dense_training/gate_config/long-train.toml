@@ -1,8 +1,8 @@
-# long-train.toml — long-horizon 主门禁(确定性 OFF;ours MBS=10 + @unset 抹确定性 env 栈)
+# long-train.toml — long-horizon 主门禁(确定性 OFF;ours MBS=4 + @unset 抹确定性 env 栈)
 [shared]
 world_size_override        = 2
 num_steps_override         = 200
-micro_batch_size_override  = 4
+micro_batch_size_override  = 2
 global_batch_size_override = 80
 gate_window                = [101, 201]
 
@@ -31,7 +31,6 @@ deterministic = false                         # → --no-deterministic
 
 [ours]
 deterministic              = false            # → DETERMINISTIC=0
-micro_batch_size_override  = 10               # 覆盖 [shared] 的 4(ours 侧)
+micro_batch_size_override  = 4                # 覆盖 [shared] 的 2(ours 侧)
 cublas_workspace_config          = "@unset"   # 覆盖全局 [env] → 这侧不 export
 nvte_allow_nondeterministic_algo = "@unset"
-cuda_device_max_connections      = "@unset"   # 覆盖全局 [env] → 允许 async H2D + 梯度分桶跨流并行

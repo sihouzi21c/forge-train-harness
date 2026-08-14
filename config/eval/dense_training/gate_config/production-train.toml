@@ -1,32 +1,14 @@
 # production-train.toml — production(ours-only,不起 ref)
-#
-# production 里程碑现为「三段 WSD-SFT pytorchjob」形态(production.md):真正的
-# 长训不再经 bin/harness run 执行,而是 dev agent 用 evals/scripts/
-# launch_production.sh 提交 cctl PyTorchJob(entry = production_train.sh →
-# train_ours_al.sh 三段驱动)。本 gate_config 仍然是**引擎超参的渲染源**:
-# production_train.sh 以 FORGE_GATE=production-train 指向渲染产物
-# workload/src/config/production-train.toml,引擎 runtime_config.load() 从其
-# [cli] 读 model/optim/muP/MTP 形状 —— 所以本文件必须继续渲染,删除即断供。
-# 三段步数/LR 相位表则住在 config/train/wsdsft_05b_prod.toml(生产配方 SSOT),
-# 不在此处。
-#
-# GBS=1280 / MBS=10 是 0.5B 生产全局批(train_pure_mup_mtp.py 默认),
-# 非 bitwise 套件的下采样 GBS=80;grad_accum = 1280/(10·DP) 由拓扑吸收。
 [shared]
 world_size_override        = 2
-num_steps_override         = 10000    # 遗留 dispatcher 路径的形状;pytorchjob 形态不消费
-micro_batch_size_override  = 10
-global_batch_size_override = 1280
+num_steps_override         = 10000
+micro_batch_size_override  = 4
+global_batch_size_override = 1024
 seed_override              = 1234     # = 全局默认,ours-only 显式留存
 seq_length_override        = 4096     # 覆盖 model.toml 基线(若不同)
 
 [shared.gate]
 forge_init_ones = 1
-# 分段续训值(run_ours_production.sh / verdicts.production 共同消费):
-# num_steps 均分为 4 段,每段结束存一个 step_<N> checkpoint;每段 wall-clock
-# 上限 24h(sh 内 timeout 施加,registry timeout_s=4×86400 是整个 sh 的兜底)。
-production_save_segments      = 4
-production_segment_timeout_s  = 86400
 
 [ours]
 # ours-only:无 [ref] 段;deterministic 用默认(ON),如需关再显式声明

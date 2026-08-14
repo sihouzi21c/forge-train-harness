@@ -1,1 +1,55 @@
-/Users/sunhj/Downloads/hjsun/ForgeInference/.artifacts/forge_train/77459cccb4da/config/agent.toml
+# Agent profile: Claude Code CLI routed through the llm-center proxy to
+# GLM-5.2 (智谱 GLM5.2), instead of the official Anthropic account.
+#
+# To use: cp config/agent/claudecode-llmcenter.toml config/agent.toml
+#         then paste your proxy key into [agent].api_key below.
+#
+# How the override stays loop-local (never global):
+#   `base_url` is exported as ANTHROPIC_BASE_URL and `api_key` as
+#   ANTHROPIC_API_KEY *inside agent-loop.sh's own process only* (see
+#   agent-loop.sh, just after the --api-key block). They live in this one
+#   tmux pane's process tree — the dev/review/stage2 children inherit them,
+#   but every other shell, tmux session, the Claude Code desktop app, and
+#   any future `claude` invocation see no env and keep using your logged-in
+#   claude.ai OAuth subscription. Nothing is written to ~/.zshrc or
+#   ~/.claude.json (the only trace is a harmless `customApiKeyResponses`
+#   approval entry that just suppresses the "use this API key?" prompt).
+#
+# `model = "GLM_5tjygf[1m]"` is the llm-center slug for GLM-5.2 with the
+# `[1m]` 1M-context suffix. The Claude Code CLI parses `[1m]` client-side:
+# it sets the local context window to 1,000,000 tokens (this is what drives
+# compaction) and forwards only the BARE `GLM_5tjygf` to the proxy — so the
+# request routes to glm-5.2 and never triggers the 500 "模型不存在" that a
+# raw `GLM_5tjygf[1m]` API model field returns (the suffix is stripped
+# before egress and never reaches the proxy). Verified end-to-end:
+# `claude -p --model GLM_5tjygf[1m]` returns modelUsage.contextWindow =
+# 1000000 with a normal 200 response. Drop `[1m]` to run at the 200K
+# window. The claude-code backend forwards `--model GLM_5tjygf[1m]`
+# verbatim to the CLI (web/agents/backends.py::_build_claude_command).
+#
+# `effort` is left empty: GLM tolerates the Claude effort beta header
+# (request still 200s) but does not act on it, so pinning a level is a
+# no-op. Switch back to the official account with `claudecode-default.toml`
+# (Opus 4.8 + high), which is the default profile.
+
+[agent]
+backend  = "claude-code"
+model    = "deepseek-v4-flash-0731-tencent[1m]"
+effort   = ""
+base_url = "https://llm-center.modelbest.co/llm"
+# Paste your llm-center key here in the per-loop config (gitignored).
+# Leave empty in any committed copy — never commit a real `sk-...` key.
+api_key  = "sk-1f5d3b7e9434756299782932bf8882e5"
+runs_per_stage = 0
+poll_seconds = 5
+agent_round_tries = 8
+retry_base_sleep = 4
+retry_continue_prompt = "Transient agent CLI / network disconnect. Continue exactly where you left off; do not restart the whole iteration from scratch."
+state_dir = ".artifacts/agent-loop-state"
+max_consecutive_review_fails = 3
+# Per-command wall-clock cap (claude-code only). Every Bash command the
+# CLI runs is wrapped in `timeout <cmd_timeout>` via a fake-$SHELL shim
+# (web/agents/timeout_shell), group-killing runaway background poll-loops
+# that would otherwise keep `claude -p` alive past its turn result. Any
+# coreutils DURATION ("40m", "1h", "3600s"); empty disables the cap.
+cmd_timeout = "40m"
