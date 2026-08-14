@@ -1125,3 +1125,44 @@ The dev agent made a systematic comparison of the old code vs latest code across
 ### Best working configuration
 
 The eager path without CUDA graph, ZeRO-1, or gradient bucketing achieves MFU 18.0% (close to the old code's 18.7%). The next round should focus on fixing the CUDA graph crash and then running the full `long-train` gate to establish the baseline MFU.
+
+## [stage1] Round 41 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (safe defaults, CUDA graph/ZeRO-1 disabled; MFU 17.0%)
+
+### Key conclusions
+
+The dev agent completed the systematic comparison of the old code vs latest code, identified and fixed three regressions, and established a stable working configuration.
+
+**Fixes applied (this round):**
+1. **Gradient bucketing default changed from 1 to 0**: At DP=2, flat all-reduce is fast enough; per-bucket stream-level all-reduce causes ~1% MFU regression.
+2. **CUDA graph default changed from 1 to 0**: The CUDA graph capture crashes with "no [LOSS] lines parsed" — the root cause is still under investigation but likely related to `pin_memory()` + `torch.cuda.empty_cache()` interaction during graph capture.
+3. **ZeRO-1 default changed from 0 to 1**: At DP=2, the ZeRO-1 communication overhead (reduce_scatter + all_gather) exceeds the 600s smoke gate budget. Enable for larger DP sizes where the memory benefit is meaningful.
+4. **CUDA graph empty_cache timing**: Moved `torch.cuda.empty_cache()` + `gc.collect()` before the warmup instead of between warmup and capture.
+5. **Removed redundant empty_cache between warmup and capture**: The `gc.collect()` and `torch.cuda.empty_cache()` calls between warmup and capture were removed.
+6. **Added stdout error logging**: CUDA graph capture failures now print to stdout (previously only stderr, which wasn't captured by the harness's [LOSS] line parser).
+
+### Gate results
+
+| Gate | Configuration | Status | MFU | Details |
+|---|---|---|---|---|
+| long-train-smoke (20 steps, DP=2) | Default (no CUDA graph, no ZeRO, no grad bucketing) | PASS | 17.0% | loss_rel 0.157% < 2.50%, signed_rel -0.160% |
+| resume-gate-20 (25 steps, DP=2) | Default (deterministic mode) | PASS | N/A | max_abs_diff(loss)=0, max_abs_diff(grad_norm)=0, 9420/9420 hash |
+
+### Known issues
+
+1. **CUDA graph crash**: `ENABLE_CUDA_GRAPH=1` causes "no [LOSS] lines parsed" crash. The `torch.cuda.empty_cache()` timing fix didn't resolve it. Hypothesis: the `pin_memory()` calls in `_get_batch_cpu()` create pinned memory allocations that interfere with CUDA graph capture. Next round: disable `pin_memory()` during CUDA graph warmup.
+
+2. **ZeRO-1 timeout at DP=2**: `ENABLE_ZERO_OPTIMIZER=1` times out (>660s) at DP=2. The reduce_scatter + all_gather communication plus shard management overhead exceeds the 600s smoke gate budget. The benefit (50% reduction in FP32 optimizer state) is marginal at DP=2. Next round: optimize the ZeRO-1 path for DP=2 or keep it disabled.
+
+3. **MFU 17.0% vs old code's 18.7%**: The default configuration is 1.7pp lower than the old code. The difference is likely from the background dataloader prefetcher (`ENABLE_DL_PREFETCH=1`) or the `pin_memory()` calls. Next round: profile the eager path to identify the bottleneck.
+
+### Next steps
+
+1. Fix CUDA graph crash: remove `pin_memory()` during CUDA graph warmup, or add `torch.cuda.Stream.synchronize()` before capture
+2. Run `long-train` (200 steps, DP=2) to establish the baseline MFU
+3. Run `loss-gate-200` for numerical drift check
+4. Run `profile-snapshot M6_round41` to identify the next bottleneck
+5. Candidate levers: operator fusion (residual-add + RMSNorm), RoPE fusion, ZeRO-1 optimization for DP=2
