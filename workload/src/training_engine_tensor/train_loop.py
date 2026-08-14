@@ -297,7 +297,14 @@ class _BackgroundPrefetcher:
     the results in a bounded ``deque``.  The main thread calls ``get()`` to
     retrieve the next batch without blocking on the dataloader's shard refill
     (which can take seconds on the first call).  The queue depth is controlled
-    by ``max_size`` (default 2 — one currently in use, one prefetched).
+    by ``max_size`` (default 4 — enough headroom to absorb dataloader latency
+    across 10-microbatch steps).
+
+    The ``get()`` method notifies the background thread after popping a batch,
+    so the producer resumes immediately instead of waiting for the 0.1s poll
+    interval.  Without this notification the background thread is idle for
+    100ms after each batch consumption, which directly causes GPU idle
+    (~630ms/step from ``pthread_cond_wait`` in the profiler).
 
     The background thread is started by ``start()`` and must be stopped by
     ``stop()`` during teardown to avoid a dangling thread.
@@ -307,7 +314,7 @@ class _BackgroundPrefetcher:
     (``non_blocking=True`` copies) hides the GPU-side H2D transfer latency.
     """
 
-    def __init__(self, dl, max_size: int = 2):
+    def __init__(self, dl, max_size: int = 4):
         self._dl = dl
         self._queue: deque = deque()
         self._max_size = max_size
@@ -329,7 +336,15 @@ class _BackgroundPrefetcher:
         with self._not_empty:
             while len(self._queue) == 0:
                 self._not_empty.wait()
-            return self._queue.popleft()
+            result = self._queue.popleft()
+            # Notify the background thread that the queue has room, so it
+            # can start the next _next_batch call immediately instead of
+            # waiting for the 0.1s timeout.  Without this notification the
+            # background thread is idle for 100ms after each batch
+            # consumption, which directly causes GPU idle (~630ms/step
+            # from pthread_cond_wait in the profiler).
+            self._not_empty.notify()
+            return result
 
     def _run(self):
         while True:
