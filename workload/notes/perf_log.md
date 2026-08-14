@@ -1405,3 +1405,50 @@ The dev agent attempted to run the `long-train-smoke` gate with the Triton wgrad
 - Candidate levers for subsequent rounds:
   - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
   - CUDA graph for optimizer step (if memory allows after normed/normed2 removal)
+- review R46 PASS: docs-only commit, no proxy; cluster slow to schedule BATCH jobs, continue next round
+
+## [stage1] Round 46 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2 baseline: CUDA graph @ 18.3% MFU; Triton wgrad disabled — slower than cuBLAS)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The devspace (ds-720930) was killed. Recovered by creating a new devspace (721480) via `cctl devspace create`, updating SSH config, rsyncing workspace, and re-pointing the lease. The `--cuda-graph-trace=node` flag was added to the nsys wrapper in `launch_dp.py` for proper GPU kernel profiling inside CUDA graphs.
+
+**Triton wgrad GEMM benchmark**: Confirmed the Triton wgrad kernel is ~6% slower than cuBLAS TF32 for the [130560, 2048] × [4096, 2048] output weight wgrad shape. MFU drops from 18.3% to 17.3% with ENABLE_TRITON_WGRAD=1. Disabled by default (ENABLE_TRITON_WGRAD=0). The `_foreach_copy_` bf16 sync optimization is retained.
+
+**Profile snapshot (long-horizon_round47)**:
+- Step time: 7221ms, MFU: 18.21%
+- GPU kernel time: 6028ms (83.5%), GPU idle: 1193ms (16.5%)
+- Top categories: elementwise/copy 49%, flash attention 17%, cuBLAS GEMM 14%
+- Top kernels: flash_bwd (680ms, 11.3%), direct_copy_kernel (604ms, 10.0%), BinaryFunc (593ms, 9.8%)
+- With `--cuda-graph-trace=node`, individual GPU kernels inside the CUDA graph are now visible
+
+### Gate results (long-train-smoke, DP=2, 20 steps, ENABLE_TRITON_WGRAD=0)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| loss_rel(point) | 0.107% | < 2.50% ✅ |
+| signed_rel | +0.0201% | no drift ✅ |
+| MFU(standard) | 18.3% | — |
+| pointwise_mean_rel | 0.107% | — |
+| loss_pass | True | — |
+
+### Profile analysis
+
+The GPU idle time (1193ms, 16.5%) is primarily from the NCCL all-reduce. The elementwise/copy operations (49% of GPU kernel time) are the dominant GPU kernel category, driven by the `.float()` / `.bfloat16()` conversions required by the FP32 precision specification (constraint.md §9 operations).
+
+The `direct_copy_kernel` (604ms, 41984 instances) and `bfloat16_copy` (266ms, 49126 instances) are the top copy kernels. With the `_foreach_copy_` optimization already in place, the remaining copy operations are from the forward/backward intermediate tensor conversions.
+
+### Next steps
+
+1. Run `resume-gate-20` regression to verify the current state doesn't break save/load.
+2. Run `profile-snapshot` with `--cuda-graph-trace=node` for any future perf hot path changes.
+3. Candidate levers for subsequent rounds:
+   - **Operator fusion**: Fused RMSNorm backward + residual-add (Triton kernel) to reduce `.float()` conversions
+   - **NCCL overlap**: Gradient bucketing with async NCCL (ENABLE_GRAD_BUCKETING=1) to reduce GPU idle time
+   - **ZeRO-1**: For larger DP sizes, sharding optimizer state saves communication volume
+- review R47 PASS:

@@ -48,6 +48,7 @@ def _rank0_nsys_cmd(child_args: list[str]) -> list[str] | None:
         "profile",
         "-t",
         "cuda,osrt",
+        "--cuda-graph-trace=node",
         "--output=" + output,
         "--force-overwrite=true",
         sys.executable,

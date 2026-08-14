@@ -1,0 +1,115 @@
+{
+  "cuda_api_per_step_ms": 0.039,
+  "gpu_idle_per_step_ms": 7200.044,
+  "gpu_kernel_per_step_ms": 0,
+  "gpu_memop_per_step_ms": 0,
+  "memops": [],
+  "mfu_e2e_standard": 18.2613,
+  "os_runtime_per_step_ms": 87296.168,
+  "profiled_steps": 12,
+  "run_meta": {
+    "grad_accum_steps": 10,
+    "micro_batch_size": 4,
+    "nsys_rep_path": "/user/sunhaojun/.forge_train/77459cccb4da/.artifacts/runs/profile-snapshot-20260814-055257-cf91eb/ours/profile.nsys-rep",
+    "out_label": "long-horizon_round46",
+    "seq_length": 4096,
+    "suite": "profile-snapshot",
+    "world_size": 2
+  },
+  "step_time_ms": 7200.044,
+  "top_api": [
+    {
+      "calls": 2,
+      "name": "cudaGetDeviceProperties_v2_v12000",
+      "pct": 79.4,
+      "per_step_ms": 0.031
+    },
+    {
+      "calls": 419,
+      "name": "cuGetProcAddress_v2",
+      "pct": 18.3,
+      "per_step_ms": 0.007
+    },
+    {
+      "calls": 32,
+      "name": "cudaGetDriverEntryPoint_v11030",
+      "pct": 1.5,
+      "per_step_ms": 0.001
+    },
+    {
+      "calls": 2,
+      "name": "cuModuleGetLoadingMode",
+      "pct": 0.4,
+      "per_step_ms": 0.0
+    },
+    {
+      "calls": 1,
+      "name": "cuInit",
+      "pct": 0.4,
+      "per_step_ms": 0.0
+    }
+  ],
+  "top_kernels": [],
+  "top_osrt": [
+    {
+      "calls": 2064,
+      "name": "poll",
+      "pct": 38.9,
+      "per_step_ms": 33930.093
+    },
+    {
+      "calls": 1724,
+      "name": "pthread_cond_timedwait",
+      "pct": 19.6,
+      "per_step_ms": 17072.681
+    },
+    {
+      "calls": 833,
+      "name": "sem_clockwait",
+      "pct": 16.5,
+      "per_step_ms": 14365.758
+    },
+    {
+      "calls": 228,
+      "name": "pthread_cond_wait",
+      "pct": 12.5,
+      "per_step_ms": 10913.237
+    },
+    {
+      "calls": 526,
+      "name": "epoll_wait",
+      "pct": 10.1,
+      "per_step_ms": 8802.874
+    },
+    {
+      "calls": 27187,
+      "name": "ioctl",
+      "pct": 0.6,
+      "per_step_ms": 530.855
+    },
+    {
+      "calls": 10,
+      "name": "sem_wait",
+      "pct": 0.4,
+      "per_step_ms": 338.405
+    },
+    {
+      "calls": 3713,
+      "name": "read",
+      "pct": 0.3,
+      "per_step_ms": 278.621
+    },
+    {
+      "calls": 30,
+      "name": "pthread_rwlock_wrlock",
+      "pct": 0.3,
+      "per_step_ms": 223.692
+    },
+    {
+      "calls": 285,
+      "name": "nanosleep",
+      "pct": 0.3,
+      "per_step_ms": 221.527
+    }
+  ]
+}

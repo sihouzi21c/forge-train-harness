@@ -30,12 +30,15 @@ from training_engine_tensor.config import (
 
 # Try to import the Triton wgrad kernel for the output weight.
 # Falls back to cuBLAS when Triton is not available (e.g. on Mac).
+# NOTE: Triton wgrad is slower than cuBLAS TF32 for the current shape
+# (V=130560, H=2048, B*S=4096).  Disabled by default.  Set
+# ENABLE_TRITON_WGRAD=1 to re-enable for benchmarking new tilings.
 _USE_TRITON_WGRAD = False
 _HAS_TRITON = False
 try:
     from training_engine_tensor.triton_kernels import wgrad_output as _wgrad_output
     _HAS_TRITON = True
-    _USE_TRITON_WGRAD = _HAS_TRITON and int(__import__('os').environ.get('ENABLE_TRITON_WGRAD', '1'))
+    _USE_TRITON_WGRAD = _HAS_TRITON and int(__import__('os').environ.get('ENABLE_TRITON_WGRAD', '0'))
 except (ImportError, ModuleNotFoundError, AttributeError):
     pass
 

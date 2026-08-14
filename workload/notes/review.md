@@ -129,8 +129,19 @@ The commit adds a genuine Triton wgrad kernel (`triton_kernels.py:49-158`) for t
 ### Key conclusions
 This commit is documentation-only — only `workload/notes/perf_log.md` and `workload/notes/review.md` were modified from the previous round. No engine code was changed, no gate thresholds were tampered with, and no remote config was edited. The Triton wgrad kernel and `_foreach_copy_` bf16 sync were implemented in the prior commit (1f57a49) and remain genuine in-process implementations. Remote cluster GPU resources (`paratera_shandong/faxin`) were occupied by another user's devspace, so 2-GPU gates (long-train, resume-gate-20, perf-bitwise) could not be run this round. Anti-proxy guard passes cleanly. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message and no green gate evidence for the four required suites.
 
+---
+
+## [stage1] Round 46 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 2df3932 — Docs: record Round 45 — Triton wgrad GEMM test attempt; cluster slow to schedule BATCH jobs
+
+### Key conclusions
+This round is a docs-only commit (only `workload/notes/perf_log.md` changed). The dev agent attempted to run the `long-train-smoke` gate on the remote cluster with the Triton wgrad GEMM and `_foreach_copy_` bf16 sync optimizations (implemented in Round 44), but the cluster (paratera_shandong, faxin pool) was slow to schedule BATCH jobs. No proxy, forgery, or hardcoded metrics detected. The commit does not declare `STAGE_STATUS: finished`, so the stage remains in-progress.
+
 ### Evidence highlights
-- `git diff HEAD~1 HEAD` — only `workload/notes/perf_log.md` and `workload/notes/review.md` changed
+- `git diff HEAD~1 HEAD` — only `workload/notes/perf_log.md` changed
 - `bin/harness run anti-proxy`: PASS (0 violations)
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 - `python3 tools/mfu_elastic_check.py`: `MFU_GATE_VERDICT: FAIL — BELOW_BAND`, no milestone override
