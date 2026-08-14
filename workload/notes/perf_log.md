@@ -2212,3 +2212,69 @@ The dev agent implemented a gradient norm optimization: replacing `torch._foreac
   2. **Residual-add + RMSNorm fusion** — small kernel count reduction
   3. **Optimizer step CUDA graph** — capture optimizer step into the graph (estimated ~15ms savings)
 - review R60 PASS: flat tensor grad norm genuine, no proxy; stage in-progress — missing resume-startup-90/perf-bitwise/profile
+
+## [stage1] Round 61 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (flat bf16 sync, profile-snapshot fixed)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented the flat bf16 sync optimization and fixed the profile-snapshot gate:
+
+1. **Flat bf16 sync (`_sync_bf16_from_fp32`)**:
+   - Replaced 157 per-param `bfloat16()` calls with `_flatten_dense_tensors` + single `bfloat16()` + `_unflatten_dense_tensors`.
+   - The CE optimization (Round 57) freed ~21 GiB of logits memory, reducing the CUDA graph's private pools from ~20.96 GiB to ~11 GiB, making the flat 4.1 GiB contiguous allocation viable.
+   - Falls back to per-param approach if the flat allocation fails (fragmentation edge case).
+   - Saves ~1.25ms of launch overhead per step (negligible MFU impact).
+
+2. **Profile-snapshot fixed**:
+   - Added Triton fusion flags to `eval_profile_snapshot.py` so the profile captures the actual long-horizon kernel path (not the PyTorch-only path).
+   - Guarded post-warmup `torch.cuda.empty_cache()` with `try/except RuntimeError` to handle the `captures_underway.empty()` PyTorch assertion failure.
+   - Profile now works with the actual Triton kernel set.
+
+### Profile results (long-horizon_round61 vs round59)
+
+| Metric | Round 59 | Round 61 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 7556 | 4687 | **-2869ms** |
+| MFU (nsys) | 17.4% | 28.1% | **+10.7pp** |
+| GPU kernel (ms) | 5258 | 2868 | **-2390ms** |
+| GPU idle (ms) | 2298 | 1819 | **-479ms** |
+| CUDA API (ms) | 5234 | 3196 | **-2038ms** |
+| BinaryFunc (ms) | 608 | 86 | **-522ms** |
+| direct_copy_kernel (ms) | 436 | 109 | **-327ms** |
+| bfloat16_copy (ms) | 274 | 0 | **-274ms** |
+
+### Top GPU kernels (round 61)
+
+| Kernel | Time (ms) | % |
+|--------|-----------|---|
+| flash_bwd | 547 | 19.1% |
+| flash_fwd | 273 | 9.5% |
+| cuBLAS GEMMs (total) | 872 | 30.4% |
+| direct_copy_kernel | 109 | 3.8% |
+| elementwise_kernel | 90 | 3.2% |
+| BinaryFunc | 86 | 3.0% |
+| _rope_kernel | 82 | 2.9% |
+| SoftMaxForward | 73 | 2.5% |
+| _ce_bwd_kernel | 62 | 2.2% |
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: `loss_rel 0.108% < 2.50%` PASS; `signed_rel +0.0417%` (no drift); MFU **28.1%** (up from 27.9% in Round 59).
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **profile-snapshot (long-horizon_round61)**: step_time 4687ms, MFU 28.05%.
+
+### Next steps
+
+- The remaining bottlenecks are:
+  1. **Flash attention**: 820ms (28.6% of GPU kernel time) — flash_attn library, no room for optimization.
+  2. **cuBLAS GEMM**: 872ms (30.4% of GPU kernel time) — cuBLAS library, no room for optimization.
+  3. **GPU idle**: 1819ms (38.8% of step time) — CPU overhead from H2D copy submission, logging, timing.
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute)
+  2. **Residual-add + RMSNorm fusion** — small kernel count reduction
+  3. **H2D copy batching** — reduce CPU overhead by concatenating input tensors before H2D copy
