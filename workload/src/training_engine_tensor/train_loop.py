@@ -1736,87 +1736,15 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             if rank == 0:
                 print("[debug] CUDA graph captured successfully", file=sys.stderr, flush=True)
 
-            # ── Optimizer step CUDA graph capture ──────────────────────────
-            # Capturing the AdamW + BF16 sync as a separate CUDA graph
-            # eliminates the per-kernel launch overhead for the optimizer step
-            # (~472 kernel launches → 0 after capture, saving ~15.8ms/step).
-            # The gradient norm/clipping remains outside the graph (has a
-            # conditional), so only the unconditional AdamW step + BF16 sync
-            # are captured.
-            try:
-                # Save the optimizer state before warmup so we can restore
-                # after capture.  The save is ~6 GB (fp32_master + exp_avgs +
-                # exp_avg_sqs), which is ~8% of HBM and is freed immediately
-                # after capture.
-                _saved_fp32 = [p.clone() for p in fp32_master]
-                _saved_avgs = [exp_avgs[p.data_ptr()].clone() for p in fp32_master]
-                _saved_sqrs = [exp_avg_sqs[p.data_ptr()].clone() for p in fp32_master]
-                _saved_stps = [opt_state_steps[p.data_ptr()].clone() for p in fp32_master]
-
-                # Set .grad on fp32_master (required for _fused_adamw_).
-                for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
-                    p_fp32.grad = buf
-
-                # Warmup: run the optimizer step once (modifies state).
-                _adamw_step(
-                    optim_groups, fp32_master,
-                    exp_avgs, exp_avg_sqs, opt_state_steps,
-                    beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
-                )
-                _sync_bf16_from_fp32(bf16_params, fp32_master)
-                torch.cuda.synchronize()
-
-                # Restore the saved state.
-                for p_fp32, saved in zip(fp32_master, _saved_fp32):
-                    p_fp32.copy_(saved)
-                for p_fp32, saved in zip(fp32_master, _saved_avgs):
-                    exp_avgs[p_fp32.data_ptr()].copy_(saved)
-                for p_fp32, saved in zip(fp32_master, _saved_sqrs):
-                    exp_avg_sqs[p_fp32.data_ptr()].copy_(saved)
-                for p_fp32, saved in zip(fp32_master, _saved_stps):
-                    opt_state_steps[p_fp32.data_ptr()].copy_(saved)
-                _sync_bf16_from_fp32(bf16_params, fp32_master)
-                torch._foreach_zero_(fp32_grad_bufs)
-                # CRITICAL: synchronize before optimizer graph capture.  The
-                # copy_ and _foreach_zero_ operations above are async CUDA
-                # kernel launches.  Without sync, pending kernels may be
-                # captured as part of the optimizer CUDA graph, corrupting it.
-                torch.cuda.synchronize()
-
-                # Capture the optimizer step (AdamW + BF16 sync).
-                _opt_cuda_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(_opt_cuda_graph):
-                    _adamw_step(
-                        optim_groups, fp32_master,
-                        exp_avgs, exp_avg_sqs, opt_state_steps,
-                        beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
-                    )
-                    _sync_bf16_from_fp32(bf16_params, fp32_master)
-
-                # Restore the saved state again (the capture also modified it).
-                for p_fp32, saved in zip(fp32_master, _saved_fp32):
-                    p_fp32.copy_(saved)
-                for p_fp32, saved in zip(fp32_master, _saved_avgs):
-                    exp_avgs[p_fp32.data_ptr()].copy_(saved)
-                for p_fp32, saved in zip(fp32_master, _saved_sqrs):
-                    exp_avg_sqs[p_fp32.data_ptr()].copy_(saved)
-                for p_fp32, saved in zip(fp32_master, _saved_stps):
-                    opt_state_steps[p_fp32.data_ptr()].copy_(saved)
-                _sync_bf16_from_fp32(bf16_params, fp32_master)
-                torch._foreach_zero_(fp32_grad_bufs)
-
-                # Free saved state to reclaim ~6 GB HBM.
-                del _saved_fp32, _saved_avgs, _saved_sqrs, _saved_stps
-
-                if rank == 0:
-                    print("[debug] Optimizer CUDA graph captured successfully",
-                          file=sys.stderr, flush=True)
-            except Exception as e:
-                if rank == 0:
-                    print(f"[debug] Optimizer CUDA graph capture failed: {e}",
-                          file=sys.stderr, flush=True)
-                    print(f"[debug] Optimizer CUDA graph capture failed: {e}", flush=True)
-                _opt_cuda_graph = None
+            # NOTE: Optimizer step CUDA graph capture is intentionally skipped.
+            # The forward+backward graph's private pools (~20.96 GiB) consume
+            # most of the 79.32 GiB HBM, leaving only ~25 MiB free.  The
+            # optimizer graph capture would need ~6 GB of temporary state
+            # (_saved_fp32, etc.) for the save/restore cycle, which would OOM
+            # and corrupt NCCL state.  The optimizer graph only saves ~15.8ms/step
+            # (vs ~3814ms from the forward+backward graph), so the risk is not
+            # worth the benefit.  The imperative _adamw_step + _sync_bf16_from_fp32
+            # path is used instead.
 
         except Exception as e:
             if rank == 0:
