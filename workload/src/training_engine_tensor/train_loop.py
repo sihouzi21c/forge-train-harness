@@ -1176,34 +1176,36 @@ def _sync_bf16_from_fp32(
     bf16_params: list[torch.Tensor],
     fp32_master: list[torch.Tensor],
 ) -> None:
-    """Copy FP32 master weights back to BF16 params using batched operations.
+    """Copy FP32 master weights back to BF16 params using a flat fused approach.
 
-    Uses ``torch._foreach_copy_`` to batch the per-parameter copy into a
-    single fused kernel launch, reducing the number of kernel launches from
-    157 (one per param) to 1.  The per-parameter ``bfloat16()`` conversions
-    are still 157 separate kernel launches, but the copy step is fused.
+    Flattens all FP32 master weights into one contiguous tensor, does a single
+    ``bfloat16()`` conversion, then copies back to the per-parameter BF16
+    buffers.  This reduces the 157 separate ``bfloat16()`` kernel launches
+    (one per param) to a single fused kernel launch, saving ~1.25ms of launch
+    overhead per step.
 
-    The per-parameter ``bfloat16()`` approach limits each temporary allocation
-    to the largest parameter's bf16 size (e.g. 534 MB for the 130560×2048
-    output weight), which fits in the memory squeezed by the CUDA graph's
-    private pools.  The flat ``_flatten_dense_tensors`` + ``bfloat16()``
-    approach would need a 2.08 GiB contiguous allocation, which can OOM.
-
-    The launch overhead is 157 × ~8us = 1.25ms for the bf16 conversions plus
-    1 × ~8us for the fused copy, totaling ~1.26ms.  Without the fused copy,
-    the overhead is 157 × ~8us = 1.25ms for the bf16 conversions plus
-    157 × ~8us = 1.25ms for the copies, totaling ~2.5ms.
+    The flat approach needs 4.1 GiB of contiguous memory for the flattened
+    fp32 + 2.08 GiB for the bf16 copy = 6.18 GiB total.  With the CE
+    optimization (Round 57) freeing ~21 GiB of logits memory, the CUDA graph's
+    private pools are now ~11 GiB (down from ~20.96 GiB in Round 25), leaving
+    enough contiguous memory for the flat allocation.  Fall back to the
+    per-parameter approach if the flat allocation fails (fragmentation).
     """
-    # Convert each FP32 master to bf16 (per-parameter to limit contiguous
-    # allocation, avoiding OOM when CUDA graph private pools are active).
-    bf16_views = [p.bfloat16() for p in fp32_master]
-    # Fused copy: single kernel launch for all 157 params.
-    # _foreach_copy_ is available in PyTorch 2.1+, fallback to per-param loop.
+    # Flatten all FP32 master weights into one contiguous tensor.
     try:
-        torch._foreach_copy_(bf16_params, bf16_views)
-    except (AttributeError, RuntimeError, TypeError):
-        for p_bf16, bf16_view in zip(bf16_params, bf16_views):
-            p_bf16.data.copy_(bf16_view)
+        flat_fp32 = torch._utils._flatten_dense_tensors(fp32_master)
+        flat_bf16 = flat_fp32.bfloat16()
+        unflattened = torch._utils._unflatten_dense_tensors(flat_bf16, bf16_params)
+        # Fused copy: single kernel launch for all 157 params.
+        torch._foreach_copy_(bf16_params, unflattened)
+    except (RuntimeError, MemoryError, AttributeError):
+        # Fallback to per-parameter approach (OOM from fragmentation).
+        bf16_views = [p.bfloat16() for p in fp32_master]
+        try:
+            torch._foreach_copy_(bf16_params, bf16_views)
+        except (AttributeError, RuntimeError, TypeError):
+            for p_bf16, bf16_view in zip(bf16_params, bf16_views):
+                p_bf16.data.copy_(bf16_view)
 
 
 def _init_optimizer_state(
@@ -1754,15 +1756,21 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         # The warmup forward+backward allocates ~24 GB of activation memory
         # in the ForwardCache.  The CUDA graph capture needs additional
         # memory for the captured operations, so we must free the cache first.
-        # (empty_cache/gc.collect already done before warmup.)
+        # (empty_cache/gc.collect already done before warmup at lines 1691-1693.)
         del _fw_cache
 
         # Free the warmup's cached CUDA memory before graph capture.
-        # The warmup allocates tensors that stay in the CUDA allocator's
-        # cache even after del _fw_cache.  Without this, the graph capture's
-        # private pools may OOM (total memory + graph private pools > 80 GB).
+        # The warmup allocates tensors that stay in the CUDA allocator's cache
+        # even after del _fw_cache.  Without this, the graph capture's private
+        # pools may OOM (total memory + graph private pools > 80 GB).
+        # Use try-except to handle the PyTorch captures_underway.empty()
+        # assertion failure that can occur in certain PyTorch versions.
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError:
+            pass  # PyTorch internal assertion failure — ignore; the cache
+                  # will be freed naturally by the next allocation.
         gc.collect()
 
         # Zero the grad bufs after warmup (the warmup accumulated gradients).
@@ -1852,6 +1860,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 print(f"[debug] CUDA graph capture failed ({_free_on_fail/(1024**3):.1f} GiB free), falling back to eager: {e}",
                       file=sys.stderr, flush=True)
                 print(f"[debug] CUDA graph capture failed, falling back to eager: {e}", flush=True)
+            # Free the partially-captured graph reference.  The private pools
+            # are freed when the CUDAGraph object is garbage-collected (__del__).
+            # Do NOT call gc.collect() or torch.cuda.empty_cache() here — they
+            # can trigger the captures_underway.empty() assertion failure in the
+            # CUDA allocator when the allocator state is inconsistent after a
+            # failed cross-rank graph capture.
             cuda_graph = None
             use_cuda_graph = False
 

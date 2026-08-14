@@ -38,6 +38,16 @@ def main() -> None:
     micro_batch_size = int(_require("MICRO_BATCH_SIZE"))
     world_size = int(_require("WORLD_SIZE"))
     backend = _require("BACKEND")
+    # Enable the fused Triton kernels for long-horizon profiling (same as
+    # eval_long_train.py).  These are gated by deterministic=False, so
+    # bitwise gates always use the PyTorch paths.
+    os.environ.setdefault("ENABLE_TRITON_RMSNORM_BWD", "1")
+    os.environ.setdefault("ENABLE_TRITON_SWIGLU_BWD", "1")
+    os.environ.setdefault("ENABLE_TRITON_SWIGLU_FWD", "1")
+    os.environ.setdefault("ENABLE_TRITON_RMSNORM_FWD", "1")
+    os.environ.setdefault("ENABLE_TRITON_CE_BWD", "1")
+    os.environ.setdefault("ENABLE_TRITON_ROPE_FWD", "1")
+    os.environ.setdefault("ENABLE_TRITON_ROPE_BWD", "1")
     config = TrainLoopConfig(
         num_steps=int(_require("NUM_STEPS")),
         micro_batch_size=micro_batch_size,
