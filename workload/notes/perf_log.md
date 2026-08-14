@@ -1632,3 +1632,4 @@ The profile snapshot (with nsys overhead) shows essentially unchanged GPU kernel
   1. **Fused forward SwiGLU** — saves the forward intermediate recomputation copies
   2. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2)
   3. **Gradient all-reduce optimization** — fuse the 3 loss scalars + grad norm into a single all-reduce
+- review R50 PASS: long-horizon PASS rejected — achieved throughput insufficient, continue MFU optimization

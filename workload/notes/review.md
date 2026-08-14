@@ -405,3 +405,21 @@ The dev agent implemented a fused Triton RMSNorm backward kernel (`triton_kernel
 - `eval_long_train.py:79` — sets `ENABLE_TRITON_RMSNORM_BWD=1` for long-horizon gates only
 
 ---
+
+## [stage1] Round 50 — 2026-08-14 18:46:48
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: eb04c99 — Perf: fuse SwiGLU backward via Triton kernel — reduce 27×3 float() copies to 1, MFU +2.1pp
+
+### Key conclusions
+The dev agent implemented a fused Triton SwiGLU backward kernel (`_swiglu_bwd_kernel` at `triton_kernels.py:365`) that fuses 3×.float() copies + silu + sigmoid + 6 element-wise operations into a single Triton kernel per (B, S) row, reading bf16 inputs and computing in fp32. The forward kernel `_swiglu_fwd_kernel` (`triton_kernels.py:279`) is also added for future use. The `silu_swiglu_intermediate_backward` at `backward.py:202` was extended to accept an optional `gate_up` parameter; when `ENABLE_TRITON_SWIGLU_BWD=1` and `deterministic=False`, it routes to the fused kernel instead of the PyTorch closed-form. The engine is genuinely implementing the backward pass in-process — no proxy, no shell-out to ref, no hardcoded synthetic metrics. Stage 1 remains in-progress because the commit message does not declare `STAGE_STATUS: finished`, and the review-side throughput bar (long-horizon milestone check) has not been met.
+
+### Evidence highlights
+- `_swiglu_bwd_kernel` at `triton_kernels.py:365` — genuine `@triton.jit` kernel computing sigmoid, silu, dsilu in fp32
+- `swiglu_backward_fused` at `triton_kernels.py:426` — wraps the Triton kernel with PyTorch interface, returns bf16 d_gate_up
+- `silu_swiglu_intermediate_backward` at `backward.py:202` — conditional routing to fused kernel or PyTorch closed-form
+- `eval_long_train.py:83` — sets `ENABLE_TRITON_SWIGLU_BWD=1` for long-horizon gates only
+- `train_loop.py:768,935` — passes `gate_up` and `ffn_half` to the backward function at both call sites
+
+---
