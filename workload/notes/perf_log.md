@@ -1499,3 +1499,16 @@ The `direct_copy_kernel` time dropped by 41.7ms (from 605ms to 563ms), confirmin
   1. **Fused RMSNorm forward+backward** — saves the `rstd` computation in the backward pass by computing it once in the forward pass
   2. **CUDA graph for optimizer step** — captures the optimizer step into the graph (needs memory re-evaluation after normed/normed2 removal)
   3. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with working CUDA graph)
+
+### Long-train gate (200-step, DP=2)
+
+| Metric | Value | Threshold |
+|--------|-------|-----------|
+| loss_pass | True | ✅ |
+| avg_mfu_e2e_standard | **18.34%** | — |
+| pointwise_mean_rel | 0.44% | < 2.50% ✅ |
+| max_rel_diff | 1.80% | — |
+| signed_mean_rel | +0.28% | no drift ✅ |
+| drift_warning | None | ✅ |
+| compared_steps | 100 | — |
+| ref_elapsed_s | 1563s | — |

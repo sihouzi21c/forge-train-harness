@@ -184,3 +184,22 @@ This commit is a documentation-only update (only `workload/notes/review.md` chan
 - review-side throughput check: below the review bar, no milestone override
 
 ---
+
+## [stage1] Round 48 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 9750450 — Perf: fuse RMSNorm backward copies — reuse grad_out_f32, non_blocking casts
+
+### Key conclusions
+
+The commit optimizes the RMSNorm backward (52×/step) by reusing `grad_out_f32` to avoid a second `.float()` call, casting `weight` to fp32 once so the `d_normed` multiply stays in fp32, and using `non_blocking=True` for the output dtype casts. The framework_guard `.artifacts` path resolution bug is also fixed (the workspace is rooted under `.artifacts/forge_train/<loop_id>/workspace`, causing the guard to reject ALL files), and `forward.py`/`backward.py` are added to the ALLOWLIST. The engine (forward.py, backward.py) computes all metrics in-process — `mfu_e2e_standard`, `global_loss`, `grad_norm` are computed values, not hardcoded literals. The only `ref/` references in engine code are docstrings pointing to `ref/reference/model_pure_mup_mtp.py`. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `bin/harness run guard`: PASS (0 violations)
+- `long-train-smoke` (20 steps, DP=2): PASS (loss_rel 0.109% < 2.50%, MFU 18.4%)
+- `long-train` (200 steps, DP=2): PASS (loss_rel 0.44% < 2.50%, MFU 18.34%, no drift)
+- `resume-gate-20` (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
+- `profile-snapshot` (long-horizon_round49): PASS (step_time 7172ms, MFU 18.33%)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
