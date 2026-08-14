@@ -145,3 +145,23 @@ This round is a docs-only commit (only `workload/notes/perf_log.md` changed). Th
 - `bin/harness run anti-proxy`: PASS (0 violations)
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 - `python3 tools/mfu_elastic_check.py`: `MFU_GATE_VERDICT: FAIL — BELOW_BAND`, no milestone override
+
+---
+
+## [stage1] Round 47 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 308a38c — Perf: disable Triton wgrad GEMM (slower than cuBLAS); add nsys cuda-graph-trace flag
+
+### Key conclusions
+The commit disables the Triton wgrad kernel (confirmed 6% MFU regression vs cuBLAS TF32) and adds `--cuda-graph-trace=node` to the nsys wrapper for proper GPU kernel profiling. A new devspace (721480) was created to replace the killed devspace (720930), and the lease was re-bound. The long-train-smoke gate (DP=2, 20 steps) PASS with MFU 18.3% (baseline), loss_rel 0.107% < 2.50%, signed_rel +0.0201% (no drift). The profile-snapshot (long-horizon_round47) shows the first proper GPU kernel breakdown: elementwise/copy 49%, flash attention 17%, cuBLAS GEMM 14% of GPU kernel time; GPU idle 1193ms (16.5% of step) from NCCL all-reduce. No proxy, forgery, or hardcoded metrics detected. The commit does not declare `STAGE_STATUS: finished`, so the stage remains in-progress.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `bin/harness run guard`: PASS (0 violations)
+- `ENABLE_TRITON_WGRAD=0` long-train-smoke: PASS (loss_rel 0.107%, MFU 18.3%)
+- `ENABLE_TRITON_WGRAD=1` long-train-smoke: PASS (loss_rel 0.115%, MFU 17.3% — regression confirmed)
+- profile-snapshot long-horizon_round47: PASS (step_time 7221ms, MFU 18.21%)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- `python3 tools/mfu_elastic_check.py`: `MFU_GATE_VERDICT: FAIL — BELOW_BAND`, no milestone override
