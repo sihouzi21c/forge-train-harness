@@ -440,3 +440,18 @@ The dev agent integrated the existing `swiglu_forward_fused` Triton kernel into 
 - resume-gate-20 (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
 - profile-snapshot (long-horizon_round53): PASS
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+## [stage1] Round 51 — 2026-08-14 19:45
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 526f202 — Docs: record Round 52 — SwiGLU forward fused Triton, MFU 20.85%, long-train PASS
+
+### Key conclusions
+Documentation-only commit recording Round 52 results (SwiGLU forward fused Triton kernel, MFU 20.85%, +2.5pp from baseline). The commit only touches `workload/notes/perf_log.md` and `workload/notes/review.md` — no engine code changes. Anti-proxy guard passes (0 violations). No proxy, no forgery, no hardcoded synthetic metrics. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in commit message, and the latest perf_log.md section is missing evidence for resume-gate-20, resume-startup-90, and perf-bitwise gates. The review-side throughput check (long-horizon milestone) also reports throughput below the review bar.
+
+### Evidence highlights
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `bin/harness run guard`: PASS (0 violations)
+- Engine files (`workload/src/training_engine_tensor/`) all compute MFU, loss, and grad_norm from actual runtime values — no hardcoded constants
+
+---

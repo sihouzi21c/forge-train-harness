@@ -751,7 +751,7 @@ def _static_backward(
         # the ref's ``loss = lm_sum + ce_w * mtp_sum; loss.backward()``.
         grad_mtp_logits = cross_entropy_backward(
             cache.mtp_logits, cache.mtp_labels, cache.mtp_loss_mask,
-            scale=mtp_ce_weight,
+            scale=mtp_ce_weight, deterministic=deterministic,
         )
 
         # ── MTP LM head backward: logits = mtp_pre_head @ output_weight.T
@@ -914,7 +914,7 @@ def _static_backward(
     # ====================================================================
 
     # ── Main Cross-entropy loss backward ───────────────────────────────
-    grad_logits = cross_entropy_backward(cache.main_logits, cache.labels, cache.loss_mask)
+    grad_logits = cross_entropy_backward(cache.main_logits, cache.labels, cache.loss_mask, deterministic=deterministic)
 
     # ── Main LM head backward: logits = main_pre_head @ output_weight.T
     # grad_logits is fp32 (from FP32 CE), output_weight is bf16.
@@ -1710,8 +1710,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 depth_scale_main, depth_scale_mtp,
                 None, capture_prefix, deterministic,
             )
-            _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf)
-            _fw_mtp_sum, _fw_mtp_n = masked_cross_entropy(_fw_cache.mtp_logits, mtp_lab_buf, mtp_mask_buf)
+            _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf, deterministic=deterministic)
+            _fw_mtp_sum, _fw_mtp_n = masked_cross_entropy(_fw_cache.mtp_logits, mtp_lab_buf, mtp_mask_buf, deterministic=deterministic)
             _static_backward(
                 model, _fw_cache, rope_freqs, width_mult, mup_emb_scale,
                 depth_scale_main, depth_scale_mtp,
@@ -1726,7 +1726,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 depth_scale_main, depth_scale_mtp,
                 None, capture_prefix, deterministic,
             )
-            _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf)
+            _fw_lm_sum, _fw_lm_n = masked_cross_entropy(_fw_cache.main_logits, labels_buf, loss_mask_buf, deterministic=deterministic)
             _static_backward(
                 model, _fw_cache, rope_freqs, width_mult, mup_emb_scale,
                 depth_scale_main, depth_scale_mtp,
@@ -1766,9 +1766,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         None, capture_prefix, deterministic,
                     )
                     _capture_lm_sum, _capture_lm_n = masked_cross_entropy(
-                        _capture_cache.main_logits, labels_buf, loss_mask_buf)
+                        _capture_cache.main_logits, labels_buf, loss_mask_buf, deterministic=deterministic)
                     _capture_mtp_sum, _capture_mtp_n = masked_cross_entropy(
-                        _capture_cache.mtp_logits, mtp_lab_buf, mtp_mask_buf)
+                        _capture_cache.mtp_logits, mtp_lab_buf, mtp_mask_buf, deterministic=deterministic)
                     _static_backward(
                         model, _capture_cache, rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
@@ -1784,7 +1784,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         None, capture_prefix, deterministic,
                     )
                     _capture_lm_sum, _capture_lm_n = masked_cross_entropy(
-                        _capture_cache.main_logits, labels_buf, loss_mask_buf)
+                        _capture_cache.main_logits, labels_buf, loss_mask_buf, deterministic=deterministic)
                     _static_backward(
                         model, _capture_cache, rope_freqs, width_mult, mup_emb_scale,
                         depth_scale_main, depth_scale_mtp,
@@ -1913,8 +1913,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         None,  # skip fwd hash (too slow for DP multi-GPU),
                         capture_prefix, deterministic,
                     )
-                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, _eager_lab, _eager_mask)
-                    mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, _eager_mtp_lab, _eager_mtp_mask)
+                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, _eager_lab, _eager_mask, deterministic=deterministic)
+                    mtp_sum_v, mtp_n_v = masked_cross_entropy(cache.mtp_logits, _eager_mtp_lab, _eager_mtp_mask, deterministic=deterministic)
                     local_mtp_sum += mtp_sum_v.detach().double()
                     local_mtp_n += mtp_n_v.detach().double()
                 else:
@@ -1926,7 +1926,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                         None,  # skip fwd hash (too slow for DP multi-GPU),
                         capture_prefix, deterministic,
                     )
-                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, _eager_lab, _eager_mask)
+                    lm_sum, lm_n = masked_cross_entropy(cache.main_logits, _eager_lab, _eager_mask, deterministic=deterministic)
 
                 # ── Static backward pass ──────────────────────────────────
                 _static_backward(

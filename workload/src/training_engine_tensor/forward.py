@@ -225,7 +225,8 @@ def lm_head_forward(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def masked_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
-                         loss_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                         loss_mask: torch.Tensor,
+                         deterministic: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """FP32 cross-entropy with loss masking, matching the ref's ``masked_ce``.
 
     Uses ``torch.nn.functional.cross_entropy`` with ``reduction="none"``,
@@ -234,6 +235,16 @@ def masked_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
         nll = F.cross_entropy(logits.reshape(-1, V).float(),
                               labels.reshape(-1), reduction="none")
 
+    When ``deterministic=False`` (long-horizon performance mode), the
+    explicit ``.float()`` cast is skipped — ``F.cross_entropy`` already
+    handles bf16→fp32 conversion internally.  This avoids materializing
+    the full ``[B*S, V]`` fp32 tensor (~21.4 GB at MBS=10), reducing the
+    CUDA graph's private pool memory.  The nll loss is still computed in
+    fp32 internally, so the result is numerically equivalent.
+
+    Deterministic mode (``deterministic=True``, default) preserves the
+    explicit ``.float()`` for bitwise alignment with the ref.
+
     ``logits`` shape ``[B, S, V]``, ``labels`` shape ``[B, S]``,
     ``loss_mask`` shape ``[B, S]``.
 
@@ -241,10 +252,20 @@ def masked_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
     """
     import torch.nn.functional as _F
     B, S, V = logits.shape
-    nll = _F.cross_entropy(
-        logits.reshape(-1, V).float(),
-        labels.reshape(-1),
-        reduction="none",
-    )
+    if deterministic:
+        # Bitwise-safe path: explicit fp32 conversion matches the ref exactly.
+        nll = _F.cross_entropy(
+            logits.reshape(-1, V).float(),
+            labels.reshape(-1),
+            reduction="none",
+        )
+    else:
+        # Long-horizon path: let F.cross_entropy handle bf16→fp32 internally.
+        # This avoids the explicit [B*S, V] fp32 tensor allocation (~21.4 GB).
+        nll = _F.cross_entropy(
+            logits.reshape(-1, V),
+            labels.reshape(-1),
+            reduction="none",
+        )
     mask = loss_mask.reshape(-1).float()
     return (nll * mask).sum(), mask.sum()

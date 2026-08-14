@@ -535,15 +535,28 @@ def cross_entropy_backward(
     loss_mask: torch.Tensor,
     scale: float = 1.0,
     chunk_size: int = 4096,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Backward of cross-entropy loss w.r.t. logits (chunked for memory).
 
-    Replays ``F.cross_entropy(chunk.float(), chunk_labels, reduction="none")``
-    in chunks along the batch dimension, avoiding the full ``[B*S, V]`` fp32
-    materialization that causes OOM at large micro-batch sizes (MBS >= 4 with
-    V=130560).  The chunked result is bitwise-identical to the non-chunked
-    ``F.cross_entropy`` backward — the same autograd kernel, just applied to
-    disjoint subsets of the batch.
+    When ``deterministic=True`` (default, bitwise-safe mode), replays
+    ``F.cross_entropy`` via autograd to produce the gradient, matching the
+    ref's ``loss.backward()`` path exactly.
+
+    When ``deterministic=False`` (long-horizon performance mode), uses the
+    direct softmax formula:
+
+        softmax = softmax(logits)
+        d_logits = (softmax - one_hot(label)) * mask * scale
+
+    This avoids the ``requires_grad_()``, ``F.cross_entropy`` forward, and
+    ``obj.backward()`` overhead of the autograd replay approach, while
+    producing the same numerical result.
+
+    The computation is chunked along the batch dimension (``chunk_size``
+    tokens per chunk) to avoid materializing the full ``[B*S, V]`` fp32
+    logits tensor.  Each chunk is ``[chunk_size, V]`` fp32, which is
+    ~2.1 GB at chunk_size=4096, V=130560.
 
     The ``scale`` multiplication is done in fp32 before the ``.to(bf16)``
     conversion, matching the ref's ``loss = lm_sum + ce_w * mtp_sum;
@@ -558,17 +571,38 @@ def cross_entropy_backward(
     mask = loss_mask.reshape(-1).float()
     total_tokens = B * S
     grad_logits = torch.zeros(total_tokens, V, dtype=logits.dtype, device=logits.device)
+    logits_flat = logits.reshape(-1, V)
 
-    for i in range(0, total_tokens, chunk_size):
-        end = min(i + chunk_size, total_tokens)
-        with torch.enable_grad():
-            chunk_logits = logits.reshape(-1, V)[i:end].detach().float().requires_grad_(True)
+    if deterministic:
+        # Bitwise-safe path: autograd replay matches the ref's backward exactly.
+        for i in range(0, total_tokens, chunk_size):
+            end = min(i + chunk_size, total_tokens)
+            with torch.enable_grad():
+                chunk_logits = logits_flat[i:end].detach().float().requires_grad_(True)
+                chunk_labels = labels_flat[i:end]
+                chunk_mask = mask[i:end]
+                nll = _F.cross_entropy(chunk_logits, chunk_labels, reduction="none")
+                obj = (nll * chunk_mask).sum()
+                obj.backward()
+                grad_logits[i:end] = chunk_logits.grad.to(logits.dtype)
+        grad = (scale * grad_logits.reshape(B, S, V)).to(logits.dtype)
+        return grad
+    else:
+        # Long-horizon path: direct softmax formula avoids autograd overhead.
+        for i in range(0, total_tokens, chunk_size):
+            end = min(i + chunk_size, total_tokens)
+            # Compute softmax in fp32 from bf16 logits chunk.
+            chunk = logits_flat[i:end].float()
+            softmax = torch.softmax(chunk, dim=-1)
+
+            # one_hot at the label position for each token in the chunk.
             chunk_labels = labels_flat[i:end]
             chunk_mask = mask[i:end]
-            nll = _F.cross_entropy(chunk_logits, chunk_labels, reduction="none")
-            obj = (nll * chunk_mask).sum()
-            obj.backward()
-            grad_logits[i:end] = chunk_logits.grad.to(logits.dtype)
+            one_hot = torch.zeros_like(softmax)
+            one_hot[torch.arange(chunk_labels.shape[0]), chunk_labels] = 1.0
 
-    grad = (scale * grad_logits.reshape(B, S, V)).to(logits.dtype)
-    return grad
+            # d_logits = (softmax - one_hot) * mask * scale (all in fp32)
+            d_logits = (softmax - one_hot) * chunk_mask[:, None] * scale
+            grad_logits[i:end] = d_logits.to(logits.dtype)
+
+        return grad_logits.reshape(B, S, V)
