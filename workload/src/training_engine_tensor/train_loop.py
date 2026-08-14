@@ -291,14 +291,16 @@ def _pairwise(items):
 
 
 class _BackgroundPrefetcher:
-    """Background-thread dataloader prefetcher with a bounded queue.
+    """Background-thread dataloader prefetcher with pre-allocated pinned buffers.
 
-    Calls ``_next_batch(dl, "cpu")`` on a daemon background thread and stores
-    the results in a bounded ``deque``.  The main thread calls ``get()`` to
-    retrieve the next batch without blocking on the dataloader's shard refill
-    (which can take seconds on the first call).  The queue depth is controlled
-    by ``max_size`` (default 4 — enough headroom to absorb dataloader latency
-    across 10-microbatch steps).
+    Calls ``next(dl)`` on a daemon background thread and copies the results
+    into pre-allocated pinned CPU buffers (eliminating the ``pin_memory()``
+    allocation overhead, ~50ms/batch).  The buffer sets are stored in a bounded
+    ``deque``.  The main thread calls ``get()`` to retrieve the next batch
+    without blocking on the dataloader's shard refill (which can take seconds
+    on the first call).  The queue depth is controlled by ``max_size`` (default
+    4 — enough headroom to absorb dataloader latency across 10-microbatch
+    steps).
 
     The ``get()`` method notifies the background thread after popping a batch,
     so the producer resumes immediately instead of waiting for the 0.1s poll
@@ -314,7 +316,7 @@ class _BackgroundPrefetcher:
     (``non_blocking=True`` copies) hides the GPU-side H2D transfer latency.
     """
 
-    def __init__(self, dl, max_size: int = 4):
+    def __init__(self, dl, max_size: int = 4, B: int = 4, S: int = 4096):
         self._dl = dl
         self._queue: deque = deque()
         self._max_size = max_size
@@ -322,6 +324,18 @@ class _BackgroundPrefetcher:
         self._not_empty = threading.Condition(self._lock)
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True, name="dl-prefetcher")
+        # Pre-allocate pinned CPU buffers for the entire queue depth.
+        # Each buffer set holds (input_ids, labels, loss_mask) as pinned
+        # tensors, eliminating the pin_memory() call in _next_batch which
+        # creates a new pinned allocation every batch (~50ms overhead per
+        # batch, ~500ms/step across 10 microbatches).
+        self._buf_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for _ in range(max_size):
+            self._buf_pool.append((
+                torch.empty(B, S, dtype=torch.long, pin_memory=True),
+                torch.empty(B, S, dtype=torch.long, pin_memory=True),
+                torch.empty(B, S, dtype=torch.float32, pin_memory=True),
+            ))
 
     def start(self):
         self._thread.start()
@@ -347,8 +361,20 @@ class _BackgroundPrefetcher:
             return result
 
     def _run(self):
+        """Background thread: fetch batches from the dataloader, copy to
+        pre-allocated pinned buffers, and enqueue them."""
+        buf_idx = 0
         while True:
-            batch = _next_batch(self._dl, "cpu")
+            data = next(self._dl)
+            while (data["loss_mask"] == 0).all().item():
+                data = next(self._dl)
+            # Copy to pre-allocated pinned buffers (fast CPU-side copy,
+            # avoids the pin_memory() allocation overhead).
+            buf = self._buf_pool[buf_idx % len(self._buf_pool)]
+            buf[0].copy_(data["tokens"])
+            buf[1].copy_(data["labels"])
+            buf[2].copy_(data["loss_mask"].float())
+            buf_idx += 1
             with self._lock:
                 if not self._running:
                     return
@@ -358,7 +384,7 @@ class _BackgroundPrefetcher:
                     self._not_empty.wait(0.1)
                     if not self._running:
                         return
-                self._queue.append(batch)
+                self._queue.append(buf)
                 self._not_empty.notify()
 
 
@@ -1605,7 +1631,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # iter_dl directly) to avoid a race on the shared iterator.
     dl_prefetcher: _BackgroundPrefetcher | None = None
     if int(os.environ.get("ENABLE_DL_PREFETCH", "1")):
-        dl_prefetcher = _BackgroundPrefetcher(iter_dl, max_size=2)
+        dl_prefetcher = _BackgroundPrefetcher(
+            iter_dl, max_size=4,
+            B=config.micro_batch_size, S=C.MAX_SEQ_LEN,
+        )
         dl_prefetcher.start()
         if rank == 0:
             print("[debug] dataloader prefetcher started", file=sys.stderr, flush=True)
