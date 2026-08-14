@@ -717,3 +717,19 @@ The dev agent eliminated the redundant `torch.cat` calls in the SwiGLU backward 
 - `bin/harness run anti-proxy`: PASS (0 violations)
 
 ---
+
+## [stage1] Round 66 — 2026-08-15 06:58:30
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: e8b59b5 — Docs: record Round 66 — pre-alloc flat BF16 sync, MFU 31.1%, long-train PASS
+
+### Key conclusions
+Docs-only commit recording Round 66 results (MFU 31.1%, +2.9pp, long-train PASS, resume-gate-20 PASS). No engine source code was modified — the actual optimization (pre-allocated flat BF16 sync buffers) was implemented in the parent commit b10f73f. No proxy, no forgery, no hardcoded values, no shell-outs detected in the engine source. Stage 1 continues in-progress (no STAGE_STATUS:finished declaration).
+
+### Evidence highlights
+- Diff shows only `workload/notes/perf_log.md` modified
+- `rg` across `workload/src/training_engine_tensor/` and `workload/ops/` finds no proxy/subprocess/ref-path patterns
+- `bin/harness run anti-proxy` (run in prior round) passed
+
+---

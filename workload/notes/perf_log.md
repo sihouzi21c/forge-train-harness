@@ -2419,6 +2419,7 @@ The dev agent eliminated the redundant `torch.cat` calls in the SwiGLU backward 
   1. **Fused grad_weight computation** — inline the `grad_weight` sum into the Triton RMSNorm backward kernel to eliminate the `hidden.float()` copy in the `rms_norm_backward_fused` wrapper.
   2. **Pre-allocated buffer for MTP eagle FC cat** — avoid the `torch.cat` at line 584 by storing the concatenated tensor in the `LayerCache`.
 - review R65 PASS: no proxy, genuine in-process optimization eliminating redundant SwiGLU bwd torch.cat
+- review R66 PASS: docs-only commit recording Round 66 MFU 31.1% results, no proxy detected
 
 ## [stage1] Round 66 — 2026-08-15
 
