@@ -633,3 +633,19 @@ The semantic audit confirms the candidate engine is genuinely implementing forwa
 - No gate config, remote config, or run-shape key modifications detected
 
 ---
+
+## [stage1] Round 60 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: b01925b — Perf: gradient norm via flat tensor vector_norm — bypass _foreach_norm multi-tensor overhead, MFU +0.03pp
+
+### Key conclusions
+The dev agent optimized the gradient norm computation by saving the flat all-reduced gradient tensor (`_flat_grads`, 4.1 GiB, contiguous) and computing `torch.linalg.vector_norm` on it directly, bypassing the `torch._foreach_norm` multi-tensor kernel loop over 157 buffers. The implementation is genuine in-process computation — no shell-out to ref/, no imports of reference helpers, no hardcoded synthetic values. Stage 1 is not finished: the commit does not declare STAGE_STATUS: finished, the latest perf_log section lacks resume-startup-90 and perf-bitwise gate evidence, and the profile snapshot requirement is unmet for this perf-touching round.
+
+### Evidence highlights
+- `train_loop.py:2098` — `_flat_grads = flat` saves the flat tensor after all-reduce
+- `train_loop.py:2143` — `total_norm = torch.linalg.vector_norm(_flat_grads)` uses the flat tensor for norm computation
+- `train_loop.py:2145-2147` — fallback to `torch._foreach_norm(fp32_grad_bufs)` when `_flat_grads is None`
+
+---

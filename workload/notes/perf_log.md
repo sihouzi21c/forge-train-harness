@@ -2211,3 +2211,4 @@ The dev agent implemented a gradient norm optimization: replacing `torch._foreac
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute)
   2. **Residual-add + RMSNorm fusion** — small kernel count reduction
   3. **Optimizer step CUDA graph** — capture optimizer step into the graph (estimated ~15ms savings)
+- review R60 PASS: flat tensor grad norm genuine, no proxy; stage in-progress — missing resume-startup-90/perf-bitwise/profile
