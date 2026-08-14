@@ -1512,3 +1512,58 @@ The `direct_copy_kernel` time dropped by 41.7ms (from 605ms to 563ms), confirmin
 | drift_warning | None | ✅ |
 | compared_steps | 100 | — |
 | ref_elapsed_s | 1563s | — |
+
+- review R49 PASS: no proxy, no forgery; docs-only commit recording R48 results
+
+## [stage1] Round 50 — 2026-08-14
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused Triton RMSNorm backward, MFU 18.0%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented a fused Triton RMSNorm backward kernel (`triton_kernels.py:_rms_norm_bwd_kernel`, `rms_norm_backward_fused`) that fuses the entire d_hidden computation (12 separate PyTorch kernel launches) into a single Triton kernel. The kernel reads bf16 inputs, computes in fp32, and writes d_hidden in bf16. The grad_weight sum is still computed via PyTorch (it is a cross-row reduction that does not map efficiently to Triton's per-row grid).
+
+**Phase 2 optimization — fused Triton RMSNorm backward:**
+
+1. **`_rms_norm_bwd_kernel` (Triton)**: Each program handles one (B, S) row of H elements. The kernel computes `r = rsqrt(mean(x^2) + eps)`, `normed = x * r`, `d_normed = grad_out * weight`, `normed_dot = mean(d_normed * normed)`, `d_hidden = r * (d_normed - normed * normed_dot)` — all in a single Triton kernel launch with fp32 internal accumulation.
+
+2. **Gating by `ENABLE_TRITON_RMSNORM_BWD=1`**: The Triton kernel is only used when `ENABLE_TRITON_RMSNORM_BWD=1` AND `deterministic=False` (long-horizon mode). The bitwise gates (perf-bitwise, multistep-1gpu, multistep) always use the PyTorch closed-form, preserving bitwise alignment. The `eval_long_train.py` script sets `ENABLE_TRITON_RMSNORM_BWD=1` for the long-horizon gates.
+
+3. **Non-power-of-2 support**: The kernel uses `next_power_of_2(H)` as `BLOCK_SIZE_H` with proper masking, supporting non-power-of-2 hidden dimensions (e.g., H=1536 for the MTP layer uses BLOCK_SIZE_H=2048).
+
+### Profile results (long-horizon_round51 vs round50)
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Step time (ms) | 7604 | 7312 | **-292ms** |
+| MFU (standard) | 17.29% | 17.98% | **+0.69pp** |
+| GPU kernel time (ms) | 5991 | 5622 | **-369ms** |
+| BinaryFunc (ms) | 591 | 533 | **-58ms** |
+| bfloat16_copy (ms) | 265 | 239 | **-26ms** |
+| direct_copy_kernel (ms) | 562 | 547 | **-15ms** |
+| elementwise (type 2) (ms) | 237 | 113 | **-124ms** |
+| CUDA API time (ms) | 6553 | 6067 | **-486ms** |
+
+The `elementwise_kernel (type 2)` dropped by 124ms (from 237ms to 113ms) — the fused Triton kernel eliminates the per-op element-wise kernels for the RMSNorm backward. The `BinaryFunc` dropped by 58ms (from 591ms to 533ms) — fewer element-wise operations. The `bfloat16_copy` dropped by 26ms (from 265ms to 239ms) — fewer bf16 conversions.
+
+### Gate results
+
+| Gate | Result | Key Metrics |
+|------|--------|-------------|
+| long-train-smoke (20 steps, DP=2) | **PASS** | loss_rel 0.108% < 2.50%, MFU **18.0%** |
+| resume-gate-20 (25 steps, DP=2) | **PASS** | bitwise (max_abs_diff=0, 9420/9420 hash) |
+| profile-snapshot (long-horizon_round51) | **PASS** | step_time 7312ms, MFU 17.98% |
+
+### Notes
+
+- `perf-bitwise` regression: FAIL (0/15 bitwise) — this is a pre-existing issue on this new devspace (ds-722156), not caused by the Triton RMSNorm changes. The `perf-bitwise` gate was passing on the old devspace (ds-721480) in Round 43 but has been failing since Round 44. The root cause is the `DETERMINISTIC=0` default causing a mismatch between the ref's `--deterministic` mode and the ours's non-deterministic `flash_attn_func` backward. This should be investigated in a dedicated round.
+
+### Next steps
+
+- Fix `perf-bitwise` regression by setting `DETERMINISTIC=1` for the bitwise gates
+- Phase 2 continued: fused residual-add + RMSNorm forward (Triton kernel) to eliminate the `hidden.float()` copy in the forward pass
+- Phase 3: gradient bucketing with NCCL overlap (revisit after the Triton RMSNorm optimization)
+- Phase 1: eliminate activation recompute for MBS=10 (the secondary goal of long-horizon)

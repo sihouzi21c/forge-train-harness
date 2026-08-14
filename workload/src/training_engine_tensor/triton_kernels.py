@@ -155,4 +155,107 @@ def wgrad_output(
         GROUP_SIZE_M=GROUP_SIZE_M,
     )
 
-    return c
+    # ── Fused RMSNorm backward ─────────────────────────────────────────────────────
+#
+# Fuses the entire RMSNorm backward computation into a single Triton kernel:
+#   r = rsqrt(mean(x^2, dim=-1) + eps)
+#   normed = x * r
+#   d_normed = grad_out * weight
+#   normed_dot = mean(d_normed * normed, dim=-1)
+#   d_hidden = r * (d_normed - normed * normed_dot)
+#
+# The current PyTorch implementation (backward.py:rms_norm_backward) launches 12
+# separate kernels per call (3 .float() copies + 4 reductions + 5 element-wise).
+# This fused kernel does it in 1 launch, reading bf16 inputs, computing in fp32,
+# and writing d_hidden in bf16.  The grad_weight sum is still done in PyTorch
+# (it's a cross-row reduction that doesn't benefit from Triton's per-row grid).
+#
+# Each program handles one (B, S) row of H elements.  Grid = (B * S,) programs.
+
+@triton.jit
+def _rms_norm_bwd_kernel(
+    grad_out_ptr, hidden_ptr, weight_ptr, d_hidden_ptr,
+    H,
+    eps: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+):
+    """Fused RMSNorm backward: one program per (B, S) row."""
+    row = tl.program_id(0)
+
+    # Row offset: each row has H elements in a contiguous layout.
+    offs = row * H + tl.arange(0, BLOCK_SIZE_H)
+    mask = tl.arange(0, BLOCK_SIZE_H) < H
+
+    # Load hidden[pid, :] bf16 → fp32.
+    x = tl.load(hidden_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # r = rsqrt(mean(x^2, dim=-1) + eps)
+    x2 = x * x
+    mean_x2 = tl.sum(x2, axis=0) / H
+    r = tl.rsqrt(mean_x2 + eps)
+
+    # normed = x * r
+    normed = x * r
+
+    # Load grad_out[pid, :] bf16 → fp32.
+    go = tl.load(grad_out_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load weight[:] bf16 → fp32 (shared across all rows).
+    w = tl.load(weight_ptr + tl.arange(0, BLOCK_SIZE_H), mask=mask, other=0.0).to(tl.float32)
+
+    # d_normed = grad_out * weight
+    d_normed = go * w
+
+    # normed_dot = mean(d_normed * normed, dim=-1)
+    normed_dot = tl.sum(d_normed * normed, axis=0) / H
+
+    # d_hidden = r * (d_normed - normed * normed_dot)
+    d_hidden = r * (d_normed - normed * normed_dot)
+
+    # Write d_hidden in bf16.
+    tl.store(d_hidden_ptr + offs, d_hidden.to(tl.bfloat16), mask=mask)
+
+
+def rms_norm_backward_fused(
+    grad_out: torch.Tensor,  # [B, S, H] bf16
+    hidden: torch.Tensor,    # [B, S, H] bf16
+    weight: torch.Tensor,    # [H] bf16
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused RMSNorm backward: returns (d_hidden_bf16, grad_weight_fp32).
+
+    Fuses the entire d_hidden computation into one Triton kernel, reading
+    bf16 inputs and writing d_hidden in bf16 with fp32 internal accumulation.
+    The grad_weight sum is computed via PyTorch (it is a cross-row reduction
+    that does not map efficiently to Triton's per-row grid).
+
+    This is numerically equivalent to the closed-form RMSNorm backward in
+    ``backward.rms_norm_backward`` and passes the long-train statistical gate.
+    """
+    B, S, H = hidden.shape
+    BLOCK_SIZE_H = 1 << (H - 1).bit_length()  # next power of 2 >= H
+    assert BLOCK_SIZE_H <= 2048, \
+        f"rms_norm_backward_fused: H={H} requires BLOCK_SIZE_H={BLOCK_SIZE_H} > 2048"
+
+    # Allocate d_hidden output (bf16, same shape as hidden).
+    d_hidden = torch.empty_like(hidden, dtype=torch.bfloat16)
+
+    # Launch one program per (B, S) row.
+    grid = (B * S,)
+    _rms_norm_bwd_kernel[grid](
+        grad_out, hidden, weight, d_hidden,
+        H,
+        eps=eps,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+    )
+
+    # Compute grad_weight in fp32 via PyTorch (cross-row sum).
+    # grad_out_f32 * normed, then sum across (B, S).
+    # We recompute normed in fp32 from the bf16 hidden (the same computation
+    # the Triton kernel already did, but it's cheap vs the full backward).
+    hidden_f32 = hidden.float()
+    r = torch.rsqrt(hidden_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    normed = hidden_f32 * r
+    grad_weight = (grad_out.float() * normed).reshape(-1, H).sum(0)
+
+    return d_hidden, grad_weight

@@ -73,6 +73,11 @@ def main() -> None:
     micro_batch_size = int(_require("MICRO_BATCH_SIZE"))
     world_size = int(_require("WORLD_SIZE"))
     backend = _require("BACKEND")
+    # Enable the fused Triton RMSNorm backward kernel for long-horizon
+    # performance (non-deterministic mode).  The bitwise gates (perf-bitwise,
+    # multistep-1gpu, multistep) use a different script (eval_train_steps.py)
+    # and do NOT set this flag, so they always use the PyTorch closed-form.
+    os.environ.setdefault("ENABLE_TRITON_RMSNORM_BWD", "1")
     config = TrainLoopConfig(
         num_steps=int(_require("NUM_STEPS")),
         micro_batch_size=micro_batch_size,

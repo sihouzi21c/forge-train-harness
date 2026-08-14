@@ -741,7 +741,9 @@ def _static_backward(
         # ── mtp.final_layernorm backward
         d_mtp_eagle_h, dw_mtp_fn = rms_norm_backward(
             d_mtp_final, cache.mtp_eagle_h, model.mtp.final_norm_weight
-        )
+        ,
+        deterministic=deterministic,
+    )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.final_norm_weight, dw_mtp_fn)
 
         # ── MTP transformer layer backward (reverse order)
@@ -779,7 +781,9 @@ def _static_backward(
         # ffn_norm backward (MLP branch)
         d_mtp_hidden_mlp, dw_mtp_mlp_norm = rms_norm_backward(
             d_mtp_normed2, mtp_lc.hidden_after_attn, model.mtp.layer.pre_mlp_norm_weight
-        )
+        ,
+        deterministic=deterministic,
+    )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.pre_mlp_norm_weight, dw_mtp_mlp_norm)
 
         # Add MLP and attention gradient at hidden
@@ -824,7 +828,9 @@ def _static_backward(
         # attention_norm backward
         d_mtp_hidden_before_attn, dw_mtp_attn_norm = rms_norm_backward(
             d_mtp_normed, mtp_lc.hidden_before_attn, model.mtp.layer.input_norm_weight
-        )
+        ,
+        deterministic=deterministic,
+    )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.layer.input_norm_weight, dw_mtp_attn_norm)
 
         # Add residual from attention branch
@@ -841,13 +847,17 @@ def _static_backward(
         # mtp.hidden_input_layernorm backward
         d_hidden_normed_mtp, dw_mtp_hnorm = rms_norm_backward(
             d_mtp_b, cache.hidden_normed, model.mtp.hidden_input_norm_weight
-        )
+        ,
+        deterministic=deterministic,
+    )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.hidden_input_norm_weight, dw_mtp_hnorm)
 
         # mtp.emb_input_layernorm backward
         grad_mtp_emb, dw_mtp_enorm = rms_norm_backward(
             d_mtp_a, cache.mtp_emb, model.mtp.emb_input_norm_weight
-        )
+        ,
+        deterministic=deterministic,
+    )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.mtp.emb_input_norm_weight, dw_mtp_enorm)
 
         # MTP embedding backward: gradient flows through rms_norm then
@@ -897,6 +907,8 @@ def _static_backward(
     hidden_post_last_layer = last_layer.hidden_after_attn + last_layer.mlp_out * depth_scale_main
     d_hidden, dw_final_norm = rms_norm_backward(
         d_hidden_normed, hidden_post_last_layer, model.final_norm_weight
+    ,
+        deterministic=deterministic,
     )
     _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, model.final_norm_weight, dw_final_norm)
 
@@ -933,7 +945,9 @@ def _static_backward(
         # ffn_norm backward (MLP branch into hidden_after_attn)
         d_hidden_mlp, dw_mlp_norm = rms_norm_backward(
             d_normed2, lc.hidden_after_attn, layer.pre_mlp_norm_weight
-        )
+        ,
+        deterministic=deterministic,
+    )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.pre_mlp_norm_weight, dw_mlp_norm)
 
         # Add MLP residual: hidden = hidden_before_attn + attn_out * depth_scale
@@ -976,7 +990,9 @@ def _static_backward(
         # attention_norm backward
         d_hidden_before_attn, dw_attn_norm = rms_norm_backward(
             d_normed, lc.hidden_before_attn, layer.input_norm_weight
-        )
+        ,
+        deterministic=deterministic,
+    )
         _add_to_grad_bufs(fp32_grad_bufs, dptr_idx, layer.input_norm_weight, dw_attn_norm)
 
         # Add residual from attention branch: hidden = hidden_before_attn + attn_out * depth_scale

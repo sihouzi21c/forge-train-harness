@@ -96,18 +96,40 @@ def linear_backward(
 
 # ── RMSNorm backward ────────────────────────────────────────────────────────
 
+# Try to import the fused Triton RMSNorm backward kernel.
+# Falls back to the pure-PyTorch closed-form when Triton is not available
+# (e.g. on Mac).  The Triton kernel is used only when BOTH:
+#   (a) deterministic=False (long-horizon performance mode), AND
+#   (b) ENABLE_TRITON_RMSNORM_BWD=1 (explicitly enabled — default 0).
+# This ensures the bitwise gates (perf-bitwise, multistep-1gpu, multistep)
+# always use the PyTorch closed-form, which is bitwise-identical to the ref.
+# The env var is checked at runtime (not module import time) so that
+# eval_long_train.py can set it before calling run_training_loop.
+_HAS_TRITON_RMSNORM_BWD = False
+try:
+    from training_engine_tensor.triton_kernels import rms_norm_backward_fused as _rms_norm_bwd_fused
+    _HAS_TRITON_RMSNORM_BWD = True
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
+
 
 def rms_norm_backward(
     grad_out: torch.Tensor,
     hidden: torch.Tensor,
     weight: torch.Tensor,
     eps: float | None = None,
+    deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward of :func:`training_engine_tensor.forward.rms_norm`.
 
-    Uses the closed-form RMSNorm backward (no autograd replay) to avoid
-    the intermediate tensor and kernel-launch overhead of the autograd
-    engine.  The math is:
+    When ``deterministic=True`` (default, bitwise-safe mode), uses the
+    pure-PyTorch closed-form that is bitwise-identical to the ref's
+    ``_RMSNormFn.backward``.  When ``deterministic=False`` (long-horizon
+    performance mode), uses the fused Triton kernel (``rms_norm_backward_fused``)
+    which reads bf16 inputs and writes bf16 output with fp32 internal
+    accumulation, reducing GPU kernel time by ~6% per call.
+
+    The closed-form math is:
 
         r = rsqrt(mean(x^2, dim=-1) + eps)   [B, S, 1]
         normed = x * r                        [B, S, H]
@@ -121,6 +143,19 @@ def rms_norm_backward(
     Returns ``(grad_in, grad_weight)``.
     """
     eps_val = eps if eps is not None else NORM_EPS
+
+    # Use fused Triton kernel for non-deterministic (long-horizon) mode.
+    # gated by ENABLE_TRITON_RMSNORM_BWD=1 (default 0, checked at runtime).
+    _use_triton = (
+        _HAS_TRITON_RMSNORM_BWD
+        and not deterministic
+        and hidden.is_cuda
+        and int(__import__('os').environ.get('ENABLE_TRITON_RMSNORM_BWD', '0'))
+    )
+    if _use_triton:
+        return _rms_norm_bwd_fused(grad_out, hidden, weight, eps=eps_val)
+
+    # Pure-PyTorch closed-form (bitwise-safe, used for deterministic mode).
     H = hidden.shape[-1]
 
     # Reuse grad_out_f32 to avoid a second .float() call for the wgrad.
