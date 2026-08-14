@@ -1361,3 +1361,47 @@ Once the cluster GPU is available:
    - CUDA graph for optimizer step (needs memory re-evaluation after normed/normed2 removal)
    - ZeRO-1 optimization for larger DP sizes
 - review R44 PASS: docs-only commit, no proxy detected; gates not run (cluster busy)
+
+## [stage1] Round 45 — 2026-08-14
+
+- **Verdict**: INCOMPLETE — remote cluster slow to schedule BATCH jobs; long-train-smoke gate not run
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: Triton wgrad GEMM + _foreach_copy_ bf16 sync)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent attempted to run the `long-train-smoke` gate with the Triton wgrad GEMM and
+`_foreach_copy_` bf16 sync optimizations (implemented in Round 44) but the remote cluster
+(paratera_shandong, pool faxin) was slow to schedule BATCH jobs.
+
+**Remote execution issues**:
+- The devspace 720930 (2× H100, loop's original SSH devspace) was killed to free GPU resources
+  for BATCH jobs.
+- The `--code-type git` approach (cloning from GitHub public repo) was used:
+  - `cctl job create` with `--code-type git --git-path "https://github.com/sihouzi21c/forge-train-harness.git" --git-ref harness`
+  - `cd /local/apps/forge-train-harness && export PYTHONPATH=... && export FORGE_CONFIG_DIR=... && python3 -m harness.cli run long-train-smoke`
+- Job 721441 transitioned Queued → Starting → Running (node gn-10-1-100-75) but ran for 14
+  minutes without producing output in the logs. The logs showed only the node info, not the
+  command output.
+- Possible causes: (a) git clone from GitHub hanging (cluster has no outbound internet access);
+  (b) log buffering preventing output from being flushed to the log server until completion.
+
+**Code state**:
+- Triton wgrad GEMM (`triton_kernels.py:_wgrad_output_kernel`, `wgrad_output`) — reads bf16
+  inputs and accumulates in fp32, avoiding the cuBLAS TF32 path's intermediate TF32 → bf16 →
+  float conversion chain. Integrated into `backward.py:linear_backward` for output dim ≥ 8192.
+- `_foreach_copy_` bf16 sync (`_sync_bf16_from_fp32` in `train_loop.py`) — replaces 157 per-param
+  `copy_` kernel launches with 1 fused `torch._foreach_copy_` call.
+- Code pushed to GitHub (`upstream`, `sihouzi21c/forge-train-harness.git`, `harness` branch).
+
+### Next steps
+
+- Re-run the `long-train-smoke` gate once the cluster is more responsive.
+- If `--code-type git` continues to hang, try using the persistent filesystem (ID 285) with
+  the code from the last `bin/harness sync push` as a fallback.
+- Once the smoke gate PASSes, run `resume-gate-20` regression to verify the Triton kernel
+  doesn't break save/load round-trip.
+- Candidate levers for subsequent rounds:
+  - Operator fusion (residual-add + RMSNorm fused kernel, RoPE fusion)
+  - CUDA graph for optimizer step (if memory allows after normed/normed2 removal)
