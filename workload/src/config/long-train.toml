@@ -66,3 +66,5 @@ ENABLE_TRITON_RMSNORM_FWD = "1"
 ENABLE_TRITON_RMSNORM_BWD = "1"
 ENABLE_TRITON_ROPE_FWD = "1"
 ENABLE_TRITON_ROPE_BWD = "1"
+# Dataloader prefetch queue depth: 64 buffers for smoother shard refill.
+DL_PREFETCH_SIZE = "64"

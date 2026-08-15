@@ -1653,7 +1653,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     dl_prefetcher: _BackgroundPrefetcher | None = None
     if int(os.environ.get("ENABLE_DL_PREFETCH", "1")) and not deterministic:
         dl_prefetcher = _BackgroundPrefetcher(
-            iter_dl, max_size=32,
+            iter_dl, max_size=int(os.environ.get("DL_PREFETCH_SIZE", "64")),
             B=config.micro_batch_size, S=C.MAX_SEQ_LEN,
         )
         dl_prefetcher.start()

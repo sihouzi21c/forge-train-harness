@@ -84,10 +84,6 @@ def linear_backward(
     g2 = grad_out.reshape(-1, n)
     x2 = x.reshape(-1, k)
 
-    # Use the Triton wgrad kernel for large output dimensions (e.g. output
-    # weight with V=130560).  The Triton kernel reads bf16 directly and
-    # accumulates in fp32, avoiding the TF32 round-trip and the explicit
-    # .float() cast.  For small/medium dimensions, cuBLAS TF32 is faster.
     if _USE_TRITON_WGRAD and n >= 8192:
         grad_weight = _wgrad_output(g2, x2)
     else:

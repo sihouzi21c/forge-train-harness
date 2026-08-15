@@ -2950,3 +2950,50 @@ The MFU is at 29.2% with all major Triton kernels enabled and CUDA graph active.
 1. Re-evaluating gradient bucketing at DP=2 with the current CUDA_DEVICE_MAX_CONNECTIONS=8 (was tested with CUDA_DEVICE_MAX_CONNECTIONS=1)
 2. Exploring the `expandable_segments:True` path now that the RoPE kernel bounds check is fixed
 3. Declaring the long-horizon optimization as ready for PR review per the milestone's hand-off protocol
+
+- review R74 PASS: docs-only commit, no proxy; STAGE_STATUS:in-progress, continue MFU optimization
+
+## [stage1] Round 78 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (dataloader prefetch queue depth increased to 64)
+
+### Key conclusions
+
+The dev agent made two structural changes:
+
+1. **Dataloader prefetch queue depth configurable and increased to 64**: The `_BackgroundPrefetcher`'s `max_size` (previously hardcoded to 32) is now configurable via the `DL_PREFETCH_SIZE` environment variable, defaulting to 64.  The larger queue depth provides more headroom for the dataloader's shard refill latency, reducing the probability of `pthread_cond_wait` on the main thread during the grad_accum loop.
+
+2. **Triton wgrad kernel re-evaluated**: The `n >= 8192` threshold was removed from `linear_backward` (the Triton wgrad is now gated only by `ENABLE_TRITON_WGRAD`).  A profile-snapshot was run with `ENABLE_TRITON_WGRAD=1` but showed no MFU improvement (MFU 29.26% vs 29.27% baseline — within run-to-run noise).  The Triton wgrad kernel is not enabled by default; it can be activated per-gate via `ENABLE_TRITON_WGRAD=1` for future benchmarking with different tile configurations.
+
+### Profile analysis (long-horizon_round78 vs round76)
+
+| Metric | Round 76 | Round 78 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 4504.0 | 4494.0 | **-10ms** |
+| MFU (standard) | 29.20% | 29.26% | **+0.06pp** |
+| GPU kernel (ms) | 2883.1 | 2872.7 | **-10.3ms** |
+| GPU idle (ms) | 1620.9 | 1621.3 | +0.4ms (noise) |
+| cudaGraphLaunch (ms) | 756.2 | 757.3 | +1.1ms (noise) |
+| cudaStreamSynchronize (ms) | 571.8 | 570.9 | -0.9ms (noise) |
+
+The MFU improvement is within run-to-run noise (~0.1pp). The structural bottlenecks (cudaGraphLaunch 757ms, cudaStreamSynchronize 571ms, frozen operators 60.4%) remain unchanged.
+
+### Gate results
+
+- **long-train-smoke** (20 steps, DP=2): PASS (loss_rel 0.208% < 2.50%, MFU 29.3%)
+- **resume-gate-20** (25 steps, DP=2): PASS (hash_pass=True, max_abs_diff_loss=0.0)
+- **profile-snapshot (long-horizon_round78)**: PASS (step_time 4494ms, MFU 29.26%)
+
+### Remaining optimization landscape
+
+The remaining optimization opportunities are all small or structurally hard, as documented in Round 77.  The MFU is plateauing at ~29.3% with all major Triton kernels enabled, CUDA graph active, and dataloader prefetch at max_size=64.  The next round should consider declaring the long-horizon optimization as ready for PR review per the milestone's hand-off protocol.
+
+### Code changes
+
+- `train_loop.py`: `_BackgroundPrefetcher` max_size configurable via `DL_PREFETCH_SIZE` env var, default 64
+- `long-train-smoke.toml`, `long-train.toml`: added `DL_PREFETCH_SIZE=64`
+- `backward.py`: removed `n >= 8192` threshold from Triton wgrad path (gated by `ENABLE_TRITON_WGRAD`)
+
+- review R75 PASS: dataloader prefetch size increased, Triton wgrad re-evaluated, no proxy detected

@@ -870,3 +870,24 @@ The dev agent fixed a Triton RoPE kernel out-of-bounds memory access (`triton_ke
 - No `config/remote.toml` changes detected
 
 ---
+
+## [stage1] Round 74 — 2026-08-15 13:58
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (optimizer step CUDA graph OOM, not feasible)
+- **Commit**: 7f32676 — Docs: record Round 77 — optimizer step CUDA graph attempted, OOM, not feasible
+
+### Key conclusions
+This is a docs-only commit that records the Round 77 attempt at optimizer step CUDA graph capture. The dev agent determined that the optimizer step CUDA graph is not feasible due to OOM (save/restore buffers require ~10 GiB, but free memory after fwd+bwd graph capture is fragmented into <2 GiB chunks) and the benefit is negligible (~15ms/step, 0.3% of 4504ms step time). No engine source code was modified. The engine (`forward.py`, `backward.py`, `train_loop.py`, `zero_optimizer.py`, `triton_kernels.py`) continues to implement all forward/backward/optimizer/loss/metric computation in-process using genuine PyTorch/Triton operations — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. The only `ref/` imports are dataloader utilities at `train_loop.py:235,281`. Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` in the commit message.
+
+### Violations (fill in only on FAIL)
+(none)
+
+### Evidence highlights
+- Commit diff only touches `workload/notes/perf_log.md` and `workload/notes/review.md` — no engine source code changes
+- `git -C "$PWD" log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- `long-train-smoke` PASS (loss_rel 0.24%), `resume-gate-20` PASS (max_abs_diff=0) — from previous round, carried forward
+- Long-horizon throughput check: BELOW_BAND — no milestone advance
+
+---
