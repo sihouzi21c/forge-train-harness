@@ -2895,3 +2895,58 @@ The dev agent implemented a fused residual-add + RMSNorm forward kernel (`triton
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute)
   2. **CUDA graph for optimizer step** — re-evaluate with improved memory headroom
   3. **H2D copy batching** — reduce cudaMemcpyAsync calls by concatenating input tensors
+- review R73 PASS: docs-only commit, no proxy; STAGE_STATUS:in-progress, continue MFU optimization
+
+## [stage1] Round 77 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 4: optimizer step CUDA graph attempted — OOM, not feasible)
+
+### Key conclusions
+
+The dev agent attempted to implement the optimizer step CUDA graph capture (AdamW + BF16 sync as a separate CUDA graph), but the approach is not feasible with the current memory situation:
+
+1. **Save/restore buffers OOM**: The optimizer step graph capture requires saving fp32_master (4.1 GiB), exp_avgs (4.1 GiB), and bf16_params (2.05 GiB) to flat buffers before capture, then restoring them after. Total: 10.25 GiB. The free memory after the fwd+bwd graph capture is only 10.9 GiB, and it's fragmented — the 2.08 GiB bf16 save buffer allocation OOMs with 519 MiB free.
+
+2. **Negligible benefit**: The current optimizer step uses `torch._fused_adamw_` (single fused kernel) and `torch._foreach_copy_` (single fused kernel) — only ~2 kernel launches worth of CPU launch overhead. The optimizer step CUDA graph would save at most ~15ms/step, which is only 0.3% of the step time (4504ms). The ~10 GiB of save/restore memory is not worth the small benefit.
+
+3. **Memory fragmentation**: The fwd+bwd graph's private pools (~11 GiB) fragment the free memory. Adding `torch.cuda.empty_cache()` after the graph capture doesn't help because the private pools are not part of the allocator's cache.
+
+### Profile analysis (long-horizon_round76)
+
+The Round 76 profile confirms the residual-add + RMSNorm fusion has a negligible impact:
+- **Step time**: 4504ms, MFU: 29.2%
+- **GPU kernel**: 2883ms (64%), GPU idle: 1621ms (36%)
+- **Frozen operators**: flash_attn 848ms (29.5%) + cuBLAS GEMM 889ms (30.9%) = 60.4% of GPU kernel time
+- **Triton kernels**: 192ms (6.6%) — _rope_kernel 84ms, _ce_bwd_kernel 63ms, _swiglu_bwd_kernel 45ms
+- **Copy/elementwise**: 294ms (10.2%) — direct_copy_kernel 112ms, elementwise_kernel 93ms, BinaryFunc 89ms
+- **CUDA API overhead**: cudaMemcpyAsync 1572ms (NCCL), cudaGraphLaunch 758ms, cudaStreamSynchronize 574ms
+
+### Remaining optimization landscape
+
+The remaining optimization opportunities are all small or structurally hard:
+
+| Lever | Est. upside | Difficulty | Notes |
+|-------|------------|------------|-------|
+| Optimizer step CUDA graph | ~15ms (0.3%) | High (OOM) | ~10 GiB save/restore not feasible |
+| Gradient bucketing (NCCL overlap) | ~100ms (2.2%) | Medium | Regressed at DP=2 (Round 40) |
+| H2D copy batching | ~3ms (0.07%) | Low | Only 60 H2D copies/step from our path |
+| Further operator fusion | ~10ms (0.2%) | Low | Diminishing returns |
+| CUDA graph for full step | ~83ms (1.8%) | High (memory) | 10× intermediate tensors OOM |
+| GEMM swap (Triton wgrad) | ~100ms (2.2%) | Medium | Triton was 6% slower than cuBLAS (Round 46) |
+
+The structural bottlenecks (cudaGraphLaunch 758ms, cudaStreamSynchronize 574ms, frozen operators 60.4%) cannot be reduced without changing the CUDA graph structure, NCCL configuration, or the frozen operator set.
+
+### Gate results
+
+- **long-train-smoke** (20 steps, DP=2): PASS (from previous round, MFU 29.3%)
+- **resume-gate-20** (25 steps, DP=2): PASS (from previous round)
+- **profile-snapshot (long-horizon_round76)**: PASS (step_time 4504ms, MFU 29.2%, GPU idle 1621ms)
+
+### Next steps
+
+The MFU is at 29.2% with all major Triton kernels enabled and CUDA graph active. The remaining optimization opportunities are small. The next round should consider:
+1. Re-evaluating gradient bucketing at DP=2 with the current CUDA_DEVICE_MAX_CONNECTIONS=8 (was tested with CUDA_DEVICE_MAX_CONNECTIONS=1)
+2. Exploring the `expandable_segments:True` path now that the RoPE kernel bounds check is fixed
+3. Declaring the long-horizon optimization as ready for PR review per the milestone's hand-off protocol

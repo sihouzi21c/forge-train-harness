@@ -832,6 +832,27 @@ This is a docs-only commit recording Round 71's profile analysis. The dev agent 
 
 ---
 
+## [stage1] Round 73 — 2026-08-15 13:39
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (profile snapshot round76, MFU 29.2%, GPU idle 1620ms/36%)
+- **Commit**: 74d265a — Docs: record Round 76 — fused residual-add + RMSNorm forward, MFU 29.2%
+
+### Key conclusions
+This is a docs-only commit that adds profile snapshot data (profile.json, summary.md) under `workload/notes/profile/long-horizon_round76/`. No engine source code was modified. The commit records the fused residual-add + RMSNorm forward kernel results (step_time 4503.7ms, MFU 29.20%, GPU idle 1620ms/36%). The `long-train-smoke` gate passed (loss_rel 0.24%) and `resume-gate-20` passed (bitwise, max_abs_diff=0). The engine (`forward.py`, `backward.py`, `train_loop.py`, `zero_optimizer.py`, `triton_kernels.py`) implements all forward/backward/optimizer/loss/metric computation in-process using genuine PyTorch/Triton operations — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. The only `ref/` imports are dataloader utilities at `train_loop.py:235,281`. Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` in the commit message. The long-horizon milestone check (review-side throughput bar) reports throughput below the review-side bar — no milestone advance.
+
+### Violations (fill in only on FAIL)
+(none)
+
+### Evidence highlights
+- Commit diff only touches `workload/notes/profile/long-horizon_round76/` — no engine source code changes
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- `long-train-smoke` PASS (loss_rel 0.24%), `resume-gate-20` PASS (bitwise, max_abs_diff=0)
+- Long-horizon throughput check: BELOW_BAND — no milestone advance
+
+---
+
 ## [stage1] Round 72 — 2026-08-15 13:13
 
 - **Verdict**: PASS
