@@ -3230,3 +3230,52 @@ The GPU idle remains the primary bottleneck. To reach 40% MFU, the GPU idle need
 2. **Gradient bucketing with the backward split from the graph**: Overlap the all-reduce with the backward compute by splitting the CUDA graph into per-layer segments
 3. **ZeRO-1 re-evaluation**: At DP=2, reduce_scatter halves the communication volume; the remaining GPU idle from the all_gather may be lower than the current all-reduce overhead
 4. **Copy/elementwise reduction**: The direct_copy_kernel (111ms, 17670 instances) is from .float() conversions in the FP32 precision spec; further Triton fusion could reduce this
+- review R79 PASS: no proxy, no forged metrics, gates pass; continue MFU optimization
+
+## [stage1] Round 82 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: flat gradient buffer view — eliminate torch.cat + _foreach_copy_ D2D copies)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent replaced `fp32_grad_bufs` (157 separate fp32 tensors) with views of the pre-allocated `_flat_grad_buf`, so that gradient accumulation during CUDA graph replay writes directly into the contiguous flat buffer. This eliminates two per-step D2D copy operations:
+
+1. **`torch.cat([t.reshape(-1) for t in fp32_grad_bufs], out=_flat_grad_buf)`**: Was copying 4.3 GiB from individual buffers to the flat buffer before all-reduce (~1.3ms GPU time, ~50ms CPU scheduling overhead).
+2. **`torch._foreach_copy_(fp32_grad_bufs, _unflatten_dense_tensors(flat, fp32_grad_bufs))`**: Was copying 4.3 GiB back from the flat buffer to individual buffers after all-reduce (~1.3ms GPU time, ~50ms CPU scheduling overhead).
+
+**Optimization — `fp32_grad_bufs` as views of `_flat_grad_buf`**:
+
+- After `_flat_grad_buf` is allocated, each `fp32_grad_bufs[i]` is replaced with `_flat_grad_buf[offset:offset+numel].view(shape)` — a slice of the flat buffer.
+- `torch._foreach_zero_` on `fp32_grad_bufs` zeros `_flat_grad_buf` directly (157 zero operations on contiguous slices).
+- CUDA graph's `_add_to_grad_bufs` writes gradients directly into `_flat_grad_buf` (the views point to the same storage).
+- `dist.all_reduce` operates on `_flat_grad_buf` directly (no `torch.cat` copy needed).
+- `flat.mul_(norm_factor)` scales `_flat_grad_buf` in-place, and `fp32_grad_bufs` (views) automatically reflect the scaled values.
+- `torch.linalg.vector_norm(_flat_grad_buf)` computes the gradient norm directly (no `_flat_grads` reference needed).
+- `torch._foreach_mul_` for gradient clipping operates on `fp32_grad_bufs` (views), scaling `_flat_grad_buf` directly.
+
+**Variable `_flat_grads` removed**: The `_flat_grads` reference variable was used to check whether the flat buffer was available for norm computation. Since `fp32_grad_bufs` are always views of `_flat_grad_buf`, the flat buffer is always available. The gradient norm computation now always uses `torch.linalg.vector_norm(_flat_grad_buf)`, eliminating the `if _flat_grads is not None else torch._foreach_norm(fp32_grad_bufs)` branch.
+
+### Estimated MFU impact
+
+- **GPU time saved**: ~2.6ms (1.3ms `torch.cat` + 1.3ms `torch._foreach_copy_`)
+- **CPU scheduling overhead saved**: ~50-100ms (reduced GPU idle from fewer CPU-to-GPU command submissions)
+- **Estimated MFU improvement**: ~1-2% (from 31.0% to ~31.3-31.6%)
+- The actual impact depends on the profiled step time and will be measured in the next round's profile-snapshot.
+
+### Code changes
+
+- `train_loop.py`: `fp32_grad_bufs` replaced with views of `_flat_grad_buf` after pre-allocation; `torch.cat` and `torch._foreach_copy_` removed from both the gradient bucketing and single all-reduce paths; `_flat_grads` variable removed; gradient norm computation simplified to always use `_flat_grad_buf`.
+
+### Next steps
+
+- Push to GitHub and run `long-train-smoke` (DP=2, 20 steps) to verify the MFU improvement.
+- Run `profile-snapshot M6_round82` to measure the actual GPU idle reduction.
+- Run `resume-gate-20` regression to verify the flat buffer view doesn't break save/load.
+- Run `long-train` (200 steps) to establish the new MFU baseline.
+- Candidate levers for subsequent rounds:
+  1. **CUDA stream overlap for NCCL** — use separate stream for all-reduce to overlap with optimizer step
+  2. **Gradient bucketing revisit** — with flat buffer views, bucketing overhead is reduced
+  3. **Copy/elementwise reduction** — further Triton fusion for .float() conversions

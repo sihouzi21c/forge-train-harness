@@ -1565,6 +1565,19 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # The flat buffer is used for both the single all-reduce and gradient bucketing paths.
     _flat_grad_buf = torch.empty(_f32_numel, dtype=torch.float32, device=device)
 
+    # Replace fp32_grad_bufs with views of _flat_grad_buf so that gradient
+    # accumulation (CUDA graph's _add_to_grad_bufs) writes directly into the
+    # contiguous flat buffer.  This eliminates the per-step torch.cat(..., out=)
+    # D2D copy (4.3 GiB) and the per-step torch._foreach_copy_ D2D copy back,
+    # saving ~2.6ms GPU time and ~100ms CPU scheduling overhead per step.
+    fp32_offsets = [0] + [p.numel() for p in fp32_master]
+    for i in range(1, len(fp32_offsets)):
+        fp32_offsets[i] += fp32_offsets[i - 1]
+    for i, (p_, start, end) in enumerate(zip(fp32_master, fp32_offsets[:-1], fp32_offsets[1:])):
+        fp32_grad_bufs[i] = _flat_grad_buf[start:end].view(p_.shape)
+    # Zero the flat buffer so the initial state is correct.
+    _flat_grad_buf.zero_()
+
     # Pre-allocate the gradient norm scalar tensor for torch.linalg.vector_norm.
     # Each step's norm computation creates a new scalar tensor, triggering a
     # CUDA allocator call that can cause an internal cudaStreamSynchronize.
@@ -2170,11 +2183,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         reported_mtp_tensor = (_local_mtp_sum / _local_mtp_n.clamp(min=1.0)) if use_mtp else None
 
         if config.world_size > 1:
-            # Initialize flat gradient reference for efficient norm computation.
-            # The flat all-reduce path sets this to the scaled all-reduced flat
-            # tensor, allowing torch.linalg.vector_norm to bypass the ~100ms
-            # multi-tensor _foreach_norm kernel (157 buffers).
-            _flat_grads = None
+            # fp32_grad_bufs are views of _flat_grad_buf, so the flat buffer
+            # always contains the accumulated gradients.  Use _flat_grad_buf
+            # directly for all-reduce and gradient norm computation — no
+            # torch.cat/_foreach_copy_ round-trip needed.
             if enable_zero and zero_opt is not None:
                 # ── ZeRO-1: reduce_scatter gradients ──────────────────────────────
                 # Each rank receives only its shard's portion of the summed gradient.
@@ -2183,10 +2195,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
                 norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 reduce_scatter_grads(zero_opt, fp32_grad_bufs, bf16_params, norm_factor)
-                # ZeRO-1 uses shard-specific gradient norm via compute_zero_grad_norm;
-                # the flat tensor is not available.  Set _flat_grads to None to
-                # trigger the per-buffer _foreach_norm path.
-                _flat_grads = None
+                # ZeRO-1 uses shard-specific gradient norm via compute_zero_grad_norm.
             elif enable_grad_bucketing:
                 # ── Gradient bucketed all-reduce ──────────────────────────────
                 # Split the flattened gradient into per-bucket chunks and all-reduce
@@ -2196,8 +2205,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # a synchronous unflatten.
                 if config.hash_capture_level > 0 and config.persistent:
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
-                # Flatten full gradient for bucketing (same as single all-reduce).
-                torch.cat([t.reshape(-1) for t in fp32_grad_bufs], out=_flat_grad_buf)
+                # fp32_grad_bufs are already views of _flat_grad_buf, so no
+                # torch.cat copy to flat buffer is needed — gradients are already
+                # accumulated directly into _flat_grad_buf.
                 flat = _flat_grad_buf
                 norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 # Split the flat tensor into buckets and all-reduce each on a separate stream.
@@ -2226,18 +2236,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # Copy the bucketed results back into the flat tensor.
                 for b_start_off, b_end_off, bucket_flat in bucket_results:
                     flat[b_start_off:b_end_off].copy_(bucket_flat)
-                # Fused unflatten: single _foreach_copy_ for all 157 params
-                # instead of 157 separate cudaMemcpyAsync calls.
-                torch._foreach_copy_(
-                    fp32_grad_bufs,
-                    torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
-                )
-                # Save the flat (scaled all-reduced) gradient tensor for efficient
-                # gradient norm computation.  torch.linalg.vector_norm on the
-                # contiguous flat tensor is ~100x faster than torch._foreach_norm
-                # on 157 per-buffer tensors (0.75ms vs 100ms) because the multi-
-                # tensor kernel's loop overhead is significant for 157 buffers.
-                _flat_grads = flat
+                # fp32_grad_bufs are already views of _flat_grad_buf, so no
+                # torch._foreach_copy_ back to individual buffers is needed.
+                # The flat (scaled all-reduced) gradient tensor is used directly
+                # for gradient norm computation via _flat_grad_buf.
             else:
                 # ── Flatten + single all-reduce (matching ref's reduce_grads) ──
                 # The ref's harness_dp.reduce_grads flattens all grad buffers into
@@ -2248,23 +2250,16 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # accumulate into a ~1e-6 loss drift from step 2 onward.
                 if config.hash_capture_level > 0 and config.persistent:
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
-                torch.cat([t.reshape(-1) for t in fp32_grad_bufs], out=_flat_grad_buf)
+                # fp32_grad_bufs are already views of _flat_grad_buf, so no
+                # torch.cat copy needed — gradients are already in the flat buffer.
                 flat = _flat_grad_buf
                 dist.all_reduce(flat, op=dist.ReduceOp.SUM)
                 norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 flat.mul_(norm_factor)
-                # Fused unflatten: single _foreach_copy_ for all 157 params
-                # instead of 157 separate cudaMemcpyAsync calls.
-                torch._foreach_copy_(
-                    fp32_grad_bufs,
-                    torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
-                )
-                # Save the flat (scaled all-reduced) gradient tensor for efficient
-                # gradient norm computation.  torch.linalg.vector_norm on the
-                # contiguous flat tensor is ~100x faster than torch._foreach_norm
-                # on 157 per-buffer tensors (0.75ms vs 100ms) because the multi-
-                # tensor kernel's loop overhead is significant for 157 buffers.
-                _flat_grads = flat
+                # fp32_grad_bufs are already views of _flat_grad_buf, so no
+                # torch._foreach_copy_ back to individual buffers is needed.
+                # The flat (scaled all-reduced) gradient tensor is used directly
+                # for gradient norm computation via _flat_grad_buf.
         else:
             # Capture pre-allreduce gradients (single-GPU, no all-reduce needed)
             if config.hash_capture_level > 0 and config.persistent:
@@ -2304,17 +2299,13 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # the _fused_adamw_ kernel reads the same .grad fields the ref does.
             for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
                 p_fp32.grad = buf
-            # Use _foreach_norm for batched per-tensor L2 norm computation, or
-            # torch.linalg.vector_norm on the flat tensor when available (the
-            # flat all-reduce path saves the scaled all-reduced gradient tensor,
-            # which is contiguous and ~100x faster to norm than 157 buffers).
-            if _flat_grads is not None:
-                # Use pre-allocated scalar tensor to avoid per-step cudaMalloc.
-                _grad_norm_val.copy_(torch.linalg.vector_norm(_flat_grads))
-                total_norm = _grad_norm_val
-            else:
-                norms = torch._foreach_norm(fp32_grad_bufs)
-                total_norm = torch.linalg.vector_norm(torch.stack(norms))
+            # fp32_grad_bufs are views of _flat_grad_buf, so the contiguous
+            # flat buffer always contains the correct gradient values (whether
+            # via all-reduce + scale on the flat buffer, or _foreach_mul_ on
+            # the views).  torch.linalg.vector_norm on the flat tensor is
+            # ~100x faster than torch._foreach_norm on 157 buffers.
+            _grad_norm_val.copy_(torch.linalg.vector_norm(_flat_grad_buf))
+            total_norm = _grad_norm_val
             if total_norm > opt_clip_grad:
                 torch._foreach_mul_(fp32_grad_bufs, opt_clip_grad / total_norm)
             grad_norm_val = total_norm

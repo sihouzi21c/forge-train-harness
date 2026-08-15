@@ -1007,3 +1007,26 @@ The dev agent pre-allocated the flat gradient buffer (4.3 GiB fp32) and the grad
 - profile-snapshot (long-horizon_round81): PASS (step_time 4223ms, MFU 31.13%, GPU idle 1360ms)
 - Long-horizon throughput check: BELOW_BAND — no milestone advance
 - No run-shape key modifications; no `config/remote.toml` changes
+
+---
+
+## [stage1] Round 79 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress
+- **Commit**: 8b49dda — Docs: Docs: record Round 81 — pre-allocate flat gradient buffer + grad norm tensor, MFU 31.0%, long-train PASS
+
+### Key conclusions
+This is a docs-only commit (the dev agent recorded Round 81's results: pre-allocated flat gradient buffer + grad norm tensor, long-train PASS at 31.0% MFU). The engine (`forward.py`, `backward.py`, `train_loop.py`, `zero_optimizer.py`, `triton_kernels.py`) implements all forward/backward/optimizer/loss/metric computation in-process — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. The only `ref/` imports are dataloader utilities at `train_loop.py:235,281`. Anti-proxy guard: PASSED (0 violations). Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` in the commit message. Long-horizon throughput check: below review-side bar — no milestone advance.
+
+### Violations (fill in only on FAIL)
+(none)
+
+### Evidence highlights
+- Anti-proxy guard: PASSED (0 violations)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- No run-shape key modifications; no `config/remote.toml` changes
+- Long-horizon: below review-side throughput bar, continue MFU optimization
+
+---
