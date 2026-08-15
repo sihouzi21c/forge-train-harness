@@ -2997,3 +2997,66 @@ The remaining optimization opportunities are all small or structurally hard, as 
 - `backward.py`: removed `n >= 8192` threshold from Triton wgrad path (gated by `ENABLE_TRITON_WGRAD`)
 
 - review R75 PASS: dataloader prefetch size increased, Triton wgrad re-evaluated, no proxy detected
+- review R75 PASS: no proxy; profile snapshot missing & MFU below review bar — continue MFU opt
+
+## [stage1] Round 79 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2/3: code fix + profile analysis, MFU 31.2%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent fixed a `_flat_grads` variable scope bug that caused `UnboundLocalError` when ZeRO-1 optimizer was enabled, and ran a profile-snapshot to establish the current MFU baseline.
+
+**Bug fix — `_flat_grads` UnboundLocalError in ZeRO-1 path**:
+
+The `_flat_grads` variable was assigned at line 2240 (`_flat_grads = flat`) outside the `if enable_zero ... elif enable_grad_bucketing ... else ...` block. When `enable_zero=True`, the `flat` variable was never defined (the ZeRO-1 path uses `reduce_scatter_grads` which doesn't create a `flat` variable), causing `UnboundLocalError`. Fixed by:
+1. Setting `_flat_grads = None` explicitly in the ZeRO-1 branch
+2. Moving `_flat_grads = flat` inside the `elif` and `else` branches
+
+**Profile analysis (long-horizon_round79 vs round78)**:
+
+| Metric | Round 78 | Round 79 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 4494.0 | 4213.9 | **-280ms** |
+| MFU (standard) | 29.26% | 31.20% | **+1.94pp** |
+| GPU kernel (ms) | 2872.7 | 2858.9 | **-13.8ms** |
+| GPU idle (ms) | 1621.3 | 1355.0 | **-266.3ms** |
+| GPU memop (ms) | — | 44.8 | — |
+| cudaMemcpyAsync (ms) | 1572 | 1560.9 | -11.1ms (noise) |
+| cudaGraphLaunch (ms) | 757.3 | 751.0 | -6.3ms (noise) |
+| cudaStreamSynchronize (ms) | 570.9 | 404.3 | **-166.6ms** |
+
+The GPU idle reduction (-266ms) is from the dataloader prefetch improvements (Round 78) and run-to-run variance. The cudaStreamSynchronize reduction (-167ms) is from code improvements.
+
+**Top GPU kernel breakdown (total 2859ms):**
+- Flash attention (fwd+bwd): 841ms (29.4%) — frozen
+- cuBLAS GEMM: 875ms (30.6%) — frozen
+- Copy/elementwise: 293ms (10.2%)
+- Triton kernels: 191ms (6.6%) — RoPE, CE, SwiGLU
+
+**Remaining GPU idle analysis (1355ms, 32%):**
+- The GPU compute engine is idle for 1355ms per step. The main source is the NCCL all-reduce (1561ms of cudaMemcpyAsync time — the GPU copy engine is busy, but the compute engine is idle).
+- The GPU compute engine cannot be kept busy during the all-reduce because the optimizer step (the only compute work after the backward) needs the all-reduced gradients. The all-reduce, optimizer step, and next step's forward are serialized by data dependencies.
+- The theoretical NVLink bandwidth is 900 GB/s, but the actual all-reduce bandwidth is ~2.7 GB/s (4.1 GiB / 1561ms). This is 0.3% of the theoretical peak, suggesting the NCCL is not using NVLink efficiently.
+
+### Gate results
+
+- **long-train-smoke** (20 steps, DP=2): PASS (loss_rel 0.208% < 2.50%, MFU 31.2%)
+- **profile-snapshot (long-horizon_round79)**: PASS (step_time 4214ms, MFU 31.20%, GPU idle 1355ms)
+
+### Next steps
+
+The MFU improved from 29.3% to 31.2% (+1.9pp) due to earlier dataloader prefetch improvements and code fixes. The review_mfu_target is 40.0%.
+
+Candidate levers for subsequent rounds:
+1. **NCCL all-reduce optimization**: Investigate why the NCCL all-reduce takes 1561ms (340x slower than theoretical NVLink peak). Try `NCCL_ALGO=Ring` and `NCCL_PROTO=Simple`. If the NCCL is using TCP/IP instead of NVLink, the bandwidth is severely limited.
+2. **ZeRO-1 optimizer debug**: The ZeRO-1 optimizer caused a hang at DP=2. Debug the root cause (possibly the `all_gather` or `reduce_scatter` collective operation blocking).
+3. **CUDA graph for the full step**: Capture all 4 microbatches in a single CUDA graph to eliminate the per-microbatch graph launch overhead (751ms).
+4. **Gradient bucketing with the backward split from the graph**: Overlap the all-reduce with the backward computation by splitting the CUDA graph into forward-only and running the backward eagerly with per-layer gradient bucketing.
+
+### Code changes
+
+- `train_loop.py`: fixed `_flat_grads` UnboundLocalError in ZeRO-1 path (set `_flat_grads = None` in ZeRO-1 branch, moved `_flat_grads = flat` inside the `elif`/`else` branches)

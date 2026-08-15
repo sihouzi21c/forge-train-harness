@@ -1587,7 +1587,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     enable_zero = (
         config.world_size > 1
         and not deterministic
-        and int(os.environ.get("ENABLE_ZERO_OPTIMIZER", "0"))  # default 0: DP=2 overhead > benefit; enable for larger DP
+        and int(os.environ.get("ENABLE_ZERO_OPTIMIZER", "0"))  # default 0: ZeRO-1 causes hang at DP=2; debug pending
     )
     zero_opt: ZeroOptimizer | None = None
     if enable_zero:
@@ -2168,6 +2168,10 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
                 norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 reduce_scatter_grads(zero_opt, fp32_grad_bufs, bf16_params, norm_factor)
+                # ZeRO-1 uses shard-specific gradient norm via compute_zero_grad_norm;
+                # the flat tensor is not available.  Set _flat_grads to None to
+                # trigger the per-buffer _foreach_norm path.
+                _flat_grads = None
             elif enable_grad_bucketing:
                 # ── Gradient bucketed all-reduce ──────────────────────────────
                 # Split the flattened gradient into per-bucket chunks and all-reduce
@@ -2212,6 +2216,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     fp32_grad_bufs,
                     torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
                 )
+                # Save the flat (scaled all-reduced) gradient tensor for efficient
+                # gradient norm computation.  torch.linalg.vector_norm on the
+                # contiguous flat tensor is ~100x faster than torch._foreach_norm
+                # on 157 per-buffer tensors (0.75ms vs 100ms) because the multi-
+                # tensor kernel's loop overhead is significant for 157 buffers.
+                _flat_grads = flat
             else:
                 # ── Flatten + single all-reduce (matching ref's reduce_grads) ──
                 # The ref's harness_dp.reduce_grads flattens all grad buffers into
@@ -2232,12 +2242,12 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     fp32_grad_bufs,
                     torch._utils._unflatten_dense_tensors(flat, fp32_grad_bufs),
                 )
-            # Save the flat (scaled all-reduced) gradient tensor for efficient
-            # gradient norm computation.  torch.linalg.vector_norm on the
-            # contiguous flat tensor is ~100x faster than torch._foreach_norm
-            # on 157 per-buffer tensors (0.75ms vs 100ms) because the multi-
-            # tensor kernel's loop overhead is significant for 157 buffers.
-            _flat_grads = flat
+                # Save the flat (scaled all-reduced) gradient tensor for efficient
+                # gradient norm computation.  torch.linalg.vector_norm on the
+                # contiguous flat tensor is ~100x faster than torch._foreach_norm
+                # on 157 per-buffer tensors (0.75ms vs 100ms) because the multi-
+                # tensor kernel's loop overhead is significant for 157 buffers.
+                _flat_grads = flat
         else:
             # Capture pre-allreduce gradients (single-GPU, no all-reduce needed)
             if config.hash_capture_level > 0 and config.persistent:
