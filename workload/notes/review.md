@@ -796,3 +796,22 @@ The dev agent increased `_BackgroundPrefetcher.max_size` from 16 to 32 to give t
 - `train_loop.py:319,1637` — `max_size` default changed from 8 to 32, instantiation from 16 to 32
 - `bin/harness run anti-proxy`: PASS (0 violations)
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---
+
+## [stage1] Round 70 — 2026-08-15 10:51
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress
+- **Commit**: 84c2ed1 — Perf: enable Triton fused kernels + CUDA_DEVICE_MAX_CONNECTIONS=8, MFU 29.2%
+
+### Key conclusions
+The dev agent enabled six pre-existing Triton fused kernels (RMSNorm fwd/bwd, SwiGLU fwd/bwd, RoPE fwd/bwd) and set `CUDA_DEVICE_MAX_CONNECTIONS=8` in long-horizon gate configs. This is a genuine config-only optimization — no proxy, no forgery, no hardcoded synthetic metrics. The Triton kernels were already implemented and gated by env vars defaulting to 0; this commit simply flips those env vars to "1" for the long-horizon path. The anti-proxy guard passes (0 violations). Stage 1 remains in-progress: the commit message does not declare `STAGE_STATUS: finished`.
+
+### Evidence highlights
+- Config files `long-train.toml`, `long-train-smoke.toml`, `loss-gate-200.toml` — added 7 env var keys each (CUDA_DEVICE_MAX_CONNECTIONS + 6 Triton kernel flags)
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---

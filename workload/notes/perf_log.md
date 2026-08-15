@@ -2760,3 +2760,48 @@ The `CUDA_DEVICE_MAX_CONNECTIONS=8` might not have helped because the DP=2 ring 
   1. **Residual-add + RMSNorm forward fusion** — fuse `hidden + attn_out * depth_scale` into the RMSNorm forward kernel, saving ~2ms per layer
   2. **NCCL overlap with optimizer step** — move the all-reduce to a separate stream and overlap with the optimizer step (currently sequential)
   3. **Triton wgrad re-tiling** — re-tile the Triton wgrad kernel for the output weight shape (V=130560, H=2048, B*S=4096) and benchmark against cuBLAS TF32
+- review R70 PASS: config-only Triton enable, no proxy detected
+
+## [stage1] Round 71 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 4: profile analysis — GPU idle 1661ms, 37%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent ran the full profile-snapshot (long-horizon_round71) on a new devspace (ds-722156) with all 6 Triton fused kernels enabled and CUDA_DEVICE_MAX_CONNECTIONS=8. The profile reveals the current bottleneck:
+
+**Profile analysis (long-horizon_round71)**:
+- **Step time**: 4495ms
+- **GPU kernel time**: 2834ms (63%)
+- **GPU idle**: 1661ms (37%)
+- **MFU(standard)**: 29.3%
+- **Top GPU kernels**: flash_bwd 556ms (19.6%), flash_fwd 277ms (9.8%), cuBLAS GEMMs 876ms (30.9%)
+- **CUDA API overhead**: 3277ms total — cudaMemcpyAsync 1538ms (46.9%), cudaGraphLaunch 744ms (22.7%), cudaStreamSynchronize 566ms (17.3%)
+- **OS runtime**: 59333ms — poll 22900ms (NCCL), pthread_cond_timedwait 11804ms, pthread_cond_wait 7689ms
+
+**GPU idle analysis**:
+The 1661ms of GPU idle (37% of step time) is primarily from the CUDA allocator's `expandable_segments:True` overhead (sem_clockwait 5000ms, sem_wait 4610ms across all threads). Attempting to disable `expandable_segments` causes a Triton illegal memory access in the RoPE kernel, likely due to the allocator's memory layout changing. The GPU idle is structural — the CPU cannot keep the GPU busy because of the CUDA allocator's segment creation overhead.
+
+**Attempted optimizations (reverted)**:
+- `expandable_segments:False` — causes Triton illegal memory access, reverted
+- H2D flattening for cudaMemcpyAsync batching — `torch._utils._flatten_dense_tensors` can't handle mixed dtypes (long, long, float32), reverted
+
+**Long-train gate**: 133/200 steps completed (killed by SIGTERM from unrelated pkill cleanup). MFU 28.8-29.0% for all 133 steps. `loss_rel` and `signed_rel` not computed (gate incomplete).
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: PASS (loss_rel 0.237% < 2.50%, signed_rel +0.0127%, MFU 29.3%)
+- **profile-snapshot (long-horizon_round71)**: PASS (step_time 4495ms, MFU 29.25%, GPU idle 1661ms)
+- **long-train (200 steps, DP=2)**: INCOMPLETE (133/200 steps, killed by SIGTERM, MFU 28.8-29.0%)
+
+### Next steps
+
+- Re-run long-train (200 steps) to establish the baseline MFU
+- Run resume-gate-20 regression to verify the Triton kernels don't break save/load
+- Candidate levers:
+  1. Gradient bucketing revisited — with CUDA_DEVICE_MAX_CONNECTIONS=8, the all-reduce is faster, making bucketing potentially beneficial
+  2. CUDA graph for optimizer step — the optimizer step (~100ms) is outside the graph; capturing it could reduce kernel launch overhead
+  3. Reduce the number of cudaMemcpyAsync calls via mixed-dtype flattening (torch.cat with byte-level packing)
