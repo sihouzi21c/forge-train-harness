@@ -764,3 +764,21 @@ The dev agent increased `_BackgroundPrefetcher.max_size` from 8 to 16, giving th
 - `train_loop.py:1639` — `max_size=16` at the instantiation site
 - `bin/harness run anti-proxy`: PASS (0 violations, run in prior round)
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---
+
+## [stage1] Round 68 — 2026-08-15 09:23
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 9710f5e — Docs: record Round 72 review — _BackgroundPrefetcher max_size 16, MFU 28.9%, long-train PASS
+
+### Key conclusions
+The commit is docs-only (`workload/notes/review.md`), recording the Round 72 review entry for the `_BackgroundPrefetcher max_size` 8→16 optimization. The engine files are untouched — the previous commit (30d1551) performed the actual change. No proxy, no forgery, no hardcoded synthetic metrics detected. The `bin/harness run anti-proxy` guard passes (0 violations). Stage 1 remains in-progress: the commit message does not declare `STAGE_STATUS: finished`, and `perf_log.md` is still missing `resume-startup-90` and `perf-bitwise` evidence for the stage finish hand-off bundle.
+
+### Evidence highlights
+- `git diff HEAD~1 HEAD --name-only`: only `workload/notes/review.md` changed
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---
