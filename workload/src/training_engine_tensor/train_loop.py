@@ -1634,7 +1634,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # thread.  Must be started after _advance_dataloader (which reads from
     # iter_dl directly) to avoid a race on the shared iterator.
     dl_prefetcher: _BackgroundPrefetcher | None = None
-    if int(os.environ.get("ENABLE_DL_PREFETCH", "1")):
+    if int(os.environ.get("ENABLE_DL_PREFETCH", "1")) and not deterministic:
         dl_prefetcher = _BackgroundPrefetcher(
             iter_dl, max_size=8,
             B=config.micro_batch_size, S=C.MAX_SEQ_LEN,
