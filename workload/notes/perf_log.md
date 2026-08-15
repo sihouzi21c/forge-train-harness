@@ -3180,3 +3180,53 @@ The GPU idle is the primary bottleneck. To reach 40% MFU, the GPU idle needs to 
 3. **ZeRO-1 re-evaluation**: At DP=2, reduce_scatter halves the communication volume; the remaining GPU idle from the all_gather may be lower than the current all-reduce overhead
 4. **Copy/elementwise reduction**: The direct_copy_kernel (111ms, 17670 instances) is from .float() conversions in the FP32 precision spec; further Triton fusion could reduce this
 - review R78 PASS: pure NCCL config tuning, no proxy, no forged metrics, gates pass
+
+## [stage1] Round 81 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: pre-allocate flat gradient buffer + grad norm tensor)
+- **Commit**: f42bfaf — Perf: pre-allocate flat gradient buffer + grad norm tensor — reduce 4.3 GiB/step allocation, reduce GPU idle
+
+### Key conclusions
+
+The dev agent pre-allocated the flat gradient buffer (4.3 GiB fp32) and the gradient norm scalar tensor to avoid per-step CUDA allocations. The `torch._utils._flatten_dense_tensors(fp32_grad_bufs)` call was replaced with `torch.cat(..., out=_flat_grad_buf)`, eliminating the per-step 4.3 GiB allocation that could trigger an internal `cudaStreamSynchronize` when the CUDA allocator cache was fragmented by the CUDA graph's private pools (~20.96 GiB).
+
+**Optimization — pre-allocate flat gradient buffer**:
+- Added `_flat_grad_buf = torch.empty(_f32_numel, dtype=torch.float32, device=device)` in the setup phase.
+- Replaced `flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)` with `torch.cat([t.reshape(-1) for t in fp32_grad_bufs], out=_flat_grad_buf)` in both the gradient bucketing and single all-reduce paths.
+- The pre-allocated buffer is reused for the `_flat_grads` reference used in gradient norm computation, so the `torch.linalg.vector_norm` path now operates on a stable pre-allocated address.
+
+**Optimization — pre-allocate gradient norm scalar**:
+- Added `_grad_norm_val = torch.zeros((), device=device, dtype=torch.float32)` in the setup phase.
+- Replaced `total_norm = torch.linalg.vector_norm(_flat_grads)` with `_grad_norm_val.copy_(torch.linalg.vector_norm(_flat_grads))`.
+- Saves 1 cudaMalloc per step (the scalar tensor allocation).
+
+### Gate results
+
+| Gate | Status | MFU | Details |
+|------|--------|-----|---------|
+| long-train-smoke (20 steps, DP=2) | PASS | 31.2% | loss_rel 0.208% < 2.50%, no drift |
+| long-train (200 steps, DP=2) | PASS | 31.0% | loss_rel 1.222% < 2.50%, no drift |
+| resume-gate-20 (25 steps, DP=2) | PASS | bitwise | max_abs_diff=0, 9420/9420 hash |
+| profile-snapshot (long-horizon_round81) | PASS | 31.13% | step_time 4223ms, GPU idle 1360ms |
+
+### Analysis
+
+The pre-allocation optimization did NOT meaningfully reduce the GPU idle (1360ms vs 1360ms, within run-to-run noise). The cudaMalloc count (806 vs 807) is essentially unchanged, confirming that the bulk of per-step allocations are from the `torch._fused_adamw_` kernel's internal temporary tensors, not from the `_flatten_dense_tensors` call.
+
+The GPU idle (1360ms, 32.2%) remains the primary bottleneck. The profile shows:
+- cudaMemcpyAsync: 1047 calls, 1583ms CPU time (unchanged)
+- cudaGraphLaunch: 82 calls, 752ms CPU time (unchanged)
+- cudaMalloc: 806 calls, 111ms CPU time (slightly higher, run-to-run)
+
+The 1047 cudaMemcpyAsync calls are dominated by the CUDA graph's internal copies (visible via `--cuda-graph-trace=node`). The pre-allocated flat buffer saves 1 cudaMalloc per step, but the impact on the overall GPU idle is negligible.
+
+### Next steps
+
+The GPU idle remains the primary bottleneck. To reach 40% MFU, the GPU idle needs to be reduced from 1360ms to ~340ms. Candidate levers for the next round:
+
+1. **CUDA stream overlap for NCCL**: Use a separate CUDA stream for the all-reduce to overlap NCCL communication with the optimizer step or next-step forward
+2. **Gradient bucketing with the backward split from the graph**: Overlap the all-reduce with the backward compute by splitting the CUDA graph into per-layer segments
+3. **ZeRO-1 re-evaluation**: At DP=2, reduce_scatter halves the communication volume; the remaining GPU idle from the all_gather may be lower than the current all-reduce overhead
+4. **Copy/elementwise reduction**: The direct_copy_kernel (111ms, 17670 instances) is from .float() conversions in the FP32 precision spec; further Triton fusion could reduce this
