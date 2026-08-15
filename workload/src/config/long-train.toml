@@ -61,7 +61,7 @@ CUDA_DEVICE_MAX_CONNECTIONS = "8"
 # The default NCCL config produces ~1039 cudaMemcpyAsync calls/step (1561ms)
 # for the 4.1 GiB all-reduce at DP=2, which is only 0.3% of NVLink bandwidth.
 # These settings increase parallelism and reduce per-call overhead.
-NCCL_ALGO = "Ring"
+NCCL_ALGO = "Tree"
 NCCL_PROTO = "Simple"
 NCCL_MIN_NCHANNELS = "16"
 NCCL_NTHREADS = "256"

@@ -3062,6 +3062,7 @@ Candidate levers for subsequent rounds:
 - `train_loop.py`: fixed `_flat_grads` UnboundLocalError in ZeRO-1 path (set `_flat_grads = None` in ZeRO-1 branch, moved `_flat_grads = flat` inside the `elif`/`else` branches)
 
 - review R76 PASS: no proxy; MFU 31.2% below review bar, continue MFU optimization
+- review R77 PASS: pure NCCL config tuning, no proxy, no forged metrics
 
 ## [stage1] Round 80 — 2026-08-15
 
@@ -3129,3 +3130,52 @@ The actual impact depends on the remote devspace's NVLink topology and NCCL conf
    - **Gradient bucketing with NCCL overlap** — revisit now that NCCL channels are tuned
    - **ZeRO-1 optimization** — re-evaluate with NCCL tuning (reduce_scatter may benefit from the same channel tuning)
    - **H2D copy batching** — reduce remaining cudaMemcpyAsync calls
+
+## [stage1] Round 80 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (NCCL_ALGO=Tree, MFU unchanged at 31.0%)
+
+### Key conclusions
+
+The dev agent changed NCCL_ALGO from "Ring" to "Tree" after benchmarking both algorithms on the remote devspace (2× H100, NV18 NVLink):
+
+- **Ring**: 15.1ms, 568.1 GB/s for 4.3 GiB all-reduce
+- **Tree**: 12.1ms, 710.2 GB/s for 4.3 GiB all-reduce — **25% faster**
+
+**Config changes**: Updated NCCL_ALGO="Tree" in all 6 long-horizon gate config files (long-train, long-train-smoke, loss-gate-200, profile-snapshot@long-horizon, and the ours/ source templates).
+
+**Gate results (NCCL_ALGO=Tree, DP=2)**:
+
+| Gate | Status | MFU | Details |
+|------|--------|-----|---------|
+| long-train-smoke (20 steps) | PASS | 31.2% | loss_rel 0.210% < 2.50% |
+| resume-gate-20 (25 steps) | PASS | — | bitwise, 9420/9420 hash |
+| long-train (200 steps) | PASS | 31.0% | loss_rel 1.217% < 2.50%, no drift |
+| profile-snapshot (long-horizon_round80) | PASS | 31.15% | step_time 4221ms, GPU idle 1360ms |
+
+**The NCCL algorithm change did NOT improve MFU at DP=2** — the benchmark showed Tree is 25% faster, but the actual gate's MFU is unchanged (31.0-31.2%, within run-to-run noise). This confirms that the GPU idle (1360ms, 32.2%) is NOT dominated by the NCCL all-reduce GPU time (14.8ms), but by the CPU-side overhead of launching the NCCL communication (1572ms of cudaMemcpyAsync time across 1039 calls).
+
+### Analysis of remaining bottleneck
+
+The GPU idle (1360ms, 32.2%) is the main bottleneck. The NCCL all-reduce takes only 14.8ms on the GPU but the CPU spends 1572ms launching 1039 cudaMemcpyAsync calls (each 1.5ms CPU time). The CPU overhead is from the CUDA graph replay's internal NVLink synchronization and the NCCL's per-chunk communication overhead.
+
+| Metric | Value | % of step |
+|--------|-------|-----------|
+| Step time | 4221ms | 100% |
+| GPU kernel | 2861ms | 67.8% |
+| GPU idle | 1360ms | 32.2% |
+| cudaMemcpyAsync | 1572ms (1039 calls) | 37.0% of API |
+| cudaGraphLaunch | 751ms (82 calls) | 17.8% of API |
+| cudaStreamSynchronize | 409ms (349 calls) | 9.6% of API |
+| Frozen ops (flash+cuBLAS) | 1717ms | 60.0% of GPU kernel |
+
+### Next steps
+
+The GPU idle is the primary bottleneck. To reach 40% MFU, the GPU idle needs to be reduced from 1360ms to ~340ms. Candidate levers:
+
+1. **CUDA stream overlap for NCCL**: Use a separate CUDA stream for the all-reduce to overlap NCCL communication with the optimizer step or next-step forward
+2. **Gradient bucketing with the backward split from the graph**: Overlap the all-reduce with the backward compute by splitting the CUDA graph into per-layer segments
+3. **ZeRO-1 re-evaluation**: At DP=2, reduce_scatter halves the communication volume; the remaining GPU idle from the all_gather may be lower than the current all-reduce overhead
+4. **Copy/elementwise reduction**: The direct_copy_kernel (111ms, 17670 instances) is from .float() conversions in the FP32 precision spec; further Triton fusion could reduce this

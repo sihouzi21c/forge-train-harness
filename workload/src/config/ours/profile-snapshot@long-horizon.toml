@@ -54,7 +54,7 @@ TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"
 # CUDA_DEVICE_MAX_CONNECTIONS: override global eval.toml default of "1" to "8".
 CUDA_DEVICE_MAX_CONNECTIONS = "8"
 # NCCL performance tuning: increase channels/threads for H100 NVLink.
-NCCL_ALGO = "Ring"
+NCCL_ALGO = "Tree"
 NCCL_PROTO = "Simple"
 NCCL_MIN_NCHANNELS = "16"
 NCCL_NTHREADS = "256"

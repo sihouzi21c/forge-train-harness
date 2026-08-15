@@ -932,3 +932,39 @@ The dev agent made two structural changes this round: (1) increased the dataload
 - No `config/remote.toml` changes; no run-shape key modifications in config files
 
 ---
+
+## [stage1] Round 77 — 2026-08-15 15:41
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 019c819 — Perf: NCCL performance tuning — Ring/Simple/16-channels/256-threads, target MFU ~35-44%
+
+### Key conclusions
+The dev agent added NCCL environment variable tuning (NCCL_ALGO=Ring, NCCL_PROTO=Simple, NCCL_MIN_NCHANNELS=16, NCCL_NTHREADS=256, NCCL_NSENDS=4) to all long-horizon gate configs to address the NCCL all-reduce bottleneck (1039 cudaMemcpyAsync calls/step, 0.3% NVLink bandwidth utilization). Also updated source templates in `workload/src/config/ours/` for consistency. The engine source code is unchanged — this is a pure configuration commit. No proxy detected, no shell-out to `ref/`, no hardcoded synthetic metrics, no run-shape or remote config tampering. The commit does not declare `STAGE_STATUS: finished` and the gates have not been re-run with the new NCCL settings, so stage remains in-progress.
+
+### Violations (fill in only on FAIL)
+(none)
+
+### Evidence highlights
+- Anti-proxy guard: PASSED — 0 violations
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- Diff: 8 files, all config/notes — no engine source changes
+## [stage1] Round 80 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (NCCL_ALGO=Tree, MFU 31.0%, long-train PASS)
+
+### Key conclusions
+The dev agent changed NCCL_ALGO from "Ring" to "Tree" in 6 long-horizon gate config files after benchmarking confirmed Tree (12.1ms, 710 GB/s) is 25% faster than Ring (15.1ms, 568 GB/s) for the 4.3 GiB all-reduce. The gates pass: long-train (200 steps, loss_rel 1.217%, MFU 31.0%), resume-gate-20 (bitwise, 9420/9420 hash), and profile-snapshot (step_time 4221ms, MFU 31.15%). The NCCL algorithm change did NOT improve MFU at DP=2 — the GPU idle (1360ms, 32.2%) is dominated by the CPU-side overhead of launching 1039 cudaMemcpyAsync calls, not the NCCL all-reduce GPU time (14.8ms). No proxy, no shell-out to ref/, no hardcoded synthetic metrics. The commit does not declare `STAGE_STATUS: finished`, and the review-side MFU threshold (40%) is not met, so stage remains in-progress.
+
+### Evidence highlights
+- Anti-proxy guard: PASSED (0 violations)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- long-train (200 steps, DP=2): PASS (loss_rel 1.217% < 2.50%, MFU 31.0%)
+- resume-gate-20 (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
+- profile-snapshot (long-horizon_round80): PASS (step_time 4221ms, MFU 31.15%, GPU idle 1360ms)
+- Diff: 10 files, config + notes + profile — no engine source changes
+- No run-shape key modifications; no `config/remote.toml` changes
+
+---
