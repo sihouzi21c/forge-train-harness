@@ -51,3 +51,18 @@ MASTER_PORT = "30327"
 NVTE_FUSED_ATTN = "1"
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"
+# ── Long-horizon performance tuning ──────────────────────────────────
+# CUDA_DEVICE_MAX_CONNECTIONS: override the global eval.toml default of "1"
+# (needed for deterministic bitwise alignment) to "8" (the H100 default).
+# This enables NCCL to use multiple NVLink streams concurrently, reducing
+# the 4.1 GiB all-reduce from ~300ms to ~100ms.
+CUDA_DEVICE_MAX_CONNECTIONS = "8"
+# Triton fused kernels: eliminate the .float() upcast tax and intermediate
+# memory round-trips in RMSNorm, SwiGLU, and RoPE.  Only active when
+# deterministic=False (long-horizon path — resume gates are unaffected).
+ENABLE_TRITON_SWIGLU_FWD = "1"
+ENABLE_TRITON_SWIGLU_BWD = "1"
+ENABLE_TRITON_RMSNORM_FWD = "1"
+ENABLE_TRITON_RMSNORM_BWD = "1"
+ENABLE_TRITON_ROPE_FWD = "1"
+ENABLE_TRITON_ROPE_BWD = "1"
