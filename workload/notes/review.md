@@ -815,3 +815,19 @@ The dev agent enabled six pre-existing Triton fused kernels (RMSNorm fwd/bwd, Sw
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 
 ---
+
+## [stage1] Round 71 — 2026-08-15 11:25
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 0c1b845 — Docs: record Round 71 — profile analysis, GPU idle 1661ms (37%), MFU 29.3%
+
+### Key conclusions
+This is a docs-only commit recording Round 71's profile analysis. The dev agent ran the full profile-snapshot suite on a new devspace, collected nsys-backed telemetry (step_time 4495ms, GPU idle 1661ms / 37%), and documented the bottleneck analysis. No source code in `workload/src/training_engine_tensor/` or `workload/ops/` was modified. The engine is genuinely implementing forward/backward/optimizer in-process — no proxy, no forgery, no hardcoded synthetic metrics. The long-train gate was killed by SIGTERM at 133/200 steps (unrelated pkill cleanup), so no green-light evidence is present for the stage FINISH decision. Stage 1 remains in-progress.
+
+### Evidence highlights
+- Diff is fully under `workload/notes/` (perf_log.md, review.md, profile data) — no engine source touched
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---

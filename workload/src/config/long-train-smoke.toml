@@ -50,7 +50,7 @@ NUM_PROCS = 2
 MASTER_ADDR = "localhost"
 MASTER_PORT = "30327"
 NVTE_FUSED_ATTN = "1"
-PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:False"
 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"
 # ── Long-horizon performance tuning ──────────────────────────────────
 CUDA_DEVICE_MAX_CONNECTIONS = "8"

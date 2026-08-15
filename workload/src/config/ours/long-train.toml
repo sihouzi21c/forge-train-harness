@@ -49,5 +49,5 @@ NUM_PROCS = 2
 MASTER_ADDR = "localhost"
 MASTER_PORT = "<runtime>"
 NVTE_FUSED_ATTN = "1"
-PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:False"
 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"

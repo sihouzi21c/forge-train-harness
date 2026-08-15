@@ -714,6 +714,7 @@ def _rope_kernel(
 
     offs = tl.arange(0, BLOCK_SIZE_D)
     mask = offs < D
+    half = D // 2
 
     # Load input a[b, s, h, :] bf16 -> fp32.
     a_offs = (b * stride_ab + s * stride_as + h * stride_ah +
@@ -729,26 +730,36 @@ def _rope_kernel(
     sin_ = tl.sin(freqs_val)
 
     # Compute rotated: the two halves of the head are swapped and negated.
-    half = D // 2
+    # The rotated computation needs to load from the opposite half of the
+    # input.  The a_second load reads from a[..., half + offs] and the
+    # a_first load reads from a[..., offs - half].  Both accesses are
+    # within the head's D elements when bounded by the correct mask.
+    #
+    #   a_second is only valid for offs < half (reads from the second half)
+    #   a_first is only valid for offs >= half (reads from the first half)
+    #
+    # Without these per-load masks, the kernel accesses memory beyond the
+    # tensor's allocated bounds when offs is near D-1 (a_second reads
+    # half elements past the end) or near 0 (a_first reads half elements
+    # before the start).  On expandable-segments virtual memory this is
+    # masked by the larger segment size, but on the legacy cudaMalloc
+    # allocator (expandable_segments:False) it causes a segfault.
+    half_mask = offs < half
+    second_half_mask = (offs >= half) & (offs < D)
+    # Load a_second from a[..., half + offs] (only valid for offs < half).
+    a_second = tl.load(a_ptr + a_offs + half * stride_ad, mask=half_mask, other=0.0)
+    # Load a_first from a[..., offs - half] (only valid for offs >= half).
+    a_first = tl.load(a_ptr + a_offs - half * stride_ad, mask=second_half_mask, other=0.0)
+
     if backward:
         # rotated = cat([a[half:], -a[:half]], dim=-1)
         # First half of output = second half of input (no negation).
         # Second half of output = first half of input (negated).
-        # Since offs iterates over the output positions, we need to
-        # load from the corresponding input halves.
-        half_mask = offs < half
-        # For offs < half: load from a[..., half + offs] (no negation)
-        # For offs >= half: load from a[..., offs - half] (negated)
-        a_second = tl.load(a_ptr + a_offs + half * stride_ad, mask=mask, other=0.0)
-        a_first = tl.load(a_ptr + a_offs - half * stride_ad, mask=mask, other=0.0)
         rotated = tl.where(half_mask, a_second, -a_first)
     else:
         # rotated = cat([-a[half:], a[:half]], dim=-1)
         # First half of output = second half of input (negated).
         # Second half of output = first half of input (no negation).
-        half_mask = offs < half
-        a_second = tl.load(a_ptr + a_offs + half * stride_ad, mask=mask, other=0.0)
-        a_first = tl.load(a_ptr + a_offs - half * stride_ad, mask=mask, other=0.0)
         rotated = tl.where(half_mask, -a_second, a_first)
 
     # output = a * cos_ + rotated * sin_

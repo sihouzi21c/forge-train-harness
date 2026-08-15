@@ -2805,3 +2805,54 @@ The 1661ms of GPU idle (37% of step time) is primarily from the CUDA allocator's
   1. Gradient bucketing revisited — with CUDA_DEVICE_MAX_CONNECTIONS=8, the all-reduce is faster, making bucketing potentially beneficial
   2. CUDA graph for optimizer step — the optimizer step (~100ms) is outside the graph; capturing it could reduce kernel launch overhead
   3. Reduce the number of cudaMemcpyAsync calls via mixed-dtype flattening (torch.cat with byte-level packing)
+- review R71 PASS: profile analysis round, achieved throughput insufficient, continue MFU optimization
+
+## [stage1] Round 75 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: RoPE kernel bounds fix + expandable_segments:False)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent fixed a Triton RoPE kernel out-of-bounds memory access that was masked by `expandable_segments:True` (CUDA virtual memory manager), and switched the long-horizon gate configs to `expandable_segments:False` for the old-allocator path.
+
+**Root cause — RoPE kernel out-of-bounds access**:
+
+The `_rope_kernel` was loading `a_second` from `a_ptr + a_offs + half * stride_ad` with `mask = offs < D` (the full head dimension). When `offs = D-1`, the load at `a_offs + (D-1) + half` is `half - 1` elements beyond the tensor's end. This is safe under `expandable_segments:True` (CUDA virtual memory segments are larger than the requested allocation, so the page is mapped), but causes a segfault under `expandable_segments:False` (the legacy `cudaMalloc` allocator returns exactly the requested size).
+
+**Fix**: Added per-load bounds masks (`half_mask` for `a_second` load, `second_half_mask` for `a_first` load) to prevent out-of-bounds reads. The `a_second` is only loaded when `offs < half` (within the first half of the head), and `a_first` is only loaded when `offs >= half` (within the second half). The `tl.where` selection already mirrored this logic, but the unconditional `tl.load` with the wrong mask allowed the out-of-bounds access.
+
+**Config change — `expandable_segments:False`**:
+
+The `PYTORCH_CUDA_ALLOC_CONF` was changed from `expandable_segments:True` to `expandable_segments:False` for the long-horizon gate configs (long-train, long-train-smoke, loss-gate-200, profile-snapshot). The `expandable_segments:True` default creates virtual memory segments on demand via `cuMemCreate`/`cuMemSetAccess`, which requires `cudaStreamSynchronize` (1.6ms per call) when the allocator pool is empty. The legacy `cudaMalloc` allocator avoids this synchronization overhead.
+
+### Profile analysis (long-horizon_round75 vs round71)
+
+| Metric | Round 71 | Round 75 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 4495.211 | 4490.144 | **-5ms** |
+| MFU (standard) | 29.25% | 29.28% | **+0.03pp** |
+| GPU kernel (ms) | 2834.367 | 2870.560 | +36ms (run-to-run) |
+| GPU idle (ms) | 1660.844 | 1619.584 | **-41ms** |
+| cudaStreamSynchronize (ms) | 566.168 | 570.043 | +4ms (run-to-run) |
+| cuMemCreate (calls) | 5996 | 0 | **-5996** (replaced by cudaMalloc) |
+| cudaMalloc (calls) | 0 | 766 | **+766** (new, legacy allocator) |
+
+The `cudaStreamSynchronize` is unchanged (570ms), confirming the syncs are from NCCL's internal synchronization, not from the CUDA allocator. The `expandable_segments:False` change replaced the virtual memory management calls (`cuMemCreate`/`cuMemSetAccess`/`cuMemRelease`/`cuMemUnmap`) with `cudaMalloc`/`cudaFree` calls, which are faster per-call but called more frequently. The net allocator overhead is similar.
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: PASS (loss_rel 0.237% < 2.50%, MFU **29.3%**)
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (max_abs_diff=0, 9420/9420 hash)
+- **profile-snapshot (long-horizon_round75)**: PASS (step_time 4490ms, MFU 29.28%)
+- **long-train (200 steps, DP=2)**: pending (running in background)
+
+### Next steps
+
+- The `expandable_segments:False` change provides a small MFU improvement (0.03pp). The main GPU idle bottleneck is from the CUDA graph launch overhead (752ms) and NCCL stream synchronization (570ms), which are structural.
+- Candidate levers for subsequent rounds:
+  1. **NCCL all-reduce overlap** — gradient bucketing with async NCCL (revisit at DP=2)
+  2. **CUDA graph for optimizer step** — capture the optimizer step into the graph (re-evaluate memory after CE optimization freed ~21 GiB)
+  3. **H2D copy batching** — reduce cudaMemcpyAsync calls by concatenating input tensors into a single pinned buffer per microbatch
