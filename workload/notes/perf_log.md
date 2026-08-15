@@ -3179,3 +3179,4 @@ The GPU idle is the primary bottleneck. To reach 40% MFU, the GPU idle needs to 
 2. **Gradient bucketing with the backward split from the graph**: Overlap the all-reduce with the backward compute by splitting the CUDA graph into per-layer segments
 3. **ZeRO-1 re-evaluation**: At DP=2, reduce_scatter halves the communication volume; the remaining GPU idle from the all_gather may be lower than the current all-reduce overhead
 4. **Copy/elementwise reduction**: The direct_copy_kernel (111ms, 17670 instances) is from .float() conversions in the FP32 precision spec; further Triton fusion could reduce this
+- review R78 PASS: pure NCCL config tuning, no proxy, no forged metrics, gates pass

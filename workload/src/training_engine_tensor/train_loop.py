@@ -1556,6 +1556,21 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # every step.  Pre-allocating avoids the per-step CUDA allocator call.
     _stats_buf = torch.empty(4, dtype=torch.float64, device=device)
 
+    # Pre-allocate flat gradient buffer for the all-reduce path.
+    # torch._utils._flatten_dense_tensors(fp32_grad_bufs) creates a new 4.3 GiB
+    # tensor every step, which can trigger an internal cudaStreamSynchronize
+    # when the CUDA allocator cache is under memory pressure from the CUDA
+    # graph's private pools.  Using torch.cat(..., out=pre_allocated) instead
+    # avoids the per-step allocation and the allocator sync that follows.
+    # The flat buffer is used for both the single all-reduce and gradient bucketing paths.
+    _flat_grad_buf = torch.empty(_f32_numel, dtype=torch.float32, device=device)
+
+    # Pre-allocate the gradient norm scalar tensor for torch.linalg.vector_norm.
+    # Each step's norm computation creates a new scalar tensor, triggering a
+    # CUDA allocator call that can cause an internal cudaStreamSynchronize.
+    # Pre-allocating avoids the per-step allocation.
+    _grad_norm_val = torch.zeros((), device=device, dtype=torch.float32)
+
     # ── Optimizer state (AdamW) ────────────────────────────────────────
     opt_beta1 = float(os.environ.get("ADAM_BETA1", "0.9"))
     opt_beta2 = float(os.environ.get("ADAM_BETA2", "0.95"))
@@ -2182,7 +2197,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 if config.hash_capture_level > 0 and config.persistent:
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
                 # Flatten full gradient for bucketing (same as single all-reduce).
-                flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
+                torch.cat([t.reshape(-1) for t in fp32_grad_bufs], out=_flat_grad_buf)
+                flat = _flat_grad_buf
                 norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 # Split the flat tensor into buckets and all-reduce each on a separate stream.
                 # The flat tensor is contiguous, so the bucketed slices are views.
@@ -2232,7 +2248,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 # accumulate into a ~1e-6 loss drift from step 2 onward.
                 if config.hash_capture_level > 0 and config.persistent:
                     _capture_all_gradients(capture_records, bf16_params, fp32_grad_bufs, model, grad_prefix, suffix="preallreduce")
-                flat = torch._utils._flatten_dense_tensors(fp32_grad_bufs)
+                torch.cat([t.reshape(-1) for t in fp32_grad_bufs], out=_flat_grad_buf)
+                flat = _flat_grad_buf
                 dist.all_reduce(flat, op=dist.ReduceOp.SUM)
                 norm_factor = (1.0 / _local_lm_n.clamp(min=1.0))
                 flat.mul_(norm_factor)
@@ -2292,7 +2309,9 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # flat all-reduce path saves the scaled all-reduced gradient tensor,
             # which is contiguous and ~100x faster to norm than 157 buffers).
             if _flat_grads is not None:
-                total_norm = torch.linalg.vector_norm(_flat_grads)
+                # Use pre-allocated scalar tensor to avoid per-step cudaMalloc.
+                _grad_norm_val.copy_(torch.linalg.vector_norm(_flat_grads))
+                total_norm = _grad_norm_val
             else:
                 norms = torch._foreach_norm(fp32_grad_bufs)
                 total_norm = torch.linalg.vector_norm(torch.stack(norms))

@@ -968,3 +968,20 @@ The dev agent changed NCCL_ALGO from "Ring" to "Tree" in 6 long-horizon gate con
 - No run-shape key modifications; no `config/remote.toml` changes
 
 ---
+
+## [stage1] Round 78 — 2026-08-15 16:30
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: bcd2678 — Perf: switch NCCL_ALGO from Ring to Tree — benchmark shows 710 vs 568 GB/s, MFU unchanged at 31.0%
+
+### Key conclusions
+The dev agent changed NCCL_ALGO from "Ring" to "Tree" across 6 long-horizon gate config files after benchmarking both algorithms on the remote devspace (2× H100, NV18 NVLink). The change is a pure configuration tuning — no engine source code was modified. Anti-proxy guard passes (0 violations); no shell-out to `ref/`, no hardcoded synthetic metrics, no run-shape key tampering, no `config/remote.toml` edits. The commit does not declare `STAGE_STATUS: finished`, and the long-horizon throughput bar is not yet met, so stage remains in-progress.
+
+### Evidence highlights
+- Anti-proxy guard: PASSED (0 violations)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- Diff: 10 files, all config + notes + profile — no engine source changes
+- No run-shape key modifications; no `config/remote.toml` changes
+
+---
