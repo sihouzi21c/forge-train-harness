@@ -733,3 +733,19 @@ Docs-only commit recording Round 66 results (MFU 31.1%, +2.9pp, long-train PASS,
 - `bin/harness run anti-proxy` (run in prior round) passed
 
 ---
+
+## [stage1] Round 67 — 2026-08-15 08:29
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: e9fde06 — Docs: record Round 67-71 — _BackgroundPrefetcher sync fix, pinned buffers, semaphore flow control, MFU 28.9%, long-train PASS
+
+### Key conclusions
+Docs-only commit recording the optimization results for Rounds 67-71 (prefetcher synchronization fix, pre-allocated pinned CPU buffers, semaphore-based flow control, max_size increased to 8, disabled prefetcher for deterministic mode, MFU 28.9%, all gates green). No engine source code was modified in this commit — the engine changes were committed in the preceding 5 commits (21b3c9f, d2999fc, 75441ee, 0711da3, 8c11984). The candidate engine (`workload/src/training_engine_tensor/` + `workload/ops/`) implements all forward/backward/optimizer/loss/metric computation in-process using genuine PyTorch/Triton operations. The only `ref/` imports are dataloader utilities (`from ref.reference.hf_stream_dataloader import build` at `train_loop.py:234`, `from ref.reference.train_pure_mup_mtp import MegatronBinaryDataloader` at `train_loop.py:280`) — these are data-loading helpers, not computation proxies. No proxy, no forgery, no hardcoded synthetic metrics, no gate shape modifications, no remote config tampering detected. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message, and the latest perf_log.md section lacks `resume-startup-90` and `perf-bitwise` gate evidence.
+
+### Evidence highlights
+- Commit diff only touches `workload/notes/perf_log.md` — no engine code changes
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+- No gate config, remote config, or run-shape key modifications detected
+
+---

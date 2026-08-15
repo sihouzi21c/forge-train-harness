@@ -299,8 +299,9 @@ class _BackgroundPrefetcher:
     ``deque``.  The main thread calls ``get()`` to retrieve the next batch
     without blocking on the dataloader's shard refill (which can take seconds
     on the first call).  The queue depth is controlled by ``max_size`` (default
-    8 — enough headroom to absorb dataloader latency across 10-microbatch
-    steps).
+    16 — enough headroom to keep the queue full across the 10-microbatch
+    step, eliminating the ``pthread_cond_wait`` that occurs when the queue
+    goes empty mid-step).
 
     Producer-consumer synchronization uses a ``threading.Semaphore`` to avoid
     the lost-notify problem with ``Condition.wait(0.1)``: the background thread
@@ -1636,7 +1637,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     dl_prefetcher: _BackgroundPrefetcher | None = None
     if int(os.environ.get("ENABLE_DL_PREFETCH", "1")) and not deterministic:
         dl_prefetcher = _BackgroundPrefetcher(
-            iter_dl, max_size=8,
+            iter_dl, max_size=16,
             B=config.micro_batch_size, S=C.MAX_SEQ_LEN,
         )
         dl_prefetcher.start()

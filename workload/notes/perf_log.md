@@ -2585,3 +2585,54 @@ The frozen operators (flash attention 28.6% + cuBLAS GEMM 30.4%) account for 59%
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2).
   2. **Residual-add + RMSNorm fusion** — fuse residual-add into the Triton RMSNorm forward kernel.
   3. **CUDA allocator tuning** — `PYTORCH_CUDA_ALLOC_CONF` settings to reduce fragmentation.
+- review R67 PASS: docs-only commit, no proxy/forgery detected; stage remains in-progress (no STAGE_STATUS:finished)
+
+## [stage1] Round 72 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: _BackgroundPrefetcher max_size 8→16, MFU 28.9%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent increased the `_BackgroundPrefetcher.max_size` from 8 to 16, giving the producer more headroom to pre-fetch batches ahead of the consumer's 10-microbatch step. The queue can now hold 16 batches (vs 8 previously), reducing the likelihood of the main thread blocking on `pthread_cond_wait` when the queue goes empty mid-step.
+
+**Optimization — `_BackgroundPrefetcher.max_size` 8→16**:
+
+1. The `_BackgroundPrefetcher` was initialized with `max_size=8`, but the step has 10 microbatches. With 8 pre-fetched batches, the consumer processed the first 8 batches without waiting, then blocked on the producer for the remaining 2 batches (~630ms of `pthread_cond_wait` per step from the CUDA runtime's NCCL synchronization).
+
+2. Increasing `max_size` to 16 gives the producer 16 pre-allocated pinned buffer sets (3 MB total, negligible vs 79 GiB HBM). The queue can hold 16 batches, which is more than the 10 microbatch step, so the consumer should rarely need to wait.
+
+3. The pre-allocated pinned buffer pool (`_buf_pool`) is sized by `max_size` in `__init__`, so the increase automatically allocates 16 buffer sets.
+
+### Gate results
+
+| Gate | Status | Key Metrics |
+|------|--------|-------------|
+| long-train-smoke (20 steps, DP=2) | **PASS** | loss_rel 0.204% < 2.50%, MFU **29.3%** |
+| resume-gate-20 (25 steps, DP=2) | **PASS** | bitwise (max_abs_diff=0, 9420/9420 hash) |
+| long-train (200 steps, DP=2) | **PASS** | loss_rel 1.075% < 2.50%, MFU **28.9%** |
+| profile-snapshot (long-horizon_round72) | **PASS** | step_time 4498ms, MFU 29.23% |
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 67-71 (prefetcher sync + pinned buffers + semaphore) | 28.9% | — | Baseline |
+| **Round 72 (max_size 8→16)** | **28.9%** | **+0.0pp** | Same devspace |
+
+### Profile analysis
+
+The `pthread_cond_wait` at 7571ms (13.1% of OS runtime) is essentially unchanged from Round 70 (7584ms). The `pthread_cond_wait` is mainly from NCCL's internal synchronization (the CUDA runtime uses `pthread_cond_wait` for GPU completion notification), not from the `_BackgroundPrefetcher.get()` method. The `max_size` increase has a modest effect on the producer-consumer synchronization but does not eliminate the CUDA runtime's internal `pthread_cond_wait` overhead.
+
+### Next steps
+
+- Continue optimization: the remaining bottlenecks are:
+  1. **cudaStreamSynchronize**: 578ms/step — from CUDA allocator and NCCL internal synchronizations
+  2. **cudaMemcpyAsync**: 1576ms/step — H2D copies for input tensors and NCCL internal copies
+  3. **Frozen operators**: flash attention (29.4% of GPU kernel) + cuBLAS GEMM (30.4%) — no room for optimization
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute)
+  2. **Residual-add + RMSNorm fusion** — fuse residual-add into the Triton RMSNorm forward kernel
+  3. **CUDA allocator tuning** — `PYTORCH_CUDA_ALLOC_CONF` settings to reduce fragmentation
