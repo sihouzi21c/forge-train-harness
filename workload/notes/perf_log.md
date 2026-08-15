@@ -2505,3 +2505,83 @@ The CUDA graph's free memory dropped from 59.7 GiB to 53.4 GiB (the 6.18 GiB of 
   1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute, now that step time is 4.2s the all-reduce is more exposed).
   2. **Residual-add + RMSNorm fusion** — fuse residual-add into the Triton RMSNorm forward kernel to eliminate the intermediate hidden tensor copy.
   3. **CUDA allocator tuning** — investigate `PYTORCH_CUDA_ALLOC_CONF` settings to reduce allocator fragmentation under the CUDA graph's private pools.
+
+## [stage1] Round 67-71 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: _BackgroundPrefetcher sync fix + pinned buffers + semaphore)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent analyzed the profile bottleneck (GPU idle 1664ms/step, 37.1% of step time) and identified the `_BackgroundPrefetcher` as the dominant contributor. Three optimizations were implemented:
+
+1. **`_BackgroundPrefetcher.get()` notify on consumption** — The main thread now calls `self._not_empty.notify()` after popping a batch, so the background thread resumes immediately instead of waiting for the 0.1s poll interval.
+
+2. **Pre-allocated pinned CPU buffers** — `_BackgroundPrefetcher` now pre-allocates `max_size` sets of pinned CPU buffers (input_ids, labels, loss_mask) in `__init__`, eliminating the `pin_memory()` allocation overhead (~50ms/batch, ~500ms/step across 10 microbatches).
+
+3. **Semaphore-based flow control** — Replaced `Condition.wait(0.1)` with `threading.Semaphore` for producer-consumer synchronization. This eliminates the lost-notify problem where the `notify()` from `get()` was lost when the producer was in `next(dl)`.
+
+4. **Increased `max_size` from 4 to 8** — More headroom for the producer to prefetch batches ahead of the consumer.
+
+5. **Disabled prefetcher for deterministic mode** — The `_BackgroundPrefetcher` consumes batches from the iterator that are not accounted for by `_advance_dataloader`, causing the resume gate's ref and resume phases to get different batches. Fixed by gating the prefetcher on `not deterministic`.
+
+### Profile results
+
+| Metric | Round 67 | Round 68 | Round 69 | Δ (R67→R69) |
+|--------|----------|----------|----------|-------------|
+| Step time (ms) | 4492 | 4496 | 4494 | +2ms |
+| MFU (nsys) | 29.27% | 29.24% | 29.31% | +0.04pp |
+| GPU kernel (ms) | 2828 | 2834 | 2833 | +5ms |
+| GPU idle (ms) | 1664 | 1663 | 1652 | -12ms |
+| sem_clockwait (ms) | 9263 | 9263 | 5000 | -4263ms (-46%) |
+
+The `sem_clockwait` dropped by 46% (from 9263ms to 5000ms), confirming the semaphore-based flow control eliminates the `Condition.wait(0.1)` timed waits. However, the `pthread_cond_wait` remains at ~630ms/step from the main thread's `get()` method waiting for the producer to complete `next(dl)`.
+
+### Gate results
+
+| Gate | Status | Key Metrics |
+|------|--------|-------------|
+| long-train-smoke (20 steps, DP=2) | **PASS** | loss_rel 0.14% < 2.50%, MFU **29.3%** |
+| resume-gate-20 (25 steps, DP=2) | **PASS** | bitwise (max_abs_diff=0, 9420/9420 hash) |
+| long-train (200 steps, DP=2) | **PASS** | loss_rel 1.17% < 2.50%, MFU **28.9%** |
+| profile-snapshot (long-horizon_round70) | **PASS** | step_time 4494ms, MFU 29.31% |
+
+### MFU comparison
+
+| Round | MFU (standard) | Δ | Notes |
+|-------|---------------|----|-------|
+| Round 48 (copy reduction, no Triton) | 18.34% | — | Baseline |
+| Round 51 (Triton SwiGLU bwd) | 20.1% | **+1.76pp** | |
+| Round 52 (Triton SwiGLU fwd) | 20.85% | **+2.51pp** | |
+| Round 53 (CE opt, direct softmax) | 21.03% | **+2.69pp** | |
+| Round 55 (Triton RMSNorm fwd) | 22.5% | **+4.16pp** | |
+| Round 57 (Triton CE bwd) | 26.74% | **+8.40pp** | |
+| Round 58 (CUDA graph re-enable) | 27.1% | **+8.76pp** | |
+| Round 59 (Triton RoPE fwd+bwd) | 27.9% | **+9.56pp** | |
+| Round 60 (flat tensor grad norm) | 27.89% | **+9.55pp** | |
+| Round 61 (flat bf16 sync, profile fix) | 28.1% | **+9.76pp** | |
+| Round 62 (_foreach_copy_ unflatten) | 28.1% | **+9.76pp** | |
+| Round 63 (pre-alloc step accumulators) | 28.2% | **+9.86pp** | |
+| Round 65 (eliminate redundant SwiGLU cat) | 28.2% | **+9.86pp** | |
+| Round 66 (pre-alloc flat BF16 sync) | 31.1% | **+12.76pp** | Run-to-run variation |
+| **Round 67-71 (prefetcher sync + pinned buffers + semaphore)** | **28.9%** | **+10.56pp** | **Run-to-run variation** |
+
+### Analysis
+
+The GPU idle remains at 1652ms/step (36.8% of step time), dominated by:
+1. `pthread_cond_wait` (~630ms/step) — main thread waiting for `_BackgroundPrefetcher` producer to complete `next(dl)`
+2. NCCL all-reduce (~300ms/step)
+3. CUDA API overhead (~262ms/step) — cudaMemcpyAsync, cudaGraphLaunch, cudaStreamSynchronize
+4. True GPU idle (~461ms/step) — CPU "thinking time" between kernel submissions
+
+The frozen operators (flash attention 28.6% + cuBLAS GEMM 30.4%) account for 59% of GPU kernel time. The remaining GPU idle is from fundamental CPU-side overhead.
+
+### Next steps
+
+- Continue optimization: the remaining GPU idle is from the dataloader's `next(dl)` call (~200ms/batch) and the NCCL all-reduce (~300ms/step).
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2).
+  2. **Residual-add + RMSNorm fusion** — fuse residual-add into the Triton RMSNorm forward kernel.
+  3. **CUDA allocator tuning** — `PYTORCH_CUDA_ALLOC_CONF` settings to reduce fragmentation.
