@@ -1120,3 +1120,23 @@ The dev agent pre-allocated the optimizer step's working tuples (`_per_group_opt
 - Profile snapshot present at `workload/notes/profile/long-horizon_round84/summary.md`
 
 ---
+
+## [stage1] Round 85 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: batched H2D input copies via single cudaMemcpyAsync)
+- **Commit**: 1eb1f54 — Perf: batch H2D input copies via single contiguous cudaMemcpyAsync — reduce GPU idle ~90ms
+
+### Key conclusions
+The dev agent implemented batched H2D input copies, replacing 6 separate `cudaMemcpyAsync` calls per microbatch with a single contiguous copy. A pre-allocated pinned CPU buffer + GPU buffer pair with dtype/shape views eliminates the CUDA driver push buffer contention from 6x the number of cudaMemcpyAsync calls. The optimization was verified on the remote cluster via `cctl` BATCH job: `long-train-smoke` PASS (MFU 30.9%, loss_rel 0.258% < 2.50%), `resume-gate-20` PASS (bitwise, 9420/9420 hash). No proxy, no forgery. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in commit message.
+
+### Evidence highlights
+- `bin/harness run guard`: PASS (0 violations)
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- `long-train-smoke` (DP=2, 20 steps, cctl job 728234): PASS — loss_rel 0.258% < 2.50%, MFU 30.9%
+- `resume-gate-20` (DP=2, 25 steps, cctl job 728251): PASS — max_abs_diff(loss)=0, 9420/9420 hash
+- `profile-snapshot` (cctl job 728318): submitted (nsys may not be available in container)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
+
+---
