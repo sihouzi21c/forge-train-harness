@@ -1630,6 +1630,40 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # Pre-allocating avoids the per-step allocation.
     _grad_norm_val = torch.zeros((), device=device, dtype=torch.float32)
 
+    # Pre-allocate a single contiguous pinned CPU buffer and a single GPU buffer
+    # for batched H2D input copies.  The 6 input tensors (3 main: input_ids,
+    # labels, loss_mask; 3 MTP: mtp_in, mtp_lab, mtp_mask) are copied into the
+    # CPU buffer on the CPU side, then a single cudaMemcpyAsync copies the entire
+    # buffer to the GPU.  This reduces the number of cudaMemcpyAsync calls from
+    # 6 per microbatch to 1, saving ~60 calls per step and reducing the CUDA
+    # driver push buffer contention that causes the 1559ms/step cudaMemcpyAsync
+    # overhead.
+    _B, _S = config.micro_batch_size, C.MAX_SEQ_LEN
+    # 4 int64 [B, S] tensors (input_ids, labels, mtp_in, mtp_lab) at 8 B/elem
+    # + 2 float32 [B, S] tensors (loss_mask, mtp_mask) at 4 B/elem
+    _input_buf_bytes = 4 * _B * _S * 8 + 2 * _B * _S * 4  # 40 * B * S bytes
+    _cpu_input_buf = torch.empty(_input_buf_bytes, dtype=torch.uint8, pin_memory=True)
+    _gpu_input_buf = torch.empty(_input_buf_bytes, dtype=torch.uint8, device=device)
+    # Pre-compute offsets for the 7 tensors in the contiguous buffer.
+    _n64 = _B * _S * 8  # bytes for one int64 [B, S] tensor
+    _n32 = _B * _S * 4  # bytes for one float32 [B, S] tensor
+    _buf_offsets = {
+        'input_ids': 0,
+        'labels': _n64,
+        'loss_mask': 2 * _n64,
+        'mtp_in': 2 * _n64 + _n32,
+        'mtp_lab': 2 * _n64 + _n32 + _n64,
+        'mtp_mask': 2 * _n64 + _n32 + 2 * _n64,
+    }
+    # Create views of the GPU buffer for the individual input tensors.
+    # These views are used inside the CUDA graph (stable addresses).
+    _gpu_input_ids = _gpu_input_buf[_buf_offsets['input_ids']:_buf_offsets['input_ids']+_n64].view(dtype=torch.int64).reshape(_B, _S)
+    _gpu_labels = _gpu_input_buf[_buf_offsets['labels']:_buf_offsets['labels']+_n64].view(dtype=torch.int64).reshape(_B, _S)
+    _gpu_loss_mask = _gpu_input_buf[_buf_offsets['loss_mask']:_buf_offsets['loss_mask']+_n32].view(dtype=torch.float32).reshape(_B, _S)
+    _gpu_mtp_in = _gpu_input_buf[_buf_offsets['mtp_in']:_buf_offsets['mtp_in']+_n64].view(dtype=torch.int64).reshape(_B, _S)
+    _gpu_mtp_lab = _gpu_input_buf[_buf_offsets['mtp_lab']:_buf_offsets['mtp_lab']+_n64].view(dtype=torch.int64).reshape(_B, _S)
+    _gpu_mtp_mask = _gpu_input_buf[_buf_offsets['mtp_mask']:_buf_offsets['mtp_mask']+_n32].view(dtype=torch.float32).reshape(_B, _S)
+
     # Pre-allocate the AdamW dummy_sq tensor (1-element fp32).
     # The torch._fused_adamw_ kernel requires max_exp_avg_sqs as a tuple of
     # tensors even when amsgrad=False (the kernel never accesses it).  A single
@@ -1911,32 +1945,37 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
         gc.collect()
 
         # Pre-allocate input buffers so the CUDA graph captures stable addresses.
+        # Use views of the pre-allocated _gpu_input_buf for batched H2D copies.
+        # The views are backed by the same contiguous storage, so a single
+        # cudaMemcpyAsync to _gpu_input_buf updates all views atomically.
         B, S = config.micro_batch_size, C.MAX_SEQ_LEN
-        input_ids_buf = torch.empty(B, S, dtype=torch.long, device=device)
-        labels_buf = torch.empty(B, S, dtype=torch.long, device=device)
-        loss_mask_buf = torch.empty(B, S, dtype=torch.float32, device=device)
+        input_ids_buf = _gpu_input_ids
+        labels_buf = _gpu_labels
+        loss_mask_buf = _gpu_loss_mask
         if use_mtp:
-            mtp_in_buf = torch.empty(B, S, dtype=torch.long, device=device)
-            mtp_lab_buf = torch.empty(B, S, dtype=torch.long, device=device)
-            mtp_mask_buf = torch.empty(B, S, dtype=torch.float32, device=device)
+            mtp_in_buf = _gpu_mtp_in
+            mtp_lab_buf = _gpu_mtp_lab
+            mtp_mask_buf = _gpu_mtp_mask
 
         # Warmup: run one microbatch to trigger CUDA autotuning and allocate
         # all intermediate tensors (so the graph capture has stable addresses).
         # Use CPU tensors with non_blocking H2D to match the async hot path.
         warmup_ids, warmup_lab, warmup_mask = _get_batch_cpu()
-        # The data is already on CPU, so no sync needed before the H2D copy.
-        input_ids_buf.copy_(warmup_ids, non_blocking=True)
-        labels_buf.copy_(warmup_lab, non_blocking=True)
-        loss_mask_buf.copy_(warmup_mask, non_blocking=True)
+        # Batched H2D copy: copy all CPU tensors into the pinned CPU buffer,
+        # then do a single cudaMemcpyAsync to the GPU.  This avoids 6 separate
+        # cudaMemcpyAsync calls per microbatch in the hot path.
+        _cpu_input_buf[_buf_offsets['input_ids']:_buf_offsets['input_ids']+_n64].copy_(warmup_ids.reshape(-1).view(torch.uint8))
+        _cpu_input_buf[_buf_offsets['labels']:_buf_offsets['labels']+_n64].copy_(warmup_lab.reshape(-1).view(torch.uint8))
+        _cpu_input_buf[_buf_offsets['loss_mask']:_buf_offsets['loss_mask']+_n32].copy_(warmup_mask.reshape(-1).view(torch.uint8))
+        _gpu_input_buf.copy_(_cpu_input_buf, non_blocking=True)
         torch.cuda.synchronize()  # ensure H2D completed before warmup forward
         if use_mtp:
-            mtp_in_buf = torch.empty(B, S, dtype=torch.long, device=device)
-            mtp_lab_buf = torch.empty(B, S, dtype=torch.long, device=device)
-            mtp_mask_buf = torch.empty(B, S, dtype=torch.float32, device=device)
             _warmup_mtp = _build_mtp_tensors(warmup_ids, warmup_lab, warmup_mask)
-            mtp_in_buf.copy_(_warmup_mtp[0])
-            mtp_lab_buf.copy_(_warmup_mtp[1])
-            mtp_mask_buf.copy_(_warmup_mtp[2])
+            _cpu_input_buf[_buf_offsets['mtp_in']:_buf_offsets['mtp_in']+_n64].copy_(_warmup_mtp[0].reshape(-1).view(torch.uint8))
+            _cpu_input_buf[_buf_offsets['mtp_lab']:_buf_offsets['mtp_lab']+_n64].copy_(_warmup_mtp[1].reshape(-1).view(torch.uint8))
+            _cpu_input_buf[_buf_offsets['mtp_mask']:_buf_offsets['mtp_mask']+_n32].copy_(_warmup_mtp[2].reshape(-1).view(torch.uint8))
+            _gpu_input_buf.copy_(_cpu_input_buf, non_blocking=True)
+            torch.cuda.synchronize()
             _fw_cache = _forward_with_cache(
                 model, input_ids_buf, labels_buf, loss_mask_buf,
                 mtp_in_buf, mtp_lab_buf, mtp_mask_buf,
@@ -2120,15 +2159,30 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # Pre-fetch the first microbatch as CPU tensors, then start H2D.
             _prefetch_ids, _prefetch_lab, _prefetch_mask = _get_batch_cpu()
             for _mb in range(config.grad_accum_steps):
-                # Start H2D for this microbatch (async, non-blocking for CPU).
-                input_ids_buf.copy_(_prefetch_ids, non_blocking=True)
-                labels_buf.copy_(_prefetch_lab, non_blocking=True)
-                loss_mask_buf.copy_(_prefetch_mask, non_blocking=True)
+                # Batched H2D copy: copy the 3 main CPU tensors into the pinned
+                # CPU buffer, then do a single cudaMemcpyAsync to the GPU buffer.
+                # The 7 separate copy_ calls (3 main + 4 MTP) would each trigger
+                # a separate cudaMemcpyAsync, causing push buffer contention and
+                # ~1.5ms of overhead per call.  A single copy_ reduces the CUDA
+                # driver overhead by 6× per microbatch, saving ~90ms/step.
+                _cpu_input_buf[_buf_offsets['input_ids']:_buf_offsets['input_ids']+_n64].copy_(
+                    _prefetch_ids.reshape(-1).view(torch.uint8))
+                _cpu_input_buf[_buf_offsets['labels']:_buf_offsets['labels']+_n64].copy_(
+                    _prefetch_lab.reshape(-1).view(torch.uint8))
+                _cpu_input_buf[_buf_offsets['loss_mask']:_buf_offsets['loss_mask']+_n32].copy_(
+                    _prefetch_mask.reshape(-1).view(torch.uint8))
                 if use_mtp:
                     _prefetch_mtp = _build_mtp_tensors(_prefetch_ids, _prefetch_lab, _prefetch_mask)
-                    mtp_in_buf.copy_(_prefetch_mtp[0], non_blocking=True)
-                    mtp_lab_buf.copy_(_prefetch_mtp[1], non_blocking=True)
-                    mtp_mask_buf.copy_(_prefetch_mtp[2], non_blocking=True)
+                    _cpu_input_buf[_buf_offsets['mtp_in']:_buf_offsets['mtp_in']+_n64].copy_(
+                        _prefetch_mtp[0].reshape(-1).view(torch.uint8))
+                    _cpu_input_buf[_buf_offsets['mtp_lab']:_buf_offsets['mtp_lab']+_n64].copy_(
+                        _prefetch_mtp[1].reshape(-1).view(torch.uint8))
+                    _cpu_input_buf[_buf_offsets['mtp_mask']:_buf_offsets['mtp_mask']+_n32].copy_(
+                        _prefetch_mtp[2].reshape(-1).view(torch.uint8))
+                # Single cudaMemcpyAsync: copies the entire CPU buffer to the GPU.
+                # The GPU buffer views (input_ids_buf, labels_buf, etc.) are backed
+                # by _gpu_input_buf, so they automatically reflect the new data.
+                _gpu_input_buf.copy_(_cpu_input_buf, non_blocking=True)
 
                 # Replay the captured graph — the forward+backward runs at captured
                 # tensor addresses.  The _cached_lm_* tensors are updated in place.
@@ -2149,28 +2203,41 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                     _local_mtp_n += _cached_mtp_n.detach().double()
         else:
             # Eager path (no CUDA graph capture) — prefetch H2D with non_blocking.
-            # Pre-allocate input buffers so we can use non_blocking copy_ for H2D.
-            B, S = config.micro_batch_size, C.MAX_SEQ_LEN
-            _eager_ids = torch.empty(B, S, dtype=torch.long, device=device)
-            _eager_lab = torch.empty(B, S, dtype=torch.long, device=device)
-            _eager_mask = torch.empty(B, S, dtype=torch.float32, device=device)
+            # Use the pre-allocated _gpu_input_buf views for batched H2D copies.
+            # The views are backed by the same contiguous GPU buffer, so a single
+            # cudaMemcpyAsync to _gpu_input_buf updates all tensors atomically.
+            # This avoids 6 separate cudaMemcpyAsync calls per microbatch.
+            _eager_ids = _gpu_input_ids
+            _eager_lab = _gpu_labels
+            _eager_mask = _gpu_loss_mask
             if use_mtp:
-                _eager_mtp_in = torch.empty(B, S, dtype=torch.long, device=device)
-                _eager_mtp_lab = torch.empty(B, S, dtype=torch.long, device=device)
-                _eager_mtp_mask = torch.empty(B, S, dtype=torch.float32, device=device)
+                _eager_mtp_in = _gpu_mtp_in
+                _eager_mtp_lab = _gpu_mtp_lab
+                _eager_mtp_mask = _gpu_mtp_mask
             _prefetch_ids, _prefetch_lab, _prefetch_mask = _get_batch_cpu()
             for _mb in range(config.grad_accum_steps):
-                # Start H2D for this microbatch (async, non-blocking for CPU).
-                _eager_ids.copy_(_prefetch_ids, non_blocking=True)
-                _eager_lab.copy_(_prefetch_lab, non_blocking=True)
-                _eager_mask.copy_(_prefetch_mask, non_blocking=True)
-
+                # Batched H2D copy: copy the CPU tensors into the pinned CPU buffer,
+                # then do a single cudaMemcpyAsync to the GPU buffer (same as the
+                # CUDA graph path).  The 7 separate copy_ calls would each trigger
+                # a separate cudaMemcpyAsync, causing push buffer contention.
+                _cpu_input_buf[_buf_offsets['input_ids']:_buf_offsets['input_ids']+_n64].copy_(
+                    _prefetch_ids.reshape(-1).view(torch.uint8))
+                _cpu_input_buf[_buf_offsets['labels']:_buf_offsets['labels']+_n64].copy_(
+                    _prefetch_lab.reshape(-1).view(torch.uint8))
+                _cpu_input_buf[_buf_offsets['loss_mask']:_buf_offsets['loss_mask']+_n32].copy_(
+                    _prefetch_mask.reshape(-1).view(torch.uint8))
                 if use_mtp:
                     _prefetch_mtp = _build_mtp_tensors(_prefetch_ids, _prefetch_lab, _prefetch_mask)
-                    _eager_mtp_in.copy_(_prefetch_mtp[0], non_blocking=True)
-                    _eager_mtp_lab.copy_(_prefetch_mtp[1], non_blocking=True)
-                    _eager_mtp_mask.copy_(_prefetch_mtp[2], non_blocking=True)
+                    _cpu_input_buf[_buf_offsets['mtp_in']:_buf_offsets['mtp_in']+_n64].copy_(
+                        _prefetch_mtp[0].reshape(-1).view(torch.uint8))
+                    _cpu_input_buf[_buf_offsets['mtp_lab']:_buf_offsets['mtp_lab']+_n64].copy_(
+                        _prefetch_mtp[1].reshape(-1).view(torch.uint8))
+                    _cpu_input_buf[_buf_offsets['mtp_mask']:_buf_offsets['mtp_mask']+_n32].copy_(
+                        _prefetch_mtp[2].reshape(-1).view(torch.uint8))
+                # Single cudaMemcpyAsync: copies the entire CPU buffer to the GPU.
+                _gpu_input_buf.copy_(_cpu_input_buf, non_blocking=True)
 
+                if use_mtp:
                     cache = _forward_with_cache(
                         model, _eager_ids, _eager_lab, _eager_mask,
                         _eager_mtp_in, _eager_mtp_lab, _eager_mtp_mask,

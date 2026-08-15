@@ -1102,3 +1102,21 @@ Docs-only round recording Round 83 validation results on the remote devspace: lo
 - No run-shape key modifications; no `config/remote.toml` changes
 
 ---
+
+## [stage1] Round 83 — 2026-08-15 19:56
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 90769bd — Perf: pre-allocate optimizer step tuples — reduce cudaMalloc -16ms, cudaLaunchKernel -8ms
+
+### Key conclusions
+The dev agent pre-allocated the optimizer step's working tuples (`_per_group_opt`) in the setup phase and moved `.grad` setup on `fp32_master` to initialization time, eliminating per-step Python list creation (~4239 operations/step) and the per-step 157-iteration `.grad` setting loop. The cudaMalloc CPU time dropped 20% (80.9ms → 64.7ms) and cudaLaunchKernel dropped 16% (50.8ms → 42.4ms). No proxy, forgery, or hardcoded metrics detected — all changes are in-process optimizations to `train_loop.py`. Stage 1 remains in-progress: no `STAGE_STATUS: finished` declaration, missing resume-startup-90/perf-bitwise/long-train-200 evidence in the latest perf_log section, and the long-horizon milestone check reports below-band throughput.
+
+### Evidence highlights
+- Anti-proxy guard: PASSED (0 violations)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- No shell-out to `ref/`, no ref-side imports, no hardcoded synthetic metrics
+- No run-shape key modifications; no `config/remote.toml` changes
+- Profile snapshot present at `workload/notes/profile/long-horizon_round84/summary.md`
+
+---
