@@ -1,0 +1,261 @@
+{
+  "cuda_api_per_step_ms": 3038.402,
+  "gpu_idle_per_step_ms": 1340.358,
+  "gpu_kernel_per_step_ms": 2871.078,
+  "gpu_memop_per_step_ms": 33.211,
+  "memops": [
+    {
+      "count": 818,
+      "operation": "[CUDA memcpy Host-to-Device]",
+      "pct": 93.4,
+      "per_step_ms": 31.023
+    },
+    {
+      "count": 25741,
+      "operation": "[CUDA memset]",
+      "pct": 5.7,
+      "per_step_ms": 1.886
+    },
+    {
+      "count": 189,
+      "operation": "[CUDA memcpy Device-to-Device]",
+      "pct": 0.9,
+      "per_step_ms": 0.295
+    },
+    {
+      "count": 32,
+      "operation": "[CUDA memcpy Device-to-Host]",
+      "pct": 0.0,
+      "per_step_ms": 0.007
+    }
+  ],
+  "mfu_e2e_standard": 31.2199,
+  "os_runtime_per_step_ms": 55878.602,
+  "profiled_steps": 12,
+  "run_meta": {
+    "grad_accum_steps": 10,
+    "micro_batch_size": 4,
+    "nsys_rep_path": "/user/sunhaojun/.forge_train/77459cccb4da/.artifacts/runs/profile-snapshot-20260815-104221-b06676/ours/profile.nsys-rep",
+    "out_label": "long-horizon_round83",
+    "seq_length": 4096,
+    "suite": "profile-snapshot",
+    "world_size": 2
+  },
+  "step_time_ms": 4211.436,
+  "top_api": [
+    {
+      "calls": 1039,
+      "name": "cudaMemcpyAsync",
+      "pct": 51.1,
+      "per_step_ms": 1552.173
+    },
+    {
+      "calls": 82,
+      "name": "cudaGraphLaunch_v10000",
+      "pct": 24.7,
+      "per_step_ms": 750.749
+    },
+    {
+      "calls": 349,
+      "name": "cudaStreamSynchronize",
+      "pct": 14.6,
+      "per_step_ms": 442.991
+    },
+    {
+      "calls": 128,
+      "name": "cudaStreamCreateWithPriority",
+      "pct": 2.7,
+      "per_step_ms": 82.097
+    },
+    {
+      "calls": 702,
+      "name": "cudaMalloc",
+      "pct": 2.7,
+      "per_step_ms": 80.94
+    },
+    {
+      "calls": 203,
+      "name": "cudaFree",
+      "pct": 1.9,
+      "per_step_ms": 56.797
+    },
+    {
+      "calls": 5999,
+      "name": "cudaLaunchKernel",
+      "pct": 1.7,
+      "per_step_ms": 50.764
+    },
+    {
+      "calls": 8,
+      "name": "cudaEventSynchronize",
+      "pct": 0.4,
+      "per_step_ms": 11.235
+    },
+    {
+      "calls": 388,
+      "name": "cudaHostAlloc",
+      "pct": 0.1,
+      "per_step_ms": 3.358
+    },
+    {
+      "calls": 2,
+      "name": "cudaGetDeviceProperties_v2_v12000",
+      "pct": 0.1,
+      "per_step_ms": 2.234
+    }
+  ],
+  "top_kernels": [
+    {
+      "instances": 2053,
+      "name": "void flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Flash_bwd_kernel_traits<(int)128, (int)64, (int)128, (int)8, (int)2, (int)4, (int)2, (bool)0, (bool)0, cutlass::bfloat16_t, Flash_kernel_traits<(int)128, (int)64, (int)128, (int)8, cutlass::bfloat16_t>>, (bool)0, (bool)1, (bool)0, (bool)0, (bool)1, (bool)1>(Flash_bwd_params)",
+      "pct": 19.6,
+      "per_step_ms": 563.07
+    },
+    {
+      "instances": 4178,
+      "name": "void flash_fwd_kernel<Flash_fwd_kernel_traits<(int)128, (int)128, (int)64, (int)4, (bool)0, (bool)0, cutlass::bfloat16_t, Flash_kernel_traits<(int)128, (int)128, (int)64, (int)4, cutlass::bfloat16_t>>, (bool)0, (bool)1, (bool)0, (bool)0, (bool)1, (bool)1, (bool)0>(Flash_fwd_params)",
+      "pct": 9.8,
+      "per_step_ms": 281.012
+    },
+    {
+      "instances": 6402,
+      "name": "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_NNT",
+      "pct": 9.2,
+      "per_step_ms": 263.369
+    },
+    {
+      "instances": 2268,
+      "name": "nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+      "pct": 7.8,
+      "per_step_ms": 223.045
+    },
+    {
+      "instances": 2330,
+      "name": "nvjet_tst_192x192_64x3_2x1_v_bz_coopB_NTN",
+      "pct": 7.3,
+      "per_step_ms": 211.015
+    },
+    {
+      "instances": 17704,
+      "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)8, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+      "pct": 3.9,
+      "per_step_ms": 111.595
+    },
+    {
+      "instances": 4326,
+      "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+      "pct": 3.2,
+      "per_step_ms": 93.148
+    },
+    {
+      "instances": 6571,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+      "pct": 3.1,
+      "per_step_ms": 88.711
+    },
+    {
+      "instances": 8356,
+      "name": "_rope_kernel",
+      "pct": 2.9,
+      "per_step_ms": 83.484
+    },
+    {
+      "instances": 168,
+      "name": "void at::native::<unnamed>::cunn_SoftMaxForward<(int)8, c10::BFloat16, float, c10::BFloat16, at::native::<unnamed>::LogSoftMaxForwardEpilogue>(T4 *, const T2 *, int)",
+      "pct": 2.6,
+      "per_step_ms": 75.196
+    },
+    {
+      "instances": 4284,
+      "name": "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_TNT",
+      "pct": 2.6,
+      "per_step_ms": 74.809
+    },
+    {
+      "instances": 672,
+      "name": "_ce_bwd_kernel",
+      "pct": 2.2,
+      "per_step_ms": 63.815
+    },
+    {
+      "instances": 2078,
+      "name": "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_NTT",
+      "pct": 1.9,
+      "per_step_ms": 55.692
+    },
+    {
+      "instances": 2163,
+      "name": "nvjet_tst_192x192_64x3_2x1_v_bz_coopB_NNN",
+      "pct": 1.9,
+      "per_step_ms": 55.459
+    },
+    {
+      "instances": 2078,
+      "name": "_swiglu_bwd_kernel",
+      "pct": 1.6,
+      "per_step_ms": 44.605
+    }
+  ],
+  "top_osrt": [
+    {
+      "calls": 1254,
+      "name": "poll",
+      "pct": 39.2,
+      "per_step_ms": 21882.266
+    },
+    {
+      "calls": 35110,
+      "name": "pthread_cond_timedwait",
+      "pct": 20.5,
+      "per_step_ms": 11480.217
+    },
+    {
+      "calls": 288,
+      "name": "pthread_cond_wait",
+      "pct": 13.4,
+      "per_step_ms": 7495.066
+    },
+    {
+      "calls": 51,
+      "name": "epoll_wait",
+      "pct": 10.0,
+      "per_step_ms": 5606.054
+    },
+    {
+      "calls": 5,
+      "name": "sem_clockwait",
+      "pct": 7.5,
+      "per_step_ms": 4166.709
+    },
+    {
+      "calls": 114,
+      "name": "sem_wait",
+      "pct": 7.1,
+      "per_step_ms": 3963.834
+    },
+    {
+      "calls": 3766,
+      "name": "read",
+      "pct": 0.6,
+      "per_step_ms": 333.027
+    },
+    {
+      "calls": 7315,
+      "name": "ioctl",
+      "pct": 0.5,
+      "per_step_ms": 256.989
+    },
+    {
+      "calls": 36796,
+      "name": "usleep",
+      "pct": 0.3,
+      "per_step_ms": 168.496
+    },
+    {
+      "calls": 7236,
+      "name": "accept",
+      "pct": 0.2,
+      "per_step_ms": 136.165
+    }
+  ]
+}

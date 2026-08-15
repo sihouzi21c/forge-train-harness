@@ -24,3 +24,5 @@ deterministic = true
 
 [ours]
 deterministic = true
+enable_cuda_graph = "0"
+cuda_device_max_connections = "8"

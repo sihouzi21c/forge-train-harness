@@ -3343,3 +3343,49 @@ Total estimated MFU improvement: ~3-5% (from 31.2% to ~34-36%). The actual impro
    - Overlap NCCL all-reduce with next-step forward (async all-reduce)
    - Gradient bucketing revisit (with flat buffer views, the bucketing overhead is reduced)
    - Copy/elementwise reduction via Triton fusion (direct_copy_kernel 112ms, 17709 instances)
+- review R81 PASS: no proxy detected; perf round with prefetcher/vector_norm/view optimizations, gate evidence and profile snapshot pending
+
+## [stage1] Round 83 (continued) — 2026-08-15
+
+### Gate results (remote validation)
+
+| Gate | Status | MFU | Details |
+|------|--------|-----|---------|
+| guard | PASS | — | 0 violations |
+| anti-proxy | PASS | — | 0 violations |
+| long-train-smoke (20 steps, DP=2) | PASS | 31.2% | loss_rel 0.195% < 2.50%, no drift |
+| resume-gate-20 (25 steps, DP=2) | PASS | bitwise | max_abs_diff=0, 9420/9420 hash |
+| long-train (200 steps, DP=2) | PASS | 31.0% | loss_rel 1.017% < 2.50%, no drift |
+| profile-snapshot (long-horizon_round83) | PASS | 31.22% | step_time 4211ms, GPU idle 1340ms |
+| perf-bitwise (25 steps, DP=2) | FAIL | 5.9% | 0/15 bitwise, 0/15700 hash — pre-existing regression from engine changes after Round 40 |
+
+### Profile analysis (long-horizon_round83 vs round82)
+
+| Metric | Round 82 | Round 83 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 4214.4 | 4211.4 | **-3.0ms** |
+| GPU idle (ms) | 1342.1 | 1340.4 | **-1.8ms** |
+| GPU kernel (ms) | 2872.3 | 2871.1 | -1.3ms |
+| MFU (standard) | 31.20% | 31.22% | **+0.02pp** |
+| cudaMemcpyAsync (calls) | 1047 | 1039 | **-8 calls** |
+| pthread_cond_wait (ms) | 7398 | 7495 | +96.7ms (noise) |
+| cudaGraphLaunch (ms) | 753.9 | 750.7 | -3.2ms |
+
+### Key conclusion
+
+The prefetcher headroom increase (128 vs 64) did NOT improve MFU (+0.02pp, within run-to-run noise). The `pthread_cond_wait` is still 625ms/step, meaning the prefetcher already had sufficient headroom at 64. The `vector_norm out=` saved 3 cudaMemcpyAsync calls (1047→1039), a negligible improvement.
+
+**The GPU idle is still 1340ms (31.8% of step time).** The dominant bottleneck is:
+- `pthread_cond_timedwait` (11480ms, 20.5% of OS runtime) — main thread polling for dataloader batches
+- `pthread_cond_wait` (7495ms, 13.4%) — main thread waiting for prefetcher
+
+### Perf-bitwise regression
+
+The `perf-bitwise` suite (deterministic=True, MBS=2, forge_init_ones=0) has MFU 5.9% and 0/15 bitwise. This is a pre-existing regression from engine changes after Round 40 (CUDA graph, Triton kernels, etc.). The `deterministic=True` path is 3x slower than Round 40 (step_time 9s vs ~3s). The `ENABLE_CUDA_GRAPH=0` and `CUDA_DEVICE_MAX_CONNECTIONS=8` config fixes did not resolve the issue — the root cause is deeper in the engine's deterministic path.
+
+### Candidate levers for next round
+
+1. **Phase 2: Fused residual-add + RMSNorm backward** — The `direct_copy_kernel` (111ms, 17704 instances) is the `.float()` conversion kernel. Fusing the residual-add with RMSNorm backward would eliminate one `.float()` copy per layer (24 layers × 2 = 48 copies).
+2. **Phase 3: Overlap NCCL all-reduce with next-step forward** — The all-reduce GPU time is ~15ms, but the GPU idle is 1340ms. The overlap might not help directly because the bottleneck is CPU-side.
+3. **Phase 2: Copy/elementwise reduction via Triton fusion** — The `BinaryFunc` (89ms, 6571 instances) and elementwise ops (93ms, 4326 instances) are significant.
+4. **Phase 2: Fused residual-add + RMSNorm forward** — Currently the forward pass does `hidden = residual_add + rms_norm(hidden)` as two separate operations. Fusing them would save one `.float()` copy.

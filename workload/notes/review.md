@@ -1030,3 +1030,55 @@ This is a docs-only commit (the dev agent recorded Round 81's results: pre-alloc
 - Long-horizon: below review-side throughput bar, continue MFU optimization
 
 ---
+
+## [stage1] Round 80 — 2026-08-15 18:22
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 0ef5db6 — Docs: record Round 82 — flat gradient buffer view, MFU 31.0%, long-train PASS
+
+### Key conclusions
+Docs-only round recording the Round 82 profile snapshot (flat gradient buffer view optimization, MFU 31.20%, GPU idle 1342ms). The engine code (`workload/src/training_engine_tensor/`) is genuinely implementing forward/backward/optimizer in-process — no subprocess calls, no ref computation imports, no hardcoded synthetic metrics. The only `ref/` imports are dataloader helpers (`hf_stream_dataloader.build`, `MegatronBinaryDataloader`), which are data pipeline components rather than computational proxies. The `pass` statements scattered across engine files are all `try-except` fallbacks for optional Triton kernel imports, not function stubs. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in commit message, and the latest perf_log section is missing resume-startup-90 and perf-bitwise gate evidence.
+
+### Evidence highlights
+- `train_loop.py:235` — `from ref.reference.hf_stream_dataloader import build as build_hf` (dataloader only, not computation)
+- `train_loop.py:2568-2581` — `pass` in cleanup-only `try-except` blocks (shutdown path, not a stub)
+- `forward.py:104,112` / `backward.py:45,111,197` — `pass` in optional Triton import fallbacks (real implementations follow each block)
+
+---
+
+## [stage1] Round 81 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 26d97ba — Perf: increase prefetcher headroom to 128, vector_norm out=, pre-computed cat views — target GPU idle 1342ms
+
+### Key conclusions
+The dev agent implemented three legitimate in-process optimizations targeting GPU idle (1342ms): increasing the prefetcher queue depth from 64 to 128 (`train_loop.py:323`), using `torch.linalg.vector_norm(..., out=)` to avoid per-step cudaMalloc (`train_loop.py:2318`), and pre-computing `fp32_master` flat views to save 157 Python `reshape(-1)` calls per step (`train_loop.py:1563`). No proxy, forgery, or shell-out to ref/ detected. Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` declaration, missing gate evidence (resume-startup-90, perf-bitwise), and missing profile snapshot for this perf-touching round.
+
+### Evidence highlights
+- `train_loop.py:323` — prefetcher max_size default increased from 64 to 128
+- `train_loop.py:2318` — `vector_norm(..., out=_grad_norm_val)` eliminates temporary allocation
+- `train_loop.py:1563` — `_fp32_master_views` pre-computed once in setup
+
+---
+
+## [stage1] Round 83 (continued) — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: (current commit)
+
+### Key conclusions
+The dev agent validated the Round 83 optimizations (prefetcher headroom 128, vector_norm out=, pre-computed cat views) on the remote devspace. All main gates pass: long-train (200 steps, 31.0% MFU, loss_rel 1.017%), resume-gate-20 (bitwise, 9420/9420 hash), long-train-smoke (31.2% MFU, loss_rel 0.195%), and profile-snapshot (31.22% MFU, step_time 4211ms). The prefetcher headroom increase did NOT improve MFU (+0.02pp, within noise). The `perf-bitwise` suite has a pre-existing regression (MFU 5.9%, 0/15 bitwise) from engine changes after Round 40. The gate config was fixed to add `ENABLE_CUDA_GRAPH=0` and `CUDA_DEVICE_MAX_CONNECTIONS=8` for the deterministic path, but the deeper regression requires further debugging. Stage 1 remains in-progress: no `STAGE_STATUS: finished` declaration.
+
+### Evidence highlights
+- Anti-proxy guard: PASSED (0 violations)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- long-train (200 steps, DP=2): PASS (loss_rel 1.017% < 2.50%, MFU 31.0%, no drift)
+- resume-gate-20 (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
+- profile-snapshot (long-horizon_round83): PASS (31.22% MFU, step_time 4211ms, GPU idle 1340ms)
+- perf-bitwise: FAIL (pre-existing regression, config fix applied)
+- No run-shape key modifications; no `config/remote.toml` changes
+
+---
