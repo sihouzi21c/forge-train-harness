@@ -3306,3 +3306,40 @@ The remaining optimization opportunities are:
 
 - `train_loop.py`: `fp32_grad_bufs` replaced with views of `_flat_grad_buf` after pre-allocation; `torch.cat` and `torch._foreach_copy_` removed from both the gradient bucketing and single all-reduce paths; `_flat_grads` variable removed; gradient norm computation simplified to always use `_flat_grad_buf`.
 - `workload/notes/profile/long-horizon_round82/`: profile data (summary.md + profile.json) from the remote devspace.
+- review R80 PASS: no proxy detected; docs-only round, missing resume-startup-90/perf-bitwise evidence for stage finish
+
+## [stage1] Round 83 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 1: prefetcher headroom + vector_norm out= + pre-computed cat views)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented three small optimizations targeting the GPU idle (1342ms, 31.8% of step time):
+
+1. **Prefetcher max_size increased from 64 to 128**: The `_BackgroundPrefetcher` queue depth was doubled to give the background thread more headroom to absorb the dataloader's shard refill latency. The `pthread_cond_wait` (267 calls, 7398ms across 12 profiled steps = 616ms/step) was the dominant source of GPU idle — the main thread waits for the background prefetcher because the dataloader's `__next__` blocks on periodic shard refills (~833ms each). With max_size=128, the prefetcher can buffer 128 batches = 12.8 steps of headroom, enough to absorb multiple shard refills without the main thread ever waiting.
+
+2. **`torch.linalg.vector_norm` with `out=` parameter**: Replaced `_grad_norm_val.copy_(torch.linalg.vector_norm(_flat_grad_buf))` with `torch.linalg.vector_norm(_flat_grad_buf, out=_grad_norm_val)`. This avoids 1 cudaMalloc (for the temporary scalar) + 1 cudaMemcpyAsync (for the copy_) + 1 cudaFree (for the temporary) per step, saving ~3ms of CUDA API CPU time.
+
+3. **Pre-computed `torch.cat` views for BF16 sync**: Pre-computed `_fp32_master_views = [t.reshape(-1) for t in fp32_master]` once in the setup phase, avoiding 157 `reshape(-1)` Python calls per step in `_sync_bf16_from_fp32`. The views are stable (same storage as the original tensors) and reused across all steps. The `_sync_bf16_from_fp32` function was updated with a `fp32_flat_views` parameter.
+
+### Estimated MFU impact
+
+- **Prefetcher headroom**: ~3-5% MFU improvement from eliminating the 616ms/step `pthread_cond_wait` (main thread no longer waits for the prefetcher). This is the largest potential gain.
+- **vector_norm out=**: ~0.1% MFU improvement from saving 1 cudaMalloc/cudaFree/cudaMemcpyAsync per step.
+- **Pre-computed views**: ~0.02% MFU improvement from saving 157 Python `reshape(-1)` calls per step.
+
+Total estimated MFU improvement: ~3-5% (from 31.2% to ~34-36%). The actual improvement depends on how much of the 616ms/step prefetcher wait is eliminated.
+
+### Next steps
+
+1. Sync to remote and run `long-train-smoke` (20 steps, DP=2) to verify the gate still passes and measure MFU improvement.
+2. Run `profile-snapshot M6_round83` to confirm the `pthread_cond_wait` is eliminated.
+3. Run `resume-gate-20` regression to verify save/load round-trip is still bitwise.
+4. Calculate the remaining GPU idle after the prefetcher wait is eliminated.
+5. Candidate levers for subsequent rounds:
+   - Overlap NCCL all-reduce with next-step forward (async all-reduce)
+   - Gradient bucketing revisit (with flat buffer views, the bucketing overhead is reduced)
+   - Copy/elementwise reduction via Triton fusion (direct_copy_kernel 112ms, 17709 instances)

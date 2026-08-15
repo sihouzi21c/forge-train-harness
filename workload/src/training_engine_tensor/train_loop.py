@@ -300,8 +300,8 @@ class _BackgroundPrefetcher:
     ``deque``.  The main thread calls ``get()`` to retrieve the next batch
     without blocking on the dataloader's shard refill (which can take seconds
     on the first call).  The queue depth is controlled by ``max_size`` (default
-    32 — enough headroom to keep the queue full across the 10-microbatch step
-    even after the warmup phase consumes 10 batches, eliminating the
+    128 — enough headroom to keep the queue full across the 10-microbatch step
+    even after the warmup phase, eliminating the
     ``pthread_cond_wait`` that occurs when the queue goes empty mid-step).
 
     Producer-consumer synchronization uses a ``threading.Semaphore`` to avoid
@@ -320,7 +320,7 @@ class _BackgroundPrefetcher:
     (``non_blocking=True`` copies) hides the GPU-side H2D transfer latency.
     """
 
-    def __init__(self, dl, max_size: int = 32, B: int = 4, S: int = 4096):
+    def __init__(self, dl, max_size: int = 128, B: int = 4, S: int = 4096):
         self._dl = dl
         self._queue: deque = deque()
         self._max_size = max_size
@@ -1248,6 +1248,7 @@ def _sync_bf16_from_fp32(
     fp32_master: list[torch.Tensor],
     flat_fp32_buf: torch.Tensor | None = None,
     flat_bf16_buf: torch.Tensor | None = None,
+    fp32_flat_views: list[torch.Tensor] | None = None,
 ) -> None:
     """Copy FP32 master weights back to BF16 params using a flat fused approach.
 
@@ -1263,13 +1264,18 @@ def _sync_bf16_from_fp32(
     temporary CUDA allocations per step that can trigger internal
     ``cudaStreamSynchronize`` when the allocator cache is under memory pressure
     from the CUDA graph's private pools.
+
+    When ``fp32_flat_views`` is provided (pre-computed views of ``fp32_master``),
+    the function uses them directly instead of creating new ``reshape(-1)``
+    views each call, saving 157 Python ``reshape(-1)`` calls per step.
     """
     if flat_fp32_buf is not None and flat_bf16_buf is not None:
         # Pre-allocated path: write directly into the pre-allocated buffers.
-        # torch.cat with out= writes the concatenated data into the contiguous
-        # buffer — same operation as _flatten_dense_tensors but without the
-        # per-step allocation.  The reshape(-1) creates views (no allocation).
-        torch.cat([t.reshape(-1) for t in fp32_master], out=flat_fp32_buf)
+        # Use pre-computed views if available, otherwise create new ones.
+        if fp32_flat_views is not None:
+            torch.cat(fp32_flat_views, out=flat_fp32_buf)
+        else:
+            torch.cat([t.reshape(-1) for t in fp32_master], out=flat_fp32_buf)
         flat_bf16_buf.copy_(flat_fp32_buf)
         unflattened = torch._utils._unflatten_dense_tensors(flat_bf16_buf, bf16_params)
         torch._foreach_copy_(bf16_params, unflattened)
@@ -1551,6 +1557,11 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     _flat_fp32_buf = torch.empty(_f32_numel, dtype=torch.float32, device=device)
     _flat_bf16_buf = torch.empty(_f32_numel, dtype=torch.bfloat16, device=device)
 
+    # Pre-compute fp32_master flat views for _sync_bf16_from_fp32.
+    # The torch.cat with out=flat_fp32_buf needs views of each fp32_master tensor.
+    # Pre-computing once avoids 157 reshape(-1) calls per step (~0.1ms saved).
+    _fp32_master_views = [t.reshape(-1) for t in fp32_master]
+
     # Pre-allocate a 4-element fp64 tensor for the loss scalar all-reduce.
     # The torch.cat for [lm_sum, lm_n, mtp_sum, mtp_n] creates a 32-byte tensor
     # every step.  Pre-allocating avoids the per-step CUDA allocator call.
@@ -1681,7 +1692,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     dl_prefetcher: _BackgroundPrefetcher | None = None
     if int(os.environ.get("ENABLE_DL_PREFETCH", "1")) and not deterministic:
         dl_prefetcher = _BackgroundPrefetcher(
-            iter_dl, max_size=int(os.environ.get("DL_PREFETCH_SIZE", "64")),
+            iter_dl, max_size=int(os.environ.get("DL_PREFETCH_SIZE", "128")),
             B=config.micro_batch_size, S=C.MAX_SEQ_LEN,
         )
         dl_prefetcher.start()
@@ -2304,8 +2315,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # via all-reduce + scale on the flat buffer, or _foreach_mul_ on
             # the views).  torch.linalg.vector_norm on the flat tensor is
             # ~100x faster than torch._foreach_norm on 157 buffers.
-            _grad_norm_val.copy_(torch.linalg.vector_norm(_flat_grad_buf))
-            total_norm = _grad_norm_val
+            # Use out= to avoid the temporary scalar allocation.
+            total_norm = torch.linalg.vector_norm(_flat_grad_buf, out=_grad_norm_val)
             if total_norm > opt_clip_grad:
                 torch._foreach_mul_(fp32_grad_bufs, opt_clip_grad / total_norm)
             grad_norm_val = total_norm
@@ -2353,7 +2364,8 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
             # ── Sync BF16 params from FP32 master ─────────────────────────
             _sync_bf16_from_fp32(bf16_params, fp32_master,
                                  flat_fp32_buf=_flat_fp32_buf,
-                                 flat_bf16_buf=_flat_bf16_buf)
+                                 flat_bf16_buf=_flat_bf16_buf,
+                                 fp32_flat_views=_fp32_master_views)
 
         # ── Per-step logging ──────────────────────────────────────────
         step_end_event.record()
