@@ -118,6 +118,26 @@ headroom). The optimizer step is excluded from the graph set, keeping only the f
 
 ---
 
+## [stage1] Round 76 — 2026-08-15 15:19
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: f31c734 — Fix: _flat_grads UnboundLocalError + profile Round 79, MFU 31.2%
+
+### Key conclusions
+The dev agent fixed a genuine `_flat_grads` variable scope bug in `train_loop.py` (line 2219: explicit `_flat_grads = None` for ZeRO-1 path, moved `_flat_grads = flat` inside `elif/else` branches), and committed a full nsys-backed profile snapshot at `workload/notes/profile/long-horizon_round79/summary.md`. MFU improved from 29.3% to 31.2% (+1.9pp) due to earlier dataloader prefetch improvements. No proxy, no shell-out to `ref/`, no hardcoded synthetic metrics, no run-shape or remote config tampering. The long-horizon throughput check (review-side) reports MFU still below the review bar — no milestone advance.
+
+### Violations (fill in only on FAIL)
+(none)
+
+### Evidence highlights
+- Anti-proxy guard: PASSED — no violations (verified via rg on `subprocess`/`os.system`/`ref/` paths in engine source; only docstring references)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- Milestone check: `MFU_GATE_VERDICT: FAIL (BELOW_BAND)` — 21 samples, throughput insufficient for milestone advance
+- Profile snapshot committed: `workload/notes/profile/long-horizon_round79/summary.md` (nsys-backed, 12 profiled steps, step_time 4214ms, MFU 31.2%)
+
+---
+
 ## [stage1] Round 43 — 2026-08-14 14:30
 
 - **Verdict**: PASS

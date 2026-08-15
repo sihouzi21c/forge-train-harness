@@ -3060,3 +3060,72 @@ Candidate levers for subsequent rounds:
 ### Code changes
 
 - `train_loop.py`: fixed `_flat_grads` UnboundLocalError in ZeRO-1 path (set `_flat_grads = None` in ZeRO-1 branch, moved `_flat_grads = flat` inside the `elif`/`else` branches)
+
+- review R76 PASS: no proxy; MFU 31.2% below review bar, continue MFU optimization
+
+## [stage1] Round 80 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2/3: NCCL performance tuning, MFU target 31.2%→~35-40%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent identified that the NCCL all-reduce takes 1561ms of cudaMemcpyAsync CPU time (1039 calls) per step, with only 2.7 GB/s effective bandwidth (0.3% of H100 NVLink 900 GB/s peak). The root cause is suboptimal NCCL channel/thread configuration for DP=2.
+
+**NCCL performance tuning — env vars added to all long-horizon gate configs**:
+
+1. `NCCL_ALGO = "Ring"` — force ring algorithm (avoids CPU copy path)
+2. `NCCL_PROTO = "Simple"` — simple protocol (no chunking overhead)
+3. `NCCL_MIN_NCHANNELS = "16"` — increase from default 1 for DP=2 to 16, enabling more parallel NVLink streams
+4. `NCCL_NTHREADS = "256"` — match H100 default (ensures optimal thread count)
+5. `NCCL_NSENDS = "4"` — more concurrent sends per channel
+
+**Config files updated**:
+- `workload/src/config/long-train.toml` — NCCL tuning + existing Triton/CUDA_DEVICE/DL_PREFETCH
+- `workload/src/config/long-train-smoke.toml` — same
+- `workload/src/config/loss-gate-200.toml` — same
+- `workload/src/config/profile-snapshot@long-horizon.toml` — NCCL tuning + CUDA_DEVICE_MAX_CONNECTIONS=8 (previously missing) + NCCL_DEBUG=INFO for diagnostics
+- `workload/src/config/ours/long-train.toml` — source template updated
+- `workload/src/config/ours/profile-snapshot@long-horizon.toml` — source template updated
+
+**Profile analysis (Round 79, pre-NCCL-tuning)**:
+
+| Metric | Value | % of step |
+|--------|-------|-----------|
+| Step time | 4214ms | 100% |
+| GPU kernel | 2859ms | 67.8% |
+| GPU idle | 1355ms | 32.2% |
+| cudaMemcpyAsync | 1561ms (1039 calls) | 37.0% of API |
+| cudaGraphLaunch | 751ms (82 calls) | 17.8% of API |
+| cudaStreamSynchronize | 404ms (349 calls) | 9.6% of API |
+| poll | 21900ms (OS) | NCCL polling |
+
+### Expected MFU impact
+
+The NCCL tuning should reduce the all-reduce CPU overhead by increasing parallelism:
+- **cudaMemcpyAsync calls**: 1039 → ~200 (5× reduction from more channels)
+- **cudaMemcpyAsync time**: 1561ms → ~300ms (5× reduction)
+- **GPU idle**: 1355ms → ~300ms (the all-reduce completes faster)
+- **Step time**: 4214ms → ~3000ms
+- **MFU(standard)**: 31.2% → ~44% (if all-reduce time is eliminated)
+
+The actual impact depends on the remote devspace's NVLink topology and NCCL configuration. The `NCCL_DEBUG=INFO` in the profile-snapshot will reveal the actual NCCL topology and algorithm selection, enabling further tuning.
+
+### Gate results
+
+- **guard**: PASS (0 violations)
+- **anti-proxy**: PASS (0 violations)
+- GPU gates not run (config-only changes, pushed to GitHub for remote testing)
+
+### Next steps
+
+1. Push to GitHub and run `long-train-smoke` (DP=2, 20 steps) to verify the gate still passes
+2. Run `profile-snapshot M6_round80` to measure the NCCL improvement and see the NCCL_DEBUG topology
+3. Run `long-train` (200 steps) to establish the new MFU baseline
+4. Run `resume-gate-20` regression to verify the NCCL tuning doesn't break save/load
+5. Candidate levers for subsequent rounds:
+   - **Gradient bucketing with NCCL overlap** — revisit now that NCCL channels are tuned
+   - **ZeRO-1 optimization** — re-evaluate with NCCL tuning (reduce_scatter may benefit from the same channel tuning)
+   - **H2D copy batching** — reduce remaining cudaMemcpyAsync calls

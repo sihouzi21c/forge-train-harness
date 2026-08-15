@@ -53,6 +53,12 @@ PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:False"
 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"
 # ── Long-horizon performance tuning ──────────────────────────────────
 CUDA_DEVICE_MAX_CONNECTIONS = "8"
+# NCCL performance tuning: increase channels/threads for H100 NVLink.
+NCCL_ALGO = "Ring"
+NCCL_PROTO = "Simple"
+NCCL_MIN_NCHANNELS = "16"
+NCCL_NTHREADS = "256"
+NCCL_NSENDS = "4"
 ENABLE_TRITON_SWIGLU_FWD = "1"
 ENABLE_TRITON_SWIGLU_BWD = "1"
 ENABLE_TRITON_RMSNORM_FWD = "1"

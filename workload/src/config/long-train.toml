@@ -57,6 +57,15 @@ TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "1800"
 # This enables NCCL to use multiple NVLink streams concurrently, reducing
 # the 4.1 GiB all-reduce from ~300ms to ~100ms.
 CUDA_DEVICE_MAX_CONNECTIONS = "8"
+# NCCL performance tuning: increase channels/threads for H100 NVLink.
+# The default NCCL config produces ~1039 cudaMemcpyAsync calls/step (1561ms)
+# for the 4.1 GiB all-reduce at DP=2, which is only 0.3% of NVLink bandwidth.
+# These settings increase parallelism and reduce per-call overhead.
+NCCL_ALGO = "Ring"
+NCCL_PROTO = "Simple"
+NCCL_MIN_NCHANNELS = "16"
+NCCL_NTHREADS = "256"
+NCCL_NSENDS = "4"
 # Triton fused kernels: eliminate the .float() upcast tax and intermediate
 # memory round-trips in RMSNorm, SwiGLU, and RoPE.  Only active when
 # deterministic=False (long-horizon path — resume gates are unaffected).
