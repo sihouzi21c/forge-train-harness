@@ -985,3 +985,25 @@ The dev agent changed NCCL_ALGO from "Ring" to "Tree" across 6 long-horizon gate
 - No run-shape key modifications; no `config/remote.toml` changes
 
 ---
+
+## [stage1] Round 81 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: pre-allocate flat gradient buffer + grad norm tensor)
+- **Commit**: f42bfaf — Perf: pre-allocate flat gradient buffer + grad norm tensor — reduce 4.3 GiB/step allocation, reduce GPU idle
+
+### Key conclusions
+The dev agent pre-allocated the flat gradient buffer (4.3 GiB fp32) and the gradient norm scalar tensor, replacing `torch._utils._flatten_dense_tensors` with `torch.cat(..., out=_flat_grad_buf)` to avoid per-step allocations. The optimization did NOT meaningfully reduce GPU idle (1360ms, unchanged), confirming that the bulk of per-step cudaMalloc calls are from the `torch._fused_adamw_` kernel's internal temporaries, not from `_flatten_dense_tensors`. The engine (`forward.py`, `backward.py`, `train_loop.py`, `zero_optimizer.py`, `triton_kernels.py`) implements all forward/backward/optimizer/loss/metric computation in-process using genuine PyTorch/Triton operations — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. The only `ref/` imports are dataloader utilities at `train_loop.py:235,281`. Stage 1 FINISH conditions not met: no `STAGE_STATUS: finished` in the commit message.
+
+### Violations (fill in only on FAIL)
+(none)
+
+### Evidence highlights
+- Anti-proxy guard: PASSED (0 violations)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- long-train (200 steps, DP=2): PASS (loss_rel 1.222% < 2.50%, MFU 31.0%)
+- resume-gate-20 (25 steps, DP=2): PASS (bitwise, 9420/9420 hash)
+- profile-snapshot (long-horizon_round81): PASS (step_time 4223ms, MFU 31.13%, GPU idle 1360ms)
+- Long-horizon throughput check: BELOW_BAND — no milestone advance
+- No run-shape key modifications; no `config/remote.toml` changes
