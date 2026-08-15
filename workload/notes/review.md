@@ -1082,3 +1082,23 @@ The dev agent validated the Round 83 optimizations (prefetcher headroom 128, vec
 - No run-shape key modifications; no `config/remote.toml` changes
 
 ---
+
+## [stage1] Round 82 — 2026-08-15 19:27
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 8e386b54 — Docs: record Round 83 validation — prefetcher headroom 128, vector_norm out=, cat views; MFU 31.0%, long-train PASS
+
+### Key conclusions
+Docs-only round recording Round 83 validation results on the remote devspace: long-train PASS (31.0% MFU, loss_rel 1.017%), resume-gate-20 PASS (bitwise, 9420/9420 hash), profile-snapshot PASS (31.22% MFU). The prefetcher headroom increase (128 vs 64) did not improve MFU (+0.02pp noise). GPU idle (1340ms) remains the dominant bottleneck. The perf-bitwise suite has a pre-existing regression (MFU 5.9%) from engine changes after Round 40; the config fix (`ENABLE_CUDA_GRAPH=0`) did not resolve it. No proxy, forgery, or hardcoded metrics detected. Engine code was not modified in this commit. Stage 1 remains in-progress: no `STAGE_STATUS: finished` declaration, missing resume-startup-90 evidence, and perf-bitwise still failing.
+
+### Evidence highlights
+- Anti-proxy guard: PASSED (0 violations)
+- `STAGE_STATUS: finished` in commit message: NOT FOUND
+- long-train (200 steps, DP=2): PASS (loss_rel 1.017% < 2.50%, MFU 31.0%)
+- resume-gate-20 (25 steps, DP=2): PASS (max_abs_diff=0, 9420/9420 hash)
+- resume-startup-90 evidence: MISSING from latest perf_log section
+- perf-bitwise: FAIL (pre-existing regression, config fix applied but ineffective)
+- No run-shape key modifications; no `config/remote.toml` changes
+
+---

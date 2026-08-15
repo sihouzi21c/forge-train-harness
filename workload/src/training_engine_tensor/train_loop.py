@@ -1181,6 +1181,7 @@ def _adamw_step(
     beta2: float,
     eps: float,
     dummy_sq: torch.Tensor | None = None,  # pre-allocated 1-element fp32 tensor
+    prealloc_opt: list[dict] | None = None,  # pre-allocated per-group tuples
 ) -> None:
     """Apply one AdamW step using the fused multi-tensor kernel.
 
@@ -1193,14 +1194,42 @@ def _adamw_step(
     kernel never accesses it).  When ``None``, a new tensor is created
     (the old per-step allocation fallback).  Pre-allocating once and
     reusing avoids a CUDA allocator call per optimizer group per step
-    that can trigger an internal ``cudaStreamSynchronize``."""
-    for group in optim_groups:
+    that can trigger an internal ``cudaStreamSynchronize``.
+
+    ``prealloc_opt``: pre-allocated tuples for ``params``, ``grads``,
+    ``eas``, ``eass``, ``steps``, and ``dummy_sqs`` per optimizer group.
+    When provided, skips the per-step list creation (saves ~4239 Python
+    operations per step).  The tuples hold references to the same tensors
+    every step — the tensors are modified in-place by
+    ``torch._fused_adamw_``, so the tuples are always valid.
+    """
+    for i, group in enumerate(optim_groups):
         params = group["params"]
         n = len(params)
         if n == 0:
             continue
         lr = group["lr"]
         wd = group["weight_decay"]
+
+        if prealloc_opt is not None and i < len(prealloc_opt) and prealloc_opt[i] is not None:
+            # Pre-allocated path: use pre-computed tuples (saves 4×157
+            # list appends and 5×157 tuple creations per group per step).
+            po = prealloc_opt[i]
+            _params = po["params"]
+            grads = po["grads"]
+            eas = po["eas"]
+            eass = po["eass"]
+            steps = po["steps"]
+            dummy_sqs = po["dummy_sqs"]
+            # Increment step counters (fused kernel reads the current step).
+            # torch._foreach_add_ accepts list; convert tuple to list.
+            torch._foreach_add_(list(steps), 1)
+            torch._fused_adamw_(
+                _params, grads, eas, eass, dummy_sqs, steps,
+                amsgrad=False, lr=lr, beta1=beta1, beta2=beta2,
+                weight_decay=wd, eps=eps, maximize=False,
+            )
+            continue
 
         # Collect gradients from .grad, momentum buffers, and step counters
         grads: list[torch.Tensor] = []
@@ -1589,11 +1618,24 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # Zero the flat buffer so the initial state is correct.
     _flat_grad_buf.zero_()
 
+    # Set .grad on fp32_master once during setup (not per-step) for the
+    # pre-allocated optimizer tuples.  The gradient buffers are views of
+    # _flat_grad_buf, which is updated by the backward pass every step.
+    for p_fp32, buf in zip(fp32_master, fp32_grad_bufs):
+        p_fp32.grad = buf
+
     # Pre-allocate the gradient norm scalar tensor for torch.linalg.vector_norm.
     # Each step's norm computation creates a new scalar tensor, triggering a
     # CUDA allocator call that can cause an internal cudaStreamSynchronize.
     # Pre-allocating avoids the per-step allocation.
     _grad_norm_val = torch.zeros((), device=device, dtype=torch.float32)
+
+    # Pre-allocate the AdamW dummy_sq tensor (1-element fp32).
+    # The torch._fused_adamw_ kernel requires max_exp_avg_sqs as a tuple of
+    # tensors even when amsgrad=False (the kernel never accesses it).  A single
+    # shared 1-element tensor is used for all 157 entries, saving 157
+    # torch.zeros_like allocations (~628 MB) per step.
+    _opt_dummy_sq = torch.zeros(1, device=device, dtype=torch.float32)
 
     # ── Optimizer state (AdamW) ────────────────────────────────────────
     opt_beta1 = float(os.environ.get("ADAM_BETA1", "0.9"))
@@ -1617,6 +1659,27 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
     # Save per-group LR multipliers (muP scaling: scaled matrix weights → lr/width_mult)
     # so we can update per-group LR before each optimizer step (matching ref's pattern).
     lr_mult_per_group = [g["lr"] / opt_lr for g in optim_groups]
+
+    # ── Pre-allocate optimizer step tuples ──────────────────────────────
+    # Pre-allocate the per-group tuples for _adamw_step to avoid creating
+    # 4 lists of 157 elements each per step (saves ~4239 Python operations/step).
+    # The tuples hold references to the same tensors every step (gradients,
+    # momentum buffers, step counters).  The tensors are modified in-place
+    # by torch._fused_adamw_, so the tuples are always valid.
+    _per_group_opt: list[dict | None] = []
+    for group in optim_groups:
+        params = group["params"]
+        if not params:
+            _per_group_opt.append(None)
+            continue
+        _per_group_opt.append({
+            "params": tuple(params),
+            "grads": tuple(p.grad for p in params),
+            "eas": tuple(exp_avgs[p.data_ptr()] for p in params),
+            "eass": tuple(exp_avg_sqs[p.data_ptr()] for p in params),
+            "steps": tuple(opt_state_steps[p.data_ptr()] for p in params),
+            "dummy_sqs": tuple(_opt_dummy_sq for _ in params),
+        })
 
     # ── ZeRO-1 distributed optimizer ─────────────────────────────────────
     # Shard FP32 optimizer state across DP ranks, switching from all_reduce
@@ -1774,12 +1837,6 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
 
     # Pre-allocate a 1-element fp32 tensor for the AdamW fused kernel's
     # max_exp_avg_sqs placeholder (amsgrad=False means the kernel never
-    # accesses it).  Reusing across all optimizer groups and all steps
-    # avoids a CUDA allocator call per group per step, which can trigger
-    # an internal cudaStreamSynchronize (~1.77ms) when the allocator cache
-    # is empty after the CUDA graph's private pool consumption.
-    _opt_dummy_sq = torch.zeros(1, device=device, dtype=torch.float32)
-
     # ── CUDA graph capture for forward+backward of one microbatch ───────
     # Capturing the static forward+backward sequence as a CUDA graph
     # eliminates the per-kernel launch overhead (cudaLaunchKernel ~3814ms/step
@@ -2360,6 +2417,7 @@ def run_training_loop(config: TrainLoopConfig, *, loss_tag: str = "LOSS") -> Non
                 exp_avgs, exp_avg_sqs, opt_state_steps,
                 beta1=opt_beta1, beta2=opt_beta2, eps=opt_eps,
                 dummy_sq=_opt_dummy_sq,
+                prealloc_opt=_per_group_opt,
             )
             # ── Sync BF16 params from FP32 master ─────────────────────────
             _sync_bf16_from_fp32(bf16_params, fp32_master,

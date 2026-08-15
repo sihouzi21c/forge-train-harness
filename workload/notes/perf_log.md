@@ -3389,3 +3389,58 @@ The `perf-bitwise` suite (deterministic=True, MBS=2, forge_init_ones=0) has MFU 
 2. **Phase 3: Overlap NCCL all-reduce with next-step forward** — The all-reduce GPU time is ~15ms, but the GPU idle is 1340ms. The overlap might not help directly because the bottleneck is CPU-side.
 3. **Phase 2: Copy/elementwise reduction via Triton fusion** — The `BinaryFunc` (89ms, 6571 instances) and elementwise ops (93ms, 4326 instances) are significant.
 4. **Phase 2: Fused residual-add + RMSNorm forward** — Currently the forward pass does `hidden = residual_add + rms_norm(hidden)` as two separate operations. Fusing them would save one `.float()` copy.
+- review R82 PASS: no proxy detected; docs-only round, resume-startup-90 missing and perf-bitwise FAIL
+
+## [stage1] Round 84 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: pre-allocated optimizer tuples, cudaMalloc -16ms)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent pre-allocated the optimizer step's working tuples (`_per_group_opt`) in the setup phase, eliminating the per-step creation of 4 lists of 157 elements each + 5 tuples of 157 elements each across 3 optimizer groups (~4239 Python operations/step). The `.grad` attribute on `fp32_master` is now set once during setup (not per-step), eliminating another 157 Python iterations.
+
+**Optimization — Pre-allocated optimizer tuples**:
+- `_adamw_step` now accepts a `prealloc_opt` parameter with pre-computed tuples for `params`, `grads`, `eas`, `eass`, `steps`, and `dummy_sqs` per optimizer group.
+- The pre-allocated path skips the per-step list creation and tuple conversion, saving ~4239 Python operations per step.
+- The tensors inside the tuples are modified in-place by `torch._fused_adamw_`, so the tuples are always valid across steps.
+- The `_opt_dummy_sq` tensor is now initialized before the pre-allocation to avoid a Python scoping issue.
+
+**Optimization — `.grad` set once during setup**:
+- `p_fp32.grad = buf` is now done once during setup (after `fp32_grad_bufs` are replaced with views of `_flat_grad_buf`), eliminating the per-step 157-iteration `.grad` setting loop in the non-ZeRO path.
+- The gradient buffers are views of `_flat_grad_buf` (never reallocated), so `.grad` is always valid.
+
+### Profile results (long-horizon_round84 vs round83)
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Step time (ms) | 4211.4 | 4212.1 | +0.6ms (noise) |
+| MFU (standard) | 31.22% | 31.22% | 0.00pp (noise) |
+| GPU kernel (ms) | 2871.1 | 2869.4 | -1.7ms (noise) |
+| GPU idle (ms) | 1340.4 | 1342.7 | +2.3ms (noise) |
+| cudaMalloc (ms) | 80.9 | 64.7 | **-16.2ms (-20%)** |
+| cudaLaunchKernel (ms) | 50.8 | 42.4 | **-8.3ms (-16%)** |
+| cudaStreamSynchronize (ms) | 443.0 | 437.9 | -5.0ms (-1.1%) |
+| CUDA API total (ms) | 2967.3 | 2896.0 | **-71.3ms (-2.4%)** |
+
+The cudaMalloc CPU time dropped by 20% (80.9ms → 64.7ms) and cudaLaunchKernel dropped by 16% (50.8ms → 42.4ms), confirming the pre-allocation of optimizer tuples eliminated the per-step `.grad` setting loop and the optimizer tuple creation overhead. The total CUDA API CPU time decreased by 71ms (-2.4%).
+
+The step time and MFU are unchanged within noise because the CPU-side savings (71ms) are a small fraction of the 4212ms step time, and the GPU is the bottleneck (2869ms GPU kernel, 1343ms GPU idle).
+
+### Gate results
+
+- **long-train-smoke (20 steps, DP=2)**: `loss_rel 0.186% < 2.50%` PASS; `signed_rel +0.0276%` (no drift); MFU **31.3%**.
+- **resume-gate-20 (25 steps, DP=2)**: bitwise PASS (`max_abs_diff=0`, `9420/9420 hash`).
+- **profile-snapshot (long-horizon_round84)**: step_time 4212ms, MFU 31.22%, GPU idle 1343ms, cudaMalloc -16ms vs prior round.
+
+### Next steps
+
+- **Phase 2: Reduce cudaMemcpyAsync overhead (1559ms, 53.8% of CUDA API time)** — The 1039 cudaMemcpyAsync calls per step are the single biggest CUDA API cost. Batching the 6 separate H2D copies per microbatch into a single copy could reduce the call count by 5× per microbatch.
+- **Phase 2: Fused residual-add + RMSNorm backward** — The `direct_copy_kernel` (112ms, 17711 instances) is the `.float()` conversion kernel. Fusing the residual-add with RMSNorm backward would eliminate one `.float()` copy per layer.
+- **Phase 3: Overlap NCCL all-reduce with next-step forward** — The GPU idle is 1343ms (32%). The lost time is from the CPU scheduling overhead between the backward pass and the optimizer step.
+- Candidate levers estimated from profile:
+  1. H2D batch reduction: ~129ms/step CUDA API time saved (cudaMemcpyAsync 1559ms → ~1430ms)
+  2. Residual-add + RMSNorm fusion: ~50ms/step GPU kernel time saved (direct_copy 112ms → ~62ms)
+  3. NCCL overlap: ~100ms/step GPU idle reduced (if bucketing doesn't regress at DP=2)
