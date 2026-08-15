@@ -53,6 +53,7 @@ from training_engine_tensor.forward import (
     precompute_rope_freqs,
     project_qkv,
     rms_norm,
+    rms_norm_residual,
 )
 
 from training_engine_tensor.parameters import (
@@ -557,8 +558,16 @@ def _forward_with_cache(
         hidden_after_attn = hidden + attn_out * depth_scale_main
         hidden = hidden_after_attn
 
-        # MLP sub-layer
-        normed2 = rms_norm(hidden, layer.pre_mlp_norm_weight, deterministic=deterministic)
+        # MLP sub-layer: fused residual-add + RMSNorm when Triton is enabled.
+        # Use hidden_before_attn (the original hidden before the attention
+        # residual-add) as the hidden input, and attn_out as the residual.
+        normed2, _residual_out = rms_norm_residual(
+            hidden_before_attn, attn_out, layer.pre_mlp_norm_weight, depth_scale_main,
+            deterministic=deterministic,
+        )
+        # _residual_out is the same as hidden_after_attn; it's returned by the
+        # fused kernel to avoid an extra computation.  Use the existing
+        # hidden_after_attn for the LayerCache and next layer's input.
         if capture_records is not None:
             _capture_forward(capture_records, capture_prefix, f"layers.{li}.ffn_norm", 0, normed2)
 
@@ -649,7 +658,14 @@ def _forward_with_cache(
         mtp_hidden_after_attn = eagle_h + mtp_attn_out * depth_scale_mtp
         eagle_h = mtp_hidden_after_attn
 
-        mtp_normed2 = rms_norm(eagle_h, model.mtp.layer.pre_mlp_norm_weight, deterministic=deterministic)
+        # Fused residual-add + RMSNorm for the MLP sub-layer.
+        # Use mtp_hidden_before_attn (the original eagle_h before the attention
+        # residual-add) as the hidden input, and mtp_attn_out as the residual.
+        mtp_normed2, _mtp_residual_out = rms_norm_residual(
+            mtp_hidden_before_attn, mtp_attn_out,
+            model.mtp.layer.pre_mlp_norm_weight, depth_scale_mtp,
+            deterministic=deterministic,
+        )
         mtp_gate_up = torch.matmul(mtp_normed2, model.mtp.layer.mlp_fc1_weight.t())
         # Use fused Triton SwiGLU forward kernel for non-deterministic mode.
         _use_triton_swiglu_fwd_mtp = (

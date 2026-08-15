@@ -103,6 +103,14 @@ try:
 except (ImportError, ModuleNotFoundError, AttributeError):
     pass
 
+# Lazy-import flag for the fused Triton residual-add + RMSNorm forward kernel.
+_HAS_TRITON_RMSNORM_RESIDUAL_FWD: bool = False
+try:
+    from training_engine_tensor.triton_kernels import rms_norm_residual_fused  # noqa: F401
+    _HAS_TRITON_RMSNORM_RESIDUAL_FWD = True
+except (ImportError, ModuleNotFoundError, AttributeError):
+    pass
+
 
 def rms_norm(hidden: torch.Tensor, weight: torch.Tensor,
              eps: float | None = None,
@@ -131,6 +139,45 @@ def rms_norm(hidden: torch.Tensor, weight: torch.Tensor,
         return rms_norm_forward_fused(hidden, weight, eps_val)
     import torch.nn.functional as _F
     return _F.rms_norm(hidden, (weight.shape[0],), weight, eps_val)
+
+
+def rms_norm_residual(
+    hidden: torch.Tensor,         # [B, S, H] bf16 — hidden_before_attn
+    residual_input: torch.Tensor,  # [B, S, H] bf16 — attn_out
+    weight: torch.Tensor,          # [H] bf16 — pre_mlp_norm_weight
+    depth_scale: float,            # depth_scale_main
+    eps: float | None = None,
+    deterministic: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused residual-add + RMSNorm forward.
+
+    Computes::
+
+        residual_out = hidden + residual_input * depth_scale
+        normed = rms_norm(residual_out, weight, eps)
+
+    in a single fused Triton kernel when ``deterministic=False`` and
+    ``ENABLE_TRITON_RMSNORM_FWD=1``.  Falls back to the two-step PyTorch
+    path when deterministic mode is required (bitwise alignment).
+
+    Returns ``(normed, residual_out)``.
+    """
+    eps_val = eps if eps is not None else NORM_EPS
+    _use_triton = (
+        _HAS_TRITON_RMSNORM_RESIDUAL_FWD
+        and not deterministic
+        and hidden.is_cuda
+        and int(os.environ.get('ENABLE_TRITON_RMSNORM_FWD', '0'))
+    )
+    if _use_triton:
+        from training_engine_tensor.triton_kernels import rms_norm_residual_fused
+        return rms_norm_residual_fused(
+            hidden, residual_input, weight, depth_scale, eps=eps_val,
+        )
+    # Fallback: two-step PyTorch path (bitwise-safe).
+    residual_out = hidden + residual_input * depth_scale
+    normed = rms_norm(residual_out, weight, eps=eps_val, deterministic=deterministic)
+    return normed, residual_out
 
 
 # ── SwiGLU MLP ─────────────────────────────────────────────────────────────

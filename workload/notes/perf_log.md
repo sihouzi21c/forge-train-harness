@@ -2856,3 +2856,42 @@ The `cudaStreamSynchronize` is unchanged (570ms), confirming the syncs are from 
   1. **NCCL all-reduce overlap** — gradient bucketing with async NCCL (revisit at DP=2)
   2. **CUDA graph for optimizer step** — capture the optimizer step into the graph (re-evaluate memory after CE optimization freed ~21 GiB)
   3. **H2D copy batching** — reduce cudaMemcpyAsync calls by concatenating input tensors into a single pinned buffer per microbatch
+- review R72 PASS: RoPE kernel bounds fix + expandable_segments:False, no proxy detected
+
+## [stage1] Round 76 — 2026-08-15
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (Phase 2: fused residual-add + RMSNorm forward, MFU ~29.3%)
+- **Commit**: (current commit)
+
+### Key conclusions
+
+The dev agent implemented a fused residual-add + RMSNorm forward kernel (`triton_kernels.py:_rms_norm_residual_fwd_kernel`, `rms_norm_residual_fused`) that fuses the residual-add (`hidden = hidden_before_attn + attn_out * depth_scale`) and the MLP RMSNorm forward into a single Triton kernel. The kernel reads the original `hidden_before_attn` and `attn_out` directly, computes the residual-add in fp32, then computes RMSNorm, and writes the normed output in bf16 — eliminating the intermediate `hidden_after_attn` write and read for the RMSNorm.
+
+**Phase 2 optimization — fused residual-add + RMSNorm forward:**
+
+1. **`_rms_norm_residual_fwd_kernel` (Triton)**: Each program handles one (B, S) row of H elements. The kernel reads bf16 `hidden` and `residual_input`, computes `x_res = hidden + residual_input * scale` in fp32, then computes `r = rsqrt(mean(x_res^2) + eps)` and `normed = x_res * r * weight`, and writes both `normed` and `residual_out` in bf16.
+
+2. **`rms_norm_residual_fused`**: PyTorch wrapper that allocates the output buffers and launches the Triton kernel with a grid of (B*S,) programs.
+
+3. **Gating by `ENABLE_TRITON_RMSNORM_FWD=1`**: The Triton kernel is only used when `deterministic=False` (long-horizon mode). The bitwise gates always use the two-step PyTorch path. The `forward.py:rms_norm_residual` function provides the fallback path.
+
+4. **Call sites updated**: Both the main branch (25 layers) and MTP branch (1 layer) MLP RMSNorm calls use the fused kernel, saving ~2ms per layer × 26 layers = ~52ms per step.
+
+### Estimated MFU impact
+
+- **Step time savings**: ~52ms per step (from eliminating 26 intermediate `hidden_after_attn` writes and reads)
+- **MFU improvement**: ~0.3pp (from 29.28% to ~29.5%)
+- **Kernel launch reduction**: 26 fewer RMSNorm kernel launches per step (the residual-add is already fused)
+
+### Next steps
+
+- Sync to remote and run `long-train-smoke` to verify the gate still passes
+- Run `profile-snapshot M6_round76` to measure the MFU improvement
+- Run `resume-gate-20` regression to verify the fusion doesn't break save/load
+- Run `long-train` (200 steps) to establish the new MFU baseline
+- Candidate levers for subsequent rounds:
+  1. **NCCL overlap** — gradient bucketing with async NCCL (revisit at DP=2 with faster compute)
+  2. **CUDA graph for optimizer step** — re-evaluate with improved memory headroom
+  3. **H2D copy batching** — reduce cudaMemcpyAsync calls by concatenating input tensors

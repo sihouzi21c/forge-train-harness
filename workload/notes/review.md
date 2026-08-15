@@ -831,3 +831,21 @@ This is a docs-only commit recording Round 71's profile analysis. The dev agent 
 - `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
 
 ---
+
+## [stage1] Round 72 — 2026-08-15 13:13
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Milestone**: long-horizon — in-progress (RoPE kernel bounds fix + expandable_segments:False, MFU 29.28%)
+- **Commit**: 290cac6 — Perf: fix RoPE kernel bounds check + expandable_segments:False — MFU 29.28%
+
+### Key conclusions
+The dev agent fixed a Triton RoPE kernel out-of-bounds memory access (`triton_kernels.py:730-760`) that was masked by `expandable_segments:True` (CUDA virtual memory allocator returns larger segments than requested, hiding off-by-half-element reads). The fix uses per-load masks (`half_mask`, `second_half_mask`) instead of the full `mask = offs < D` for the `a_second`/`a_first` loads, matching the `tl.where` selection logic. The `PYTORCH_CUDA_ALLOC_CONF` was switched to `expandable_segments:False` across all long-horizon gate configs, reducing GPU idle by 41ms (1661ms→1619ms) by eliminating `cuMemCreate`/`cuMemSetAccess` overhead (5996 calls/step → 0). The engine is genuinely implementing forward/backward/optimizer/loss/metric in-process — no proxy, no shell-out to `ref/`, no hardcoded synthetic metrics. Stage 1 remains in-progress: the commit message does not declare `STAGE_STATUS: finished`, and the long-horizon milestone check (review-side throughput bar) has not been met.
+
+### Evidence highlights
+- `triton_kernels.py:730-760` — per-load bounds masks `half_mask` (offs < half) and `second_half_mask` (offs >= half & offs < D) replace the single `mask = offs < D`
+- `bin/harness run anti-proxy`: PASS (0 violations)
+- No gate config run-shape keys (`global_batch_size`, `grad_accum_steps`, `world_size`, `num_steps`, `gate_window`, `seed`, `seq_length`) were modified — only `PYTORCH_CUDA_ALLOC_CONF` env var
+- No `config/remote.toml` changes detected
+
+---
