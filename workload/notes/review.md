@@ -749,3 +749,18 @@ Docs-only commit recording the optimization results for Rounds 67-71 (prefetcher
 - No gate config, remote config, or run-shape key modifications detected
 
 ---
+
+## [stage1] Round 72 — 2026-08-15 08:55
+
+- **Verdict**: PASS
+- **Stage status**: in-progress
+- **Commit**: 30d1551 — Perf: increase _BackgroundPrefetcher max_size to 16 — reduce main-thread wait, MFU 28.9%
+
+### Key conclusions
+The dev agent increased `_BackgroundPrefetcher.max_size` from 8 to 16, giving the producer more headroom to pre-fetch batches ahead of the 10-microbatch step queue. The pre-allocated pinned buffer pool is automatically sized by `max_size` in `__init__`, so the increase allocates 16 buffer sets (3 MB total, negligible vs 79 GiB HBM). The engine changes are minimal (one parameter change in `train_loop.py`). All gates pass: long-train (MFU 28.9%, loss_rel 1.075%), resume-gate-20 (bitwise, 9420/9420 hash), profile-snapshot (MFU 29.23%). No proxy, no forgery, no hardcoded synthetic metrics. Stage 1 remains in-progress: no `STAGE_STATUS: finished` in the commit message.
+
+### Evidence highlights
+- `train_loop.py:321` — `_BackgroundPrefetcher.__init__` docstring and `max_size` default updated
+- `train_loop.py:1639` — `max_size=16` at the instantiation site
+- `bin/harness run anti-proxy`: PASS (0 violations, run in prior round)
+- `git log -1 --format='%B' | grep 'STAGE_STATUS: finished'`: NOT FOUND
