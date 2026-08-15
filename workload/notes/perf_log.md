@@ -3261,21 +3261,48 @@ The dev agent replaced `fp32_grad_bufs` (157 separate fp32 tensors) with views o
 ### Estimated MFU impact
 
 - **GPU time saved**: ~2.6ms (1.3ms `torch.cat` + 1.3ms `torch._foreach_copy_`)
-- **CPU scheduling overhead saved**: ~50-100ms (reduced GPU idle from fewer CPU-to-GPU command submissions)
-- **Estimated MFU improvement**: ~1-2% (from 31.0% to ~31.3-31.6%)
-- The actual impact depends on the profiled step time and will be measured in the next round's profile-snapshot.
+- **CPU scheduling overhead saved**: ~18ms GPU idle reduction
+- **Measured MFU improvement**: 31.13% → 31.20% (+0.07pp, within run-to-run noise)
+
+### Gate results
+
+| Gate | Status | MFU | Details |
+|------|--------|-----|---------|
+| long-train-smoke (20 steps, DP=2) | PASS | 31.2% | loss_rel 0.208% < 2.50%, no drift |
+| resume-gate-20 (25 steps, DP=2) | PASS | bitwise | max_abs_diff=0, 9420/9420 hash |
+| long-train (200 steps, DP=2) | PASS | 31.0% | loss_rel 1.224% < 2.50%, no drift |
+| profile-snapshot (long-horizon_round82) | PASS | 31.20% | step_time 4214ms, GPU idle 1342ms |
+
+### Profile analysis (long-horizon_round82 vs round81)
+
+| Metric | Round 81 | Round 82 | Δ |
+|--------|----------|----------|---|
+| Step time (ms) | 4223.0 | 4214.4 | **-9ms** |
+| GPU idle (ms) | 1360.0 | 1342.1 | **-18ms** |
+| GPU kernel (ms) | 2863.5 | 2872.3 | +8.9ms (run-to-run) |
+| MFU (standard) | 31.13% | 31.20% | **+0.07pp** |
+| cudaMalloc (calls) | 806 | 702 | **-104** |
+| cudaMalloc (ms) | 111 | 63 | **-48ms** |
+| cudaGraphLaunch (calls) | 82 | 82 | unchanged |
+| cudaGraphLaunch (ms) | 752 | 754 | +2ms (noise) |
+| cudaMemcpyAsync (calls) | 1047 | 1047 | unchanged |
+| cudaMemcpyAsync (ms) | 1583 | 1575 | -8ms (noise) |
+
+The GPU idle reduction of 18ms is from eliminating the `torch.cat` and `torch._foreach_copy_` CPU scheduling overhead. The cudaMalloc reduction of 104 calls is from eliminating the internal allocations in `torch.cat(..., out=_flat_grad_buf)`.
+
+### Analysis
+
+The optimization is beneficial but modest. The GPU idle (1342ms, 31.9% of step time) is still the dominant bottleneck. The cudaMemcpyAsync calls (1047, 1575ms) are from the CUDA graph's internal memory transfers, which cannot be eliminated without changing the graph structure.
+
+The remaining optimization opportunities are:
+
+1. **CUDA stream overlap for NCCL**: Use a separate CUDA stream for the all-reduce to overlap with the optimizer step or next-step forward. The all-reduce GPU time is only ~15ms, but the GPU idle is 1342ms, suggesting the idle is from CPU scheduling overhead (cudaGraphLaunch 754ms, cudaStreamSynchronize 437ms, cudaMemcpyAsync 1575ms).
+
+2. **Gradient bucketing revisit**: With flat buffer views, the bucketing overhead is reduced (no `torch.cat`/`_foreach_copy_`). The gradient bucketing path was regressing at DP=2, but with the current code, it may be worth re-evaluating.
+
+3. **Copy/elementwise reduction**: The `direct_copy_kernel` (112ms, 17709 instances) is from `.float()` conversions in the FP32 precision spec. Further Triton fusion could reduce this.
 
 ### Code changes
 
 - `train_loop.py`: `fp32_grad_bufs` replaced with views of `_flat_grad_buf` after pre-allocation; `torch.cat` and `torch._foreach_copy_` removed from both the gradient bucketing and single all-reduce paths; `_flat_grads` variable removed; gradient norm computation simplified to always use `_flat_grad_buf`.
-
-### Next steps
-
-- Push to GitHub and run `long-train-smoke` (DP=2, 20 steps) to verify the MFU improvement.
-- Run `profile-snapshot M6_round82` to measure the actual GPU idle reduction.
-- Run `resume-gate-20` regression to verify the flat buffer view doesn't break save/load.
-- Run `long-train` (200 steps) to establish the new MFU baseline.
-- Candidate levers for subsequent rounds:
-  1. **CUDA stream overlap for NCCL** — use separate stream for all-reduce to overlap with optimizer step
-  2. **Gradient bucketing revisit** — with flat buffer views, bucketing overhead is reduced
-  3. **Copy/elementwise reduction** — further Triton fusion for .float() conversions
+- `workload/notes/profile/long-horizon_round82/`: profile data (summary.md + profile.json) from the remote devspace.
